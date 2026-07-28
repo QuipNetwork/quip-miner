@@ -7,7 +7,7 @@
 use super::extrinsic::{
     build_hybrid_signed_extrinsic, difficulties_storage_key, hex_decode, hex_encode,
     job_orders_storage_key, last_proof_block_storage_key, load_hybrid_pair, miner_identity_bytes,
-    topology_curve_c_storage_key, SignedExtensionContext,
+    registered_topologies_prefix, topology_curve_c_storage_key, SignedExtensionContext,
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
@@ -164,6 +164,90 @@ impl RealChainClient {
             None => Ok(None),
             Some(hex) => hex_decode(hex).map(Some).map_err(ChainError::Decode),
         }
+    }
+
+    /// SCALE-decode `topology_meta(hash)` at best head. `None` on a null result
+    /// (hash never registered).
+    async fn topology_meta_scale(
+        &self,
+        topology_hash: [u8; 32],
+    ) -> Result<Option<TopologyMetaScale>, ChainError> {
+        // Arg: SCALE(H256) == the 32 hash bytes verbatim.
+        let Some(bytes) = self
+            .quantum_pow_call_at_head("QuantumPowApi_topology_meta", &topology_hash)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let decoded: Option<TopologyMetaScale> =
+            Decode::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))?;
+        Ok(decoded)
+    }
+
+    /// Enumerate the 32-byte topology hashes stored under `RegisteredTopologies`
+    /// via paged `state_getKeysPaged`. Each `Blake2_128Concat` map key is
+    /// `prefix ++ blake2_128(hash) ++ hash`, so the topology hash is the final
+    /// 32 bytes of every returned key.
+    async fn registered_topology_hashes(&self) -> Result<Vec<[u8; 32]>, ChainError> {
+        const PAGE: u64 = 256;
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?
+            .to_string();
+        let prefix = registered_topologies_prefix();
+        let prefix_hex = hex_encode(&prefix);
+        let mut hashes = Vec::new();
+        let mut start = prefix_hex.clone();
+        loop {
+            let page = self
+                .rpc_call(
+                    "state_getKeysPaged",
+                    Value::Array(vec![
+                        Value::String(prefix_hex.clone()),
+                        Value::Number(PAGE.into()),
+                        Value::String(start.clone()),
+                        Value::String(at.clone()),
+                    ]),
+                )
+                .await?;
+            let Some(arr) = page.as_array() else {
+                break;
+            };
+            if arr.is_empty() {
+                break;
+            }
+            for k in arr {
+                let key_hex = k.as_str().ok_or_else(|| {
+                    ChainError::Decode("state_getKeysPaged item not a string".into())
+                })?;
+                let key = hex_decode(key_hex).map_err(ChainError::Decode)?;
+                let len = key.len();
+                if len < 32 {
+                    return Err(ChainError::Decode(format!(
+                        "RegisteredTopologies key too short ({len} bytes)"
+                    )));
+                }
+                let mut h = [0u8; 32];
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "len >= 32 checked immediately above"
+                )]
+                h.copy_from_slice(&key[len - 32..]);
+                hashes.push(h);
+            }
+            if (arr.len() as u64) < PAGE {
+                break;
+            }
+            start = arr
+                .last()
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| ChainError::Decode("empty page tail".into()))?;
+        }
+        Ok(hashes)
     }
 }
 
@@ -446,18 +530,29 @@ impl ChainClient for RealChainClient {
         &self,
         topology_hash: [u8; 32],
     ) -> Result<Option<TopologyInputs>, ChainError> {
-        // Arg: SCALE(H256) == the 32 hash bytes verbatim.
-        let Some(bytes) = self
-            .quantum_pow_call_at_head("QuantumPowApi_topology_meta", &topology_hash)
+        self.topology_meta_scale(topology_hash)
             .await?
-        else {
-            return Ok(None);
-        };
-        let decoded: Option<TopologyMetaScale> =
-            Decode::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))?;
-        decoded
             .map(|m| m.into_inputs().map_err(ChainError::Decode))
             .transpose()
+    }
+
+    async fn fetch_registered_topologies(
+        &self,
+    ) -> Result<Vec<super::RegisteredTopology>, ChainError> {
+        let hashes = self.registered_topology_hashes().await?;
+        let mut out = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            // A hash listed in RegisteredTopologies must resolve; a null here is
+            // a chain inconsistency worth surfacing rather than silently dropping.
+            let Some(scale) = self.topology_meta_scale(hash).await? else {
+                return Err(ChainError::Decode(format!(
+                    "RegisteredTopologies listed {} but topology_meta returned null",
+                    hex_encode(&hash)
+                )));
+            };
+            out.push(scale.into_registered(hash).map_err(ChainError::Decode)?);
+        }
+        Ok(out)
     }
 
     #[expect(

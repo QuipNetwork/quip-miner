@@ -13,7 +13,7 @@ pub mod submit;
 
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
-pub use qblock::{QBlockRecord, TopologyInputs};
+pub use qblock::{QBlockRecord, RegisteredTopology, TopologyInputs};
 pub use real::RealChainClient;
 pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
 pub use submit::{classify_receipt, Proof, SubmitAction};
@@ -90,4 +90,11 @@ pub trait ChainClient: Send + Sync {
         &self,
         topology_hash: [u8; 32],
     ) -> Result<Option<TopologyInputs>, ChainError>;
+
+    /// Enumerate every topology in `RegisteredTopologies`, each with its redraw
+    /// inputs and `registered_at` block. The `download` command orders these
+    /// into a mining-era timeline to re-attribute qblocks by the era covering
+    /// their `submitted_at`, since the stored per-qblock `topology_hash` is
+    /// unreliable (clobbered by the v5 migration backfill).
+    async fn fetch_registered_topologies(&self) -> Result<Vec<RegisteredTopology>, ChainError>;
 }

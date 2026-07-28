@@ -225,6 +225,19 @@ pub fn topology_curve_c_storage_key(topology_hash: &[u8; 32]) -> Vec<u8> {
     quantum_pow_map_key(b"TopologyCurveC", topology_hash)
 }
 
+/// `QuantumPow::RegisteredTopologies` storage-map prefix (twox128 pallet ++
+/// twox128 item). Used with `state_getKeysPaged` to enumerate every registered
+/// topology hash — the corrupted per-qblock `topology_hash` (migration-clobbered)
+/// cannot be trusted, so the download rebuilds the mining-era timeline from this
+/// authoritative set instead.
+#[must_use]
+pub fn registered_topologies_prefix() -> Vec<u8> {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(&twox128(b"QuantumPow"));
+    key.extend_from_slice(&twox128(b"RegisteredTopologies"));
+    key
+}
+
 /// `QuantumPow::LastProofBlock` — plain `StorageValue` (block number of the last
 /// winning proof).
 #[must_use]

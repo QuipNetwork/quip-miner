@@ -2,7 +2,7 @@
 
 use super::{
     ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, Proof, QBlockRecord,
-    SubmitAction, TopologyInputs,
+    RegisteredTopology, SubmitAction, TopologyInputs,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -24,6 +24,9 @@ pub struct FakeChain {
     qblocks: Mutex<HashMap<u64, QBlockRecord>>,
     /// Scripted `fetch_topology_meta` results, keyed by topology hash.
     topologies: Mutex<HashMap<[u8; 32], TopologyInputs>>,
+    /// Scripted `fetch_registered_topologies` set, keyed by topology hash,
+    /// carrying each topology's `registered_at` for era ordering.
+    registered: Mutex<HashMap<[u8; 32], (TopologyInputs, u32)>>,
 }
 
 impl FakeChain {
@@ -39,6 +42,33 @@ impl FakeChain {
             decay_params: Mutex::new(None),
             qblocks: Mutex::new(HashMap::new()),
             topologies: Mutex::new(HashMap::new()),
+            registered: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Script a topology into both `fetch_topology_meta` and
+    /// `fetch_registered_topologies`, with an explicit `registered_at` block so
+    /// tests can build a multi-era mining timeline.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_registered_topology(
+        &self,
+        hash: [u8; 32],
+        inputs: TopologyInputs,
+        registered_at: u32,
+    ) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            let _ = self.topologies.lock().unwrap().insert(hash, inputs.clone());
+            let _ = self
+                .registered
+                .lock()
+                .unwrap()
+                .insert(hash, (inputs, registered_at));
         }
     }
 
@@ -248,6 +278,26 @@ impl ChainClient for FakeChain {
         )]
         {
             Ok(self.topologies.lock().unwrap().get(&topology_hash).cloned())
+        }
+    }
+
+    async fn fetch_registered_topologies(&self) -> Result<Vec<RegisteredTopology>, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(self
+                .registered
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(hash, (inputs, registered_at))| RegisteredTopology {
+                    topology_hash: *hash,
+                    inputs: inputs.clone(),
+                    registered_at: *registered_at,
+                })
+                .collect())
         }
     }
 }

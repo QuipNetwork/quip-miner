@@ -60,12 +60,18 @@ struct DownloadArgs {
     /// Output dataset directory (created if absent).
     #[arg(long)]
     out: PathBuf,
-    /// Only keep qblocks whose `topology_hash` matches this 64-char hex.
+    /// Only keep qblocks whose resolved mining-era `topology_hash` matches this
+    /// 64-char hex.
     #[arg(long)]
     topology: Option<String>,
     /// Max instances per topology bucket.
     #[arg(long, default_value_t = 10_000)]
     cap: usize,
+    /// Energy floor (milli): a qblock in a shallow era whose energy is below
+    /// this is reclassified into the previous (deeper) era. Defaults to the
+    /// measured h0 floor.
+    #[arg(long, default_value_t = quip_coordinator::download::DEFAULT_ENERGY_FLOOR_MILLI)]
+    energy_floor_milli: i64,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -527,6 +533,7 @@ fn run_download_cli(args: DownloadArgs) -> StdExitCode {
         out_dir: args.out,
         topology_filter,
         cap: args.cap,
+        energy_floor_milli: args.energy_floor_milli,
     };
     match rt.block_on(run_download(&chain, &params)) {
         Ok(summary) => {

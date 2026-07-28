@@ -18,7 +18,9 @@ use quip_coordinator::chain::qblock::{QBlockRecord, TopologyInputs};
 use quip_coordinator::chain::snapshot::MiningSnapshot;
 use quip_coordinator::chain::{ChainClient, FakeChain, RealChainClient};
 use quip_coordinator::download::record::hex_plain;
-use quip_coordinator::download::{run_download, DownloadParams, Selection};
+use quip_coordinator::download::{
+    run_download, DownloadParams, Selection, DEFAULT_ENERGY_FLOOR_MILLI,
+};
 use quip_coordinator::drive::{drain_all, ListSource};
 use quip_coordinator::topology::topology_hash_sets;
 
@@ -79,7 +81,7 @@ async fn download_writes_dataset_that_reloads_via_list_source() {
     );
 
     let fake = FakeChain::new(empty_snapshot(), None);
-    fake.set_topology(hash, topo.clone());
+    fake.set_registered_topology(hash, topo.clone(), 0);
     for id in 1..=3u64 {
         fake.set_qblock(id, qblock_at(id, hash));
     }
@@ -93,6 +95,7 @@ async fn download_writes_dataset_that_reloads_via_list_source() {
             out_dir: dir.clone(),
             topology_filter: None,
             cap: 10_000,
+            energy_floor_milli: DEFAULT_ENERGY_FLOOR_MILLI,
         },
     )
     .await
@@ -157,6 +160,7 @@ async fn devnet_download_qblocks_end_to_end() {
             out_dir: dir.clone(),
             topology_filter: None,
             cap: 10_000,
+            energy_floor_milli: DEFAULT_ENERGY_FLOOR_MILLI,
         },
     )
     .await

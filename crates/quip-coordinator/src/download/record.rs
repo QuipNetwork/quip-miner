@@ -70,12 +70,12 @@ pub enum VerifyError {
         /// Actual redrawn `j` length.
         got_j: usize,
     },
-    /// Recomputed topology hash differs from the qblock's recorded hash —
-    /// the fetched topology inputs are not the ones the proof was mined on.
+    /// Recomputed topology hash differs from the resolved era hash — the era's
+    /// fetched inputs do not hash to the era key (a chain inconsistency).
     TopologyHashMismatch {
-        /// The qblock's recorded `topology_hash`.
+        /// The mining-era `topology_hash` the record is bucketed under.
         expected: [u8; 32],
-        /// The hash recomputed from the fetched topology inputs.
+        /// The hash recomputed from the era's topology inputs.
         got: [u8; 32],
     },
 }
@@ -112,19 +112,25 @@ pub fn hex_plain(bytes: &[u8]) -> String {
     s
 }
 
-/// Redraw a qblock's Ising problem from its nonce and self-verify it, then
-/// build the ranked instance record.
+/// Redraw a qblock's Ising problem from its nonce against a **mining-era**
+/// topology and self-verify it, then build the ranked instance record.
+///
+/// `era_topology_hash` is the topology resolved from the mining-era timeline
+/// (see [`crate::download::timeline`]), NOT the qblock's stored hash — that
+/// stored hash is unreliable (clobbered by the chain's v5 migration backfill).
+/// The stamped `topology_hash` and bucket key are therefore `era_topology_hash`.
 ///
 /// Winning spins are not on-chain, so verification targets **problem
 /// regeneration**: (1) the draw succeeds, (2) `(h, j)` lengths match
-/// `(nodes, edges)`, (3) the recomputed `topology_hash` equals the qblock's
-/// recorded hash (proving the fetched topology is the right bucket).
+/// `(nodes, edges)`, (3) the recomputed `topology_hash` equals
+/// `era_topology_hash` (proving the era's fetched inputs hash to the era key).
 ///
 /// # Errors
 /// [`VerifyError`] if any of the three checks fails.
 pub fn build_instance_record(
     q: &QBlockRecord,
     topo: &TopologyInputs,
+    era_topology_hash: [u8; 32],
 ) -> Result<InstanceRecord, VerifyError> {
     let (h, j) = draw_ising_milli(
         q.nonce,
@@ -149,15 +155,15 @@ pub fn build_instance_record(
         &topo.allowed_j_milli,
         &topo.allowed_spin_milli,
     );
-    if recomputed != q.topology_hash {
+    if recomputed != era_topology_hash {
         return Err(VerifyError::TopologyHashMismatch {
-            expected: q.topology_hash,
+            expected: era_topology_hash,
             got: recomputed,
         });
     }
     Ok(InstanceRecord {
         nonce: hex_plain(&q.nonce),
-        topology_hash: hex_plain(&q.topology_hash),
+        topology_hash: hex_plain(&era_topology_hash),
         energy_milli: q.energy_milli,
         salt_hex: hex_plain(&q.salt),
         qblock_id: q.qblock_id,
@@ -221,7 +227,7 @@ mod tests {
             &t.allowed_j_milli,
             &t.allowed_spin_milli,
         );
-        let rec = build_instance_record(&qblock(h), &t).unwrap();
+        let rec = build_instance_record(&qblock(h), &t, h).unwrap();
         assert_eq!(rec.nonce, "5a".repeat(32)); // un-prefixed, 64 chars
         assert_eq!(rec.topology_hash, hex_plain(&h));
         assert_eq!(rec.energy_milli, -14_510_000);
@@ -232,9 +238,28 @@ mod tests {
 
     #[test]
     fn wrong_topology_hash_fails_self_verify() {
-        // topology_hash that does NOT match the given inputs → rejected.
-        let err = build_instance_record(&qblock([0x00; 32]), &topo()).unwrap_err();
+        // Era hash that does NOT match the given inputs → rejected. (The era's
+        // inputs must hash to its key; a mismatch is a chain inconsistency.)
+        let err = build_instance_record(&qblock([0x00; 32]), &topo(), [0x00; 32]).unwrap_err();
         assert!(matches!(err, VerifyError::TopologyHashMismatch { .. }));
+    }
+
+    #[test]
+    fn stored_qblock_hash_is_ignored_in_favor_of_era_hash() {
+        // The qblock carries a bogus (migration-clobbered) stored hash, but the
+        // record is verified and stamped against the era hash of the inputs.
+        let t = topo();
+        let era_hash = topology_hash_sets(
+            &t.nodes,
+            &t.edges,
+            &t.allowed_h_milli,
+            &t.allowed_j_milli,
+            &t.allowed_spin_milli,
+        );
+        let mut q = qblock([0xff; 32]); // stored hash is wrong on purpose
+        q.topology_hash = [0xff; 32];
+        let rec = build_instance_record(&q, &t, era_hash).unwrap();
+        assert_eq!(rec.topology_hash, hex_plain(&era_hash));
     }
 
     #[test]
@@ -249,7 +274,7 @@ mod tests {
             &t.allowed_spin_milli,
         );
         assert!(matches!(
-            build_instance_record(&qblock(h), &t),
+            build_instance_record(&qblock(h), &t, h),
             Err(VerifyError::Draw(_))
         ));
     }

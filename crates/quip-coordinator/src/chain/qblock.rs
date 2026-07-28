@@ -38,6 +38,20 @@ pub struct QBlockRecord {
     pub nonce: [u8; 32],
 }
 
+/// A registered topology plus its registration block, as enumerated from
+/// `RegisteredTopologies`. `registered_at` orders the mining-era timeline the
+/// `download` command uses to re-attribute qblocks (the stored per-qblock
+/// `topology_hash` is unreliable — clobbered by the v5 migration backfill).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredTopology {
+    /// Consensus topology hash (key in `RegisteredTopologies`).
+    pub topology_hash: [u8; 32],
+    /// Redraw inputs (Set-only allowed specs).
+    pub inputs: TopologyInputs,
+    /// Block number the topology was registered at.
+    pub registered_at: u32,
+}
+
 /// Topology redraw inputs, decoded from `TopologyMeta` (Set specs only).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopologyInputs {
@@ -91,6 +105,21 @@ impl TopologyMetaScale {
             allowed_h_milli: require_set_values(&self.allowed_h_values)?,
             allowed_j_milli: require_set_values(&self.allowed_j_values)?,
             allowed_spin_milli: require_set_values(&self.allowed_spin_values)?,
+        })
+    }
+
+    /// Decode into a [`RegisteredTopology`] for `topology_hash`, keeping the
+    /// `registered_at` block that orders the mining-era timeline.
+    ///
+    /// # Errors
+    /// Same as [`Self::into_inputs`] — a range/empty allowed-value spec cannot
+    /// be redrawn.
+    pub fn into_registered(self, topology_hash: [u8; 32]) -> Result<RegisteredTopology, String> {
+        let registered_at = self.registered_at;
+        Ok(RegisteredTopology {
+            topology_hash,
+            inputs: self.into_inputs()?,
+            registered_at,
         })
     }
 }
