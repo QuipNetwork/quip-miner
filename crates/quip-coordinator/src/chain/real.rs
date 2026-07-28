@@ -12,16 +12,18 @@ use super::extrinsic::{
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
     encode_submit_proof_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
-    MiningSnapshotScale, OrderStatus,
+    MiningSnapshotScale, OrderStatus, QBlockWithNonceScale, TopologyMetaScale,
 };
 use super::submit::{classify_receipt, Proof, SubmitAction};
-use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot};
+use super::{
+    ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, QBlockRecord, TopologyInputs,
+};
 use crate::decay::{
     DEFAULT_BASE_MAX_ENERGY_MILLI, DEFAULT_C_EASY_MILLI, DEFAULT_C_HARD_MILLI,
     DEFAULT_C_KNEE_MILLI, EPOCH_LENGTH_BLOCKS,
 };
 use async_trait::async_trait;
-use parity_scale_codec::Decode;
+use parity_scale_codec::{Decode, Encode};
 use quantum_validation::AllowedValueSpec;
 use quip_transaction_crypto::HybridPair;
 use serde_json::Value;
@@ -132,6 +134,36 @@ impl RealChainClient {
         T::decode(&mut &bytes[..])
             .map(Some)
             .map_err(|e| ChainError::Decode(e.to_string()))
+    }
+
+    /// Run a `QuantumPowApi` runtime call at best head with SCALE-encoded
+    /// `params`, returning the raw result bytes (`None` on null result).
+    async fn quantum_pow_call_at_head(
+        &self,
+        method: &str,
+        params: &[u8],
+    ) -> Result<Option<Vec<u8>>, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let block_hash = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))
+            .and_then(|hex| hex_decode(hex).map_err(ChainError::Decode))?;
+        let result = self
+            .rpc_call(
+                "state_call",
+                Value::Array(vec![
+                    Value::String(method.to_string()),
+                    Value::String(hex_encode(params)),
+                    Value::String(hex_encode(&block_hash)),
+                ]),
+            )
+            .await?;
+        match result.as_str() {
+            None => Ok(None),
+            Some(hex) => hex_decode(hex).map(Some).map_err(ChainError::Decode),
+        }
     }
 }
 
@@ -395,6 +427,37 @@ impl ChainClient for RealChainClient {
             });
         }
         Ok(orders)
+    }
+
+    async fn fetch_qblock_by_id(&self, qblock_id: u64) -> Result<Option<QBlockRecord>, ChainError> {
+        // Arg: SCALE(u64).
+        let Some(bytes) = self
+            .quantum_pow_call_at_head("QuantumPowApi_qblock_by_id", &qblock_id.encode())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let decoded: Option<QBlockWithNonceScale> =
+            Decode::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))?;
+        Ok(decoded.map(|qn| qn.into_record(qblock_id)))
+    }
+
+    async fn fetch_topology_meta(
+        &self,
+        topology_hash: [u8; 32],
+    ) -> Result<Option<TopologyInputs>, ChainError> {
+        // Arg: SCALE(H256) == the 32 hash bytes verbatim.
+        let Some(bytes) = self
+            .quantum_pow_call_at_head("QuantumPowApi_topology_meta", &topology_hash)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let decoded: Option<TopologyMetaScale> =
+            Decode::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))?;
+        decoded
+            .map(|m| m.into_inputs().map_err(ChainError::Decode))
+            .transpose()
     }
 
     #[expect(

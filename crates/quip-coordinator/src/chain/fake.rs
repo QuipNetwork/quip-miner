@@ -1,7 +1,11 @@
 //! Scripted chain for tests: fixed snapshot, optional mempool order, captured submits.
 
-use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, Proof, SubmitAction};
+use super::{
+    ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, Proof, QBlockRecord,
+    SubmitAction, TopologyInputs,
+};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// Test double: returns a scripted snapshot / order and records submits.
@@ -16,6 +20,10 @@ pub struct FakeChain {
     qblock_id: Mutex<Option<u64>>,
     /// Scripted `fetch_decay_params` (default `None`).
     decay_params: Mutex<Option<DecayParams>>,
+    /// Scripted `fetch_qblock_by_id` results, keyed by qblock id.
+    qblocks: Mutex<HashMap<u64, QBlockRecord>>,
+    /// Scripted `fetch_topology_meta` results, keyed by topology hash.
+    topologies: Mutex<HashMap<[u8; 32], TopologyInputs>>,
 }
 
 impl FakeChain {
@@ -29,6 +37,36 @@ impl FakeChain {
             submit_result: Mutex::new(Ok(SubmitAction::Success)),
             qblock_id: Mutex::new(None),
             decay_params: Mutex::new(None),
+            qblocks: Mutex::new(HashMap::new()),
+            topologies: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Script a qblock returned by `fetch_qblock_by_id(id)`.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_qblock(&self, id: u64, rec: QBlockRecord) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            let _ = self.qblocks.lock().unwrap().insert(id, rec);
+        }
+    }
+
+    /// Script a topology returned by `fetch_topology_meta(hash)`.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_topology(&self, hash: [u8; 32], inputs: TopologyInputs) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            let _ = self.topologies.lock().unwrap().insert(hash, inputs);
         }
     }
 
@@ -188,5 +226,86 @@ impl ChainClient for FakeChain {
         {
             Ok(self.decay_params.lock().unwrap().clone())
         }
+    }
+
+    async fn fetch_qblock_by_id(&self, qblock_id: u64) -> Result<Option<QBlockRecord>, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(self.qblocks.lock().unwrap().get(&qblock_id).cloned())
+        }
+    }
+
+    async fn fetch_topology_meta(
+        &self,
+        topology_hash: [u8; 32],
+    ) -> Result<Option<TopologyInputs>, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(self.topologies.lock().unwrap().get(&topology_hash).cloned())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_snapshot() -> MiningSnapshot {
+        MiningSnapshot {
+            last_proof_block_hash: [0u8; 32],
+            topology_hash: vec![9u8; 32],
+            nodes: vec![0, 1],
+            edges: vec![(0, 1)],
+            allowed_h_milli: vec![-1000, 0, 1000],
+            allowed_j_milli: vec![-1000, 1000],
+            allowed_spin_milli: vec![-1000, 1000],
+            min_solutions: 1,
+            max_energy_milli: i64::MAX,
+            min_diversity_milli: 0,
+            block_number: 0,
+        }
+    }
+
+    fn sample_qblock() -> QBlockRecord {
+        QBlockRecord {
+            qblock_id: 1,
+            miner: [1; 32],
+            salt: [2; 32],
+            energy_milli: -1,
+            reward: 0,
+            submitted_at: 0,
+            last_proof_block_hash: [0; 32],
+            topology_hash: [9; 32],
+            device_access_time_us: 0,
+            max_energy_milli: -1,
+            min_solutions: 1,
+            min_diversity_milli: 0,
+            nonce: [7; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_returns_scripted_qblock_and_topology() {
+        let fake = FakeChain::new(sample_snapshot(), None);
+        assert!(fake.fetch_qblock_by_id(1).await.unwrap().is_none());
+        let rec = sample_qblock();
+        fake.set_qblock(1, rec.clone());
+        assert_eq!(fake.fetch_qblock_by_id(1).await.unwrap(), Some(rec));
+        assert!(fake.fetch_topology_meta([9; 32]).await.unwrap().is_none());
+        let topo = TopologyInputs {
+            nodes: vec![0, 1],
+            edges: vec![(0, 1)],
+            allowed_h_milli: vec![-1000, 0, 1000],
+            allowed_j_milli: vec![-1000, 1000],
+            allowed_spin_milli: vec![-1000, 1000],
+        };
+        fake.set_topology([9; 32], topo.clone());
+        assert_eq!(fake.fetch_topology_meta([9; 32]).await.unwrap(), Some(topo));
     }
 }

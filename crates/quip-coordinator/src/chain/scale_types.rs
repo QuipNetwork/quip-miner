@@ -340,8 +340,7 @@ mod tests {
             registered_at: 7,
         };
         let encoded = Some(m.clone()).encode();
-        let decoded: Option<TopologyMetaScale> =
-            Decode::decode(&mut &encoded[..]).expect("decode");
+        let decoded: Option<TopologyMetaScale> = Decode::decode(&mut &encoded[..]).expect("decode");
         assert_eq!(decoded, Some(m));
     }
 

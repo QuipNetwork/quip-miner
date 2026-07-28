@@ -77,4 +77,17 @@ pub trait ChainClient: Send + Sync {
         &self,
         topology_hash: [u8; 32],
     ) -> Result<Option<DecayParams>, ChainError>;
+
+    /// Fetch the winning qblock for a monotonic `qblock_id`
+    /// (`QuantumPowApi_qblock_by_id`), with its derived nonce. `None` when the
+    /// id is unassigned or the block had no accepted proof.
+    async fn fetch_qblock_by_id(&self, qblock_id: u64) -> Result<Option<QBlockRecord>, ChainError>;
+
+    /// Fetch a registered topology's redraw inputs by hash
+    /// (`QuantumPowApi_topology_meta`). `None` if the hash was never
+    /// registered; `Err` if its allowed-value specs are non-Set (unredrawable).
+    async fn fetch_topology_meta(
+        &self,
+        topology_hash: [u8; 32],
+    ) -> Result<Option<TopologyInputs>, ChainError>;
 }
