@@ -244,9 +244,136 @@ pub fn require_set_values(spec: &AllowedValueSpec<Vec<i32>>) -> Result<Vec<i32>,
     }
 }
 
+/// On-chain winning block (matches pallet `QBlock<AccountId32, u128, u32>`,
+/// `types.rs:205`). Field order is the pallet's; layout must stay
+/// byte-identical.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct QBlockScale {
+    /// Winning miner account (`AccountId32` raw bytes).
+    pub miner: [u8; 32],
+    /// 32-byte salt used in nonce derivation.
+    pub salt: [u8; 32],
+    /// Achieved winning energy in milli units (most negative = hardest).
+    pub energy_milli: i64,
+    /// Block reward in plancks.
+    pub reward: u128,
+    /// Substrate block number the proof was accepted at.
+    pub submitted_at: u32,
+    /// Active difficulty gates the proof cleared.
+    pub difficulty: DifficultyConfig,
+    /// Hash of the block holding the previous winning proof (nonce input).
+    pub last_proof_block_hash: H256,
+    /// Topology the proof was mined against.
+    pub topology_hash: H256,
+    /// Miner-reported compute time in microseconds (`0` = unreported).
+    pub device_access_time_us: u64,
+}
+
+/// Runtime-API view augmenting [`QBlockScale`] with its derived nonce
+/// (matches pallet `QBlockWithNonce`, `types.rs:236`).
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct QBlockWithNonceScale {
+    /// The winning block. (Field name mirrors the pallet's `solution`.)
+    pub solution: QBlockScale,
+    /// Derived `PoW` nonce as a `U256` (big-endian of the BLAKE3 digest).
+    pub nonce: U256,
+}
+
+/// Registered topology definition (matches pallet
+/// `TopologyMeta<Nodes, Edges, AllowedValues, BlockNumber>`, `types.rs:79`).
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct TopologyMetaScale {
+    /// Topology node ids.
+    pub nodes: Vec<u32>,
+    /// Topology undirected edges as `(u, v)` node-id pairs.
+    pub edges: Vec<(u32, u32)>,
+    /// Allowed linear-field values.
+    pub allowed_h_values: AllowedValueSpec<Vec<i32>>,
+    /// Allowed coupling values.
+    pub allowed_j_values: AllowedValueSpec<Vec<i32>>,
+    /// Allowed spin values.
+    pub allowed_spin_values: AllowedValueSpec<Vec<i32>>,
+    /// Block number the topology was registered at.
+    pub registered_at: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qblock_with_nonce_scale_roundtrip() {
+        let q = QBlockScale {
+            miner: [0x11; 32],
+            salt: [0x22; 32],
+            energy_milli: -14_520_000,
+            reward: 1_000_000_000_000,
+            submitted_at: 4242,
+            difficulty: DifficultyConfig {
+                min_solutions: 5,
+                max_energy_milli: -14_490_000,
+                min_diversity_milli: 200,
+            },
+            last_proof_block_hash: H256::from([3u8; 32]),
+            topology_hash: H256::from([0x6e; 32]),
+            device_access_time_us: 987_654,
+        };
+        let qn = QBlockWithNonceScale {
+            solution: q,
+            nonce: U256::from_big_endian(&[0xab; 32]),
+        };
+        // Runtime API returns Option<QBlockWithNonce>.
+        let encoded = Some(qn.clone()).encode();
+        let decoded: Option<QBlockWithNonceScale> =
+            Decode::decode(&mut &encoded[..]).expect("decode");
+        assert_eq!(decoded, Some(qn));
+    }
+
+    #[test]
+    fn topology_meta_scale_roundtrip() {
+        let m = TopologyMetaScale {
+            nodes: vec![0, 1, 2, 3],
+            edges: vec![(0, 1), (1, 2), (2, 3), (0, 3)],
+            allowed_h_values: AllowedValueSpec::Set(vec![-1000, 0, 1000]),
+            allowed_j_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            allowed_spin_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            registered_at: 7,
+        };
+        let encoded = Some(m.clone()).encode();
+        let decoded: Option<TopologyMetaScale> =
+            Decode::decode(&mut &encoded[..]).expect("decode");
+        assert_eq!(decoded, Some(m));
+    }
+
+    #[test]
+    fn qblock_with_nonce_decode_rejects_truncated() {
+        // Untrusted chain bytes: a chopped payload must Err, never panic.
+        let qn = QBlockWithNonceScale {
+            solution: QBlockScale {
+                miner: [1; 32],
+                salt: [2; 32],
+                energy_milli: -1,
+                reward: 0,
+                submitted_at: 0,
+                difficulty: DifficultyConfig {
+                    min_solutions: 1,
+                    max_energy_milli: -1,
+                    min_diversity_milli: 0,
+                },
+                last_proof_block_hash: H256::zero(),
+                topology_hash: H256::zero(),
+                device_access_time_us: 0,
+            },
+            nonce: U256::zero(),
+        };
+        let enc = qn.encode();
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "enc is a full encode; len-4 in bounds"
+        )]
+        let truncated = &enc[..enc.len() - 4];
+        assert!(QBlockWithNonceScale::decode(&mut &truncated[..]).is_err());
+    }
 
     #[test]
     fn require_set_values_accepts_nonempty_set() {
