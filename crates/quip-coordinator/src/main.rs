@@ -1,9 +1,10 @@
 //! quip-coordinator binary: CLI, runtime wiring, graceful shutdown.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use quip_coordinator::chain::extrinsic::{load_hybrid_pair, miner_identity_bytes};
+use quip_coordinator::chain::extrinsic::{hex_decode, load_hybrid_pair, miner_identity_bytes};
 use quip_coordinator::chain::RealChainClient;
 use quip_coordinator::config::{parse_config, LaunchEntry};
+use quip_coordinator::download::{run_download, DownloadParams, Selection};
 use quip_coordinator::drive::{
     aggregate, drain_all, parse_topology_spec, print_table, run_drive, write_jsonl,
     DriveManyParams, ListSource, RandomSource,
@@ -38,6 +39,33 @@ struct Cli {
 enum Command {
     /// Drive a spawned miner with synthetic work; no chain, no submit.
     Drive(DriveArgs),
+    /// Download winning qblocks from chain into a `hardest_models` dataset.
+    Download(DownloadArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct DownloadArgs {
+    /// Validator RPC URL(s) (ws:// or http://), primary first. Repeatable.
+    #[arg(long, required = true)]
+    validator: Vec<String>,
+    /// First qblock id (inclusive). Requires --to; mutually exclusive with --all.
+    #[arg(long)]
+    from: Option<u64>,
+    /// Last qblock id (inclusive). Requires --from.
+    #[arg(long)]
+    to: Option<u64>,
+    /// Download all qblocks 1..=latest. Mutually exclusive with --from/--to.
+    #[arg(long, default_value_t = false)]
+    all: bool,
+    /// Output dataset directory (created if absent).
+    #[arg(long)]
+    out: PathBuf,
+    /// Only keep qblocks whose `topology_hash` matches this 64-char hex.
+    #[arg(long)]
+    topology: Option<String>,
+    /// Max instances per topology bucket.
+    #[arg(long, default_value_t = 10_000)]
+    cap: usize,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -108,6 +136,7 @@ fn main() -> StdExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Drive(args)) => run_drive_cli(args),
+        Some(Command::Download(args)) => run_download_cli(args),
         None => run_config_path(cli.config),
     }
 }
@@ -439,6 +468,78 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
     StdExitCode::from(ExitCode::Clean as u8)
 }
 
+/// Resolve `--from`/`--to`/`--all` into a [`Selection`], rejecting
+/// combinations that are ambiguous or incomplete.
+fn parse_selection(from: Option<u64>, to: Option<u64>, all: bool) -> Result<Selection, String> {
+    match (all, from, to) {
+        (true, None, None) => Ok(Selection::All),
+        (true, _, _) => Err("--all is mutually exclusive with --from/--to".into()),
+        (false, Some(from), Some(to)) => Ok(Selection::Range { from, to }),
+        (false, None, None) => Err("provide --all, or both --from and --to".into()),
+        (false, _, _) => Err("--from and --to must be provided together".into()),
+    }
+}
+
+/// Parse a 64-char hex `--topology` filter into 32 raw bytes.
+fn parse_topology_hex(hex: &str) -> Result<[u8; 32], String> {
+    let bytes = hex_decode(hex)?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "--topology must decode to 32 bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "CLI binary reports download run failures/summary to stderr"
+)]
+fn run_download_cli(args: DownloadArgs) -> StdExitCode {
+    let selection = match parse_selection(args.from, args.to, args.all) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+        }
+    };
+    let topology_filter = match args.topology.as_deref().map(parse_topology_hex).transpose() {
+        Ok(f) => f,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+        }
+    };
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: runtime: {e}");
+            return StdExitCode::from(ExitCode::InternalFatal as u8);
+        }
+    };
+    // Empty signer key: download only reads chain state, never signs/submits.
+    let chain = RealChainClient::new(args.validator, String::new());
+    let params = DownloadParams {
+        selection,
+        out_dir: args.out,
+        topology_filter,
+        cap: args.cap,
+    };
+    match rt.block_on(run_download(&chain, &params)) {
+        Ok(summary) => {
+            eprintln!("download: {summary:?}");
+            StdExitCode::from(ExitCode::Clean as u8)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            StdExitCode::from(ExitCode::InternalFatal as u8)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +599,44 @@ mod tests {
         assert!(preset_path("a/b").is_err());
         assert!(preset_path("").is_err());
         assert!(preset_path("smoke").is_ok());
+    }
+
+    #[test]
+    fn parse_selection_all_alone_is_ok() {
+        assert_eq!(parse_selection(None, None, true), Ok(Selection::All));
+    }
+
+    #[test]
+    fn parse_selection_from_to_is_ok() {
+        assert_eq!(
+            parse_selection(Some(1), Some(5), false),
+            Ok(Selection::Range { from: 1, to: 5 })
+        );
+    }
+
+    #[test]
+    fn parse_selection_all_with_from_is_error() {
+        assert!(parse_selection(Some(1), None, true).is_err());
+    }
+
+    #[test]
+    fn parse_selection_from_without_to_is_error() {
+        assert!(parse_selection(Some(1), None, false).is_err());
+    }
+
+    #[test]
+    fn parse_selection_neither_is_error() {
+        assert!(parse_selection(None, None, false).is_err());
+    }
+
+    #[test]
+    fn parse_topology_hex_rejects_wrong_length() {
+        assert!(parse_topology_hex("aabb").is_err());
+    }
+
+    #[test]
+    fn parse_topology_hex_accepts_64_char_hex() {
+        let hash = parse_topology_hex(&"11".repeat(32)).unwrap();
+        assert_eq!(hash, [0x11; 32]);
     }
 }
