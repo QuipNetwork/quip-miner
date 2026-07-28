@@ -5,6 +5,7 @@ pub mod extrinsic;
 pub mod fake;
 pub mod mempool;
 pub mod proof_encode;
+pub mod qblock;
 pub mod real;
 pub mod scale_types;
 pub mod snapshot;
@@ -12,6 +13,7 @@ pub mod submit;
 
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
+pub use qblock::{QBlockRecord, TopologyInputs};
 pub use real::RealChainClient;
 pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
 pub use submit::{classify_receipt, Proof, SubmitAction};
