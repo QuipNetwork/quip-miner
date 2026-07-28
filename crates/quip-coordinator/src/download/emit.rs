@@ -48,7 +48,11 @@ pub struct ManifestEntry {
     /// Topology node count.
     pub nodes: usize,
     /// Topology edge count.
-    pub edges: usize,
+    pub edge_count: usize,
+    /// Topology adjacency (undirected edge endpoint pairs), so consumers can
+    /// redraw the graph from the manifest alone without opening
+    /// `topology.spec.json`.
+    pub edges: Vec<(u32, u32)>,
     /// Allowed linear-field values (milli).
     pub allowed_h_milli: Vec<i32>,
     /// Allowed coupling values (milli).
@@ -78,7 +82,8 @@ fn manifest_entry(
         energy_band_min_milli,
         energy_band_max_milli,
         nodes: topo.nodes.len(),
-        edges: topo.edges.len(),
+        edge_count: topo.edges.len(),
+        edges: topo.edges.clone(),
         allowed_h_milli: topo.allowed_h_milli.clone(),
         allowed_j_milli: topo.allowed_j_milli.clone(),
         allowed_spin_milli: topo.allowed_spin_milli.clone(),
@@ -92,9 +97,20 @@ struct Manifest<'a> {
     buckets: BTreeMap<&'a String, ManifestEntry>,
 }
 
-/// Write `<out>/<hash>/instances.jsonl` per bucket plus a single
-/// `<out>/manifest.json` describing every bucket (with its embedded topology
-/// spec, so miners can redraw h/J offline).
+/// `<out>/<hash>/topology.spec.json` body, matching the drive harness's
+/// `TopologySpecJson` schema (`drive::topology_spec`) exactly, so it loads
+/// via `--topology` (and by miner benches) without a chain connection.
+#[derive(serde::Serialize)]
+struct TopologySpecOut<'a> {
+    nodes: &'a [u32],
+    edges: &'a [(u32, u32)],
+    allowed_h_milli: &'a [i32],
+    allowed_j_milli: &'a [i32],
+}
+
+/// Write `<out>/<hash>/instances.jsonl` + `<out>/<hash>/topology.spec.json`
+/// per bucket plus a single `<out>/manifest.json` describing every bucket
+/// (with its topology summary, so miners can redraw h/J offline).
 ///
 /// # Errors
 /// Returns an I/O error if any directory/file cannot be created or written.
@@ -118,6 +134,16 @@ pub fn write_dataset(
             body.push('\n');
         }
         std::fs::write(bucket_dir.join("instances.jsonl"), body)?;
+        let spec = TopologySpecOut {
+            nodes: &topo.nodes,
+            edges: &topo.edges,
+            allowed_h_milli: &topo.allowed_h_milli,
+            allowed_j_milli: &topo.allowed_j_milli,
+        };
+        std::fs::write(
+            bucket_dir.join("topology.spec.json"),
+            serde_json::to_string_pretty(&spec)?,
+        )?;
         let _ = manifest.insert(hash, manifest_entry(hash, recs, topo, default_hash_hex));
     }
     let doc = Manifest {
@@ -218,6 +244,40 @@ mod tests {
         let manifest = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
         assert!(manifest.contains("\"chain-default\"")); // alias for default_hash
         assert!(manifest.contains("energy_band_min_milli"));
+        assert!(manifest.contains("\"edge_count\": 1"));
+        assert!(manifest.contains("\"edges\": [\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Guardrail: `topology.spec.json` must deserialize via the drive
+    /// harness's `TopologySpecJson` schema (`parse_topology_spec`) and its
+    /// nodes/edges/allowed values must round-trip exactly. A miner offline
+    /// (no chain) redraws the graph from this file alone.
+    #[test]
+    fn topology_spec_json_round_trips_via_drive_parser() {
+        use crate::drive::parse_topology_spec;
+
+        let dir = std::env::temp_dir().join(format!("hm-spec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut buckets = BTreeMap::new();
+        let _ = buckets.insert("aa".to_string(), vec![rec("aa", -500, "01")]);
+        let mut topo = BTreeMap::new();
+        let input = TopologyInputs {
+            nodes: vec![0, 1, 2, 3],
+            edges: vec![(0, 1), (1, 2), (2, 3), (0, 3)],
+            allowed_h_milli: vec![-1000, 0, 1000],
+            allowed_j_milli: vec![-1000, 1000],
+            allowed_spin_milli: vec![-1000, 1000],
+        };
+        let _ = topo.insert("aa".to_string(), input.clone());
+        write_dataset(&dir, &buckets, &topo, None).unwrap();
+
+        let text = std::fs::read_to_string(dir.join("aa/topology.spec.json")).unwrap();
+        let spec = parse_topology_spec(&text).unwrap();
+        assert_eq!(spec.topology.nodes, input.nodes);
+        assert_eq!(spec.topology.edge_pairs(), input.edges);
+        assert_eq!(spec.allowed_h_milli, input.allowed_h_milli);
+        assert_eq!(spec.allowed_j_milli, input.allowed_j_milli);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
