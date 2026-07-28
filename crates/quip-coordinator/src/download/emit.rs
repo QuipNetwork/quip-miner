@@ -220,4 +220,58 @@ mod tests {
         assert!(manifest.contains("energy_band_min_milli"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Guardrail: the emitted `instances.jsonl` must be byte-compatible with
+    /// the drive harness's `--source list` loader. A schema drift here (field
+    /// name, `0x` prefix) would silently break the whole download → drive
+    /// pipeline.
+    #[test]
+    fn emitted_jsonl_loads_via_list_source() {
+        use crate::chain::snapshot::MiningSnapshot;
+        use crate::download::record::hex_plain;
+        use crate::drive::{drain_all, ListSource};
+
+        // A bucket whose topology matches the snapshot the drive harness will pass.
+        let snap = MiningSnapshot {
+            last_proof_block_hash: [0u8; 32],
+            topology_hash: vec![9u8; 32],
+            nodes: vec![0, 1, 2, 3],
+            edges: vec![(0, 1), (1, 2), (2, 3), (0, 3)],
+            allowed_h_milli: vec![-1000, 0, 1000],
+            allowed_j_milli: vec![-1000, 1000],
+            allowed_spin_milli: vec![-1000, 1000],
+            min_solutions: 1,
+            max_energy_milli: i64::MAX,
+            min_diversity_milli: 0,
+            block_number: 0,
+        };
+        let hash_hex = hex_plain(&[9u8; 32]);
+        // Two instances with real 64-char nonces.
+        let recs = vec![
+            rec(&hash_hex, -500, &"11".repeat(32)),
+            rec(&hash_hex, -100, &"22".repeat(32)),
+        ];
+        let buckets = bucket_and_rank(recs, 10_000);
+        let mut topo_map = BTreeMap::new();
+        let _ = topo_map.insert(
+            hash_hex.clone(),
+            TopologyInputs {
+                nodes: snap.nodes.clone(),
+                edges: snap.edges.clone(),
+                allowed_h_milli: snap.allowed_h_milli.clone(),
+                allowed_j_milli: snap.allowed_j_milli.clone(),
+                allowed_spin_milli: snap.allowed_spin_milli.clone(),
+            },
+        );
+        let dir = std::env::temp_dir().join(format!("hm-ls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_dataset(&dir, &buckets, &topo_map, None).unwrap();
+        let jsonl = dir.join(&hash_hex).join("instances.jsonl");
+        // The drive harness load path: nonce-ref entries re-derived against the snapshot.
+        let mut src = ListSource::load(&jsonl, Some(&snap), 0).unwrap();
+        let jobs = drain_all(&mut src);
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.first().unwrap().provenance.as_ref().unwrap().is_pow); // recognized as nonce-ref
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
