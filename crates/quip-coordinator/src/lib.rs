@@ -6,6 +6,7 @@ pub mod chain;
 pub mod config;
 pub mod dashboard;
 pub mod decay;
+pub mod download;
 pub mod drive;
 pub mod liveness;
 /// `PoW` and mempool job construction helpers.
