@@ -1,6 +1,6 @@
 //! tonic `MinerService` server: token verify, handshake, job dispatch, results.
 
-use crate::chain::{ChainClient, Proof, SubmitAction};
+use crate::chain::{ChainClient, ChainError, Proof, SubmitAction, SubmitReceipt};
 use crate::config::LaunchEntry;
 use crate::router::{MinerCaps, Router};
 use crate::topology::Topology;
@@ -200,6 +200,12 @@ pub struct CoordinatorState {
     /// Live controller counters. Shared with the dashboard router, so the HTTP
     /// handlers never take this mutex.
     pub metrics: Arc<crate::metrics::CoordinatorMetrics>,
+    /// `LastProofBlockHash` the current round's jobs were built on, as
+    /// `0x`-prefixed hex. Set by the feeder on reseed.
+    pub last_proof_block_hash: String,
+    /// `miner_id` to its backend label (`CPU`, `GPU-CUDA`). Seeded from the
+    /// launch plan so the session can stamp every attempt.
+    pub miner_types: HashMap<String, String>,
 }
 
 impl CoordinatorState {
@@ -228,6 +234,8 @@ impl CoordinatorState {
             generation: 0,
             miner_liveness: HashMap::new(),
             metrics: Arc::new(crate::metrics::CoordinatorMetrics::new(&[])),
+            last_proof_block_hash: String::new(),
+            miner_types: HashMap::new(),
         }
     }
 
@@ -578,6 +586,10 @@ async fn run_session<C: ChainClient>(
                         // transient reason: keep it for the win-time retry loop
                         // instead of dropping a genuine winner.
                         let mut retain_for_retry = false;
+                        // Chain detail of the submit attempt, kept for the
+                        // attempt record below; `None` when this result never
+                        // reached the gate that triggers a submit.
+                        let mut receipt: Option<Result<SubmitReceipt, ChainError>> = None;
                         if validated.accepted && beats_current(validated.best_energy_milli, best) {
                             let proof = Proof {
                                 job_id: result.job_id.clone(),
@@ -605,8 +617,8 @@ async fn run_session<C: ChainClient>(
                                     .map_or(0, |m| m.device_access_time_us),
                             };
                             let job_hex = crate::chain::extrinsic::hex_encode(&result.job_id);
-                            let receipt = chain.submit_proof(&proof).await;
-                            match receipt.as_ref().map(|r| r.action) {
+                            let submit_result = chain.submit_proof(&proof).await;
+                            match submit_result.as_ref().map(|r| r.action) {
                                 Ok(SubmitAction::Success) => {
                                     let mut st = state.lock().await;
                                     st.current_best_milli = Some(validated.best_energy_milli);
@@ -647,6 +659,7 @@ async fn run_session<C: ChainClient>(
                                     retain_for_retry = true;
                                 }
                             }
+                            receipt = Some(submit_result);
                         }
                         // Record the attempt; stash sub-threshold candidates so
                         // the easing difficulty can still win them; refresh the
@@ -714,6 +727,41 @@ async fn run_session<C: ChainClient>(
                                 );
                             }
 
+                            let pow_sequence = submitted
+                                .then(|| st.metrics.chain().miner_info.map(|i| i.proofs_submitted))
+                                .flatten();
+                            let ctx = crate::attempt::AttemptContext {
+                                miner_type: st
+                                    .miner_types
+                                    .get(&miner_id)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                // The ceiling the coordinator checked this
+                                // result against, not the base difficulty: the
+                                // gate is what decided accept or reject.
+                                threshold_milli: gates.min_energy_milli,
+                                last_proof_block_hash: st.last_proof_block_hash.clone(),
+                                extrinsic_hash: receipt
+                                    .as_ref()
+                                    .and_then(|r| r.as_ref().ok())
+                                    .and_then(|r| r.extrinsic_hash)
+                                    .map(|h| {
+                                        format!("0x{}", crate::chain::extrinsic::hex_encode(&h))
+                                    }),
+                                chain_block_hash: receipt
+                                    .as_ref()
+                                    .and_then(|r| r.as_ref().ok())
+                                    .and_then(|r| r.block_hash)
+                                    .map(|h| {
+                                        format!("0x{}", crate::chain::extrinsic::hex_encode(&h))
+                                    }),
+                                chain_block_number: receipt
+                                    .as_ref()
+                                    .and_then(|r| r.as_ref().ok())
+                                    .and_then(|r| r.block_number),
+                                pow_sequence,
+                                device_access_time_us: device_us,
+                            };
                             let attempt = crate::attempt::AttemptRecord::new(
                                 qblock_id,
                                 &miner_id,
@@ -721,7 +769,7 @@ async fn run_session<C: ChainClient>(
                                 &job,
                                 &validated,
                                 submitted,
-                                device_us,
+                                &ctx,
                             );
                             let summary = (stash_changed || submitted).then(|| {
                                 crate::attempt::summary_body(
@@ -732,7 +780,8 @@ async fn run_session<C: ChainClient>(
                                 )
                             });
                             if let Some(tx) = st.attempt_tx.as_ref() {
-                                let _ = tx.send(crate::attempt::WriterMsg::Attempt(attempt));
+                                let _ =
+                                    tx.send(crate::attempt::WriterMsg::Attempt(Box::new(attempt)));
                                 if let Some(body) = summary {
                                     let _ = tx.send(crate::attempt::WriterMsg::Summary {
                                         qblock_id,

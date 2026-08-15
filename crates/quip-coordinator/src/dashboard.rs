@@ -342,12 +342,11 @@ fn attempt_from_record(rec: &Map<String, Value>, iter: usize, solution_number: u
         Some(us) if us > 0 => safe_u64("qpu_access_time_us", solution_number, us),
         _ => Value::Null,
     };
-    // AttemptRecord has no backend type; empty string is the indexer default.
     json!({
         "type": "attempt",
         "ts_ns": wire_u128(ts_ns),
         "miner_id": miner_id,
-        "miner_type": "",
+        "miner_type": string_field(rec, "miner_type").unwrap_or_default(),
         "solution_number": solution_number,
         "iter": iter,
         "best_energy_milli": best_energy_milli,
@@ -365,13 +364,6 @@ fn attempt_from_record(rec: &Map<String, Value>, iter: usize, solution_number: u
 
 /// Build a submission object from the attempt trail. v0.3 does not write
 /// `submission.json`; the indexer still requires the submission object.
-///
-/// Fields with no v0.3 source:
-/// - `threshold_milli` → `0`
-/// - `last_proof_block_hash` → `"0x0"` (non-empty so the parser accepts it)
-/// - `extrinsic_hash`, `chain_block_hash`, `chain_block_number`, `pow_sequence`
-///   → `null`
-/// - `miner_type` → `""`
 fn submission_from_records(records: &[Map<String, Value>], solution_number: u64) -> Value {
     // Prefer the last submitted attempt; else the last accepted; else the last.
     // Caller guarantees `records` is non-empty; fall back to an empty map only
@@ -420,18 +412,23 @@ fn submission_from_records(records: &[Map<String, Value>], solution_number: u64)
         "ts_ns": ts_ns,
         "solution_number": solution_number,
         "miner_id": miner_id,
-        "miner_type": "",
+        "miner_type": string_field(chosen, "miner_type").unwrap_or_default(),
         "energy_milli": energy_milli,
         "diversity_milli": diversity_milli,
-        // No max-energy / threshold is stored on AttemptRecord.
-        "threshold_milli": 0,
+        "threshold_milli": safe_i64(
+            "threshold_milli",
+            solution_number,
+            i64_field(chosen, "threshold_milli").unwrap_or(0),
+        ),
         "num_valid": num_valid,
-        // No last-proof block hash is stored on AttemptRecord.
-        "last_proof_block_hash": "0x0",
-        "extrinsic_hash": null,
-        "chain_block_hash": null,
-        "chain_block_number": null,
-        "pow_sequence": null,
+        "last_proof_block_hash": string_field(chosen, "last_proof_block_hash")
+            .unwrap_or_else(|| "0x0".to_string()),
+        "extrinsic_hash": chosen.get("extrinsic_hash").cloned().unwrap_or(Value::Null),
+        "chain_block_hash": chosen.get("chain_block_hash").cloned().unwrap_or(Value::Null),
+        "chain_block_number": u64_field(chosen, "chain_block_number")
+            .map_or(Value::Null, |n| wire_u128(u128::from(n))),
+        "pow_sequence": u64_field(chosen, "pow_sequence")
+            .map_or(Value::Null, |n| safe_u64("pow_sequence", solution_number, n)),
         "outcome": outcome,
     })
 }
@@ -795,6 +792,89 @@ mod tests {
             at(&v, "/data/attempts/0/best_energy_milli"),
             &json!(-14_200)
         );
+    }
+
+    fn submitted_line() -> String {
+        serde_json::json!({
+            "ts_ms": 1_700_000_000_000_u64,
+            "qblock_id": 42,
+            "generation": 1,
+            "miner_id": "cpu-0",
+            "miner_type": "CPU",
+            "job_id": "ab",
+            "is_pow": true,
+            "order_id": "",
+            "best_energy_milli": -14_200,
+            "raw_best_energy_milli": -14_200,
+            "diversity_milli": 250,
+            "n_valid": 6,
+            "accepted": true,
+            "submitted": true,
+            "device_access_time_us": 12_000,
+            "threshold_milli": -2_500_000,
+            "last_proof_block_hash":
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "extrinsic_hash":
+                "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "chain_block_hash":
+                "0x3333333333333333333333333333333333333333333333333333333333333333",
+            "chain_block_number": 10_249_u64,
+            "pow_sequence": 412_u64,
+        })
+        .to_string()
+    }
+
+    /// C8: a submitted, winning result reports every field the dashboard shows.
+    #[tokio::test]
+    async fn c8_submission_reports_the_real_chain_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("42");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attempts.jsonl"),
+            format!("{}\n", submitted_line()),
+        )
+        .unwrap();
+
+        let v = attempts_body(tmp.path(), 42).await;
+        let s = at(&v, "/data/submission");
+
+        assert_eq!(at(s, "/threshold_milli"), &json!(-2_500_000));
+        let hash = at(s, "/last_proof_block_hash").as_str().unwrap();
+        assert_ne!(hash, "0x0");
+        assert_eq!(hash.len(), 66, "a 32-byte hex hash is 0x plus 64 digits");
+        assert!(at(s, "/miner_type").as_str().unwrap().starts_with("CPU"));
+        assert!(!at(s, "/extrinsic_hash").is_null());
+        assert!(!at(s, "/chain_block_hash").is_null());
+        // Block heights are large by design, so rule N1 makes them strings.
+        assert_eq!(at(s, "/chain_block_number"), &json!("10249"));
+        assert_eq!(at(s, "/pow_sequence"), &json!(412));
+        assert_eq!(at(&v, "/data/attempts/0/miner_type"), &json!("CPU"));
+    }
+
+    /// A rejected attempt has no chain outcome. The four nullable fields stay
+    /// null and the two non-nullable ones keep their types, or the dashboard
+    /// parser throws.
+    #[tokio::test]
+    async fn a_non_winning_submission_nulls_only_the_nullable_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("43");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attempts.jsonl"),
+            format!("{}\n", sentinel_line(-500)),
+        )
+        .unwrap();
+
+        let v = attempts_body(tmp.path(), 43).await;
+        let s = at(&v, "/data/submission");
+
+        assert!(at(s, "/extrinsic_hash").is_null());
+        assert!(at(s, "/chain_block_hash").is_null());
+        assert!(at(s, "/chain_block_number").is_null());
+        assert!(at(s, "/pow_sequence").is_null());
+        assert!(at(s, "/threshold_milli").is_number());
+        assert!(at(s, "/miner_type").is_string());
     }
 
     #[tokio::test]

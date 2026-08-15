@@ -724,6 +724,10 @@ pub async fn feeder_loop<C>(
                     st.set_topology(Some(topo));
                     st.target = Some(target);
                     st.qblock_id = qblock_id;
+                    st.last_proof_block_hash = format!(
+                        "0x{}",
+                        crate::chain::extrinsic::hex_encode(&snap.last_proof_block_hash)
+                    );
                     st.stash
                         .reset(generation, schedule, last_proof_block, epoch_length);
                 }
@@ -1037,6 +1041,10 @@ where
         let mut st = state.lock().await;
         for e in &launch {
             let _ = st.configure.insert(e.miner_id.clone(), e.configure.clone());
+            let _ = st.miner_types.insert(
+                e.miner_id.clone(),
+                crate::metrics::miner_type_label(&e.backend),
+            );
         }
     }
 
