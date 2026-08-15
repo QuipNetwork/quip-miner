@@ -745,16 +745,12 @@ async fn run_session<C: ChainClient>(
                                     .as_ref()
                                     .and_then(|r| r.as_ref().ok())
                                     .and_then(|r| r.extrinsic_hash)
-                                    .map(|h| {
-                                        format!("0x{}", crate::chain::extrinsic::hex_encode(&h))
-                                    }),
+                                    .map(|h| crate::chain::extrinsic::hex_encode(&h)),
                                 chain_block_hash: receipt
                                     .as_ref()
                                     .and_then(|r| r.as_ref().ok())
                                     .and_then(|r| r.block_hash)
-                                    .map(|h| {
-                                        format!("0x{}", crate::chain::extrinsic::hex_encode(&h))
-                                    }),
+                                    .map(|h| crate::chain::extrinsic::hex_encode(&h)),
                                 chain_block_number: receipt
                                     .as_ref()
                                     .and_then(|r| r.as_ref().ok())

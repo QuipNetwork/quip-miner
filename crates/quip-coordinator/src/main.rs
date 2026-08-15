@@ -494,7 +494,7 @@ fn identity_from_keys(
         quip_coordinator::metrics::Identity::default,
         |ss58_address| quip_coordinator::metrics::Identity {
             ss58_address,
-            account_id_hex: format!("0x{}", hex_encode(&account)),
+            account_id_hex: hex_encode(&account),
             node_id: node_id.map_or_else(
                 || quip_coordinator::readiness::node_id_from_account(&account),
                 str::to_string,

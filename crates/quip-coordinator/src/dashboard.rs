@@ -812,16 +812,34 @@ mod tests {
             "submitted": true,
             "device_access_time_us": 12_000,
             "threshold_milli": -2_500_000,
-            "last_proof_block_hash":
-                "0x1111111111111111111111111111111111111111111111111111111111111111",
-            "extrinsic_hash":
-                "0x2222222222222222222222222222222222222222222222222222222222222222",
-            "chain_block_hash":
-                "0x3333333333333333333333333333333333333333333333333333333333333333",
+            "last_proof_block_hash": LAST_PROOF_BLOCK_HASH,
+            "extrinsic_hash": EXTRINSIC_HASH,
+            "chain_block_hash": CHAIN_BLOCK_HASH,
             "chain_block_number": 10_249_u64,
             "pow_sequence": 412_u64,
         })
         .to_string()
+    }
+
+    // Three distinct 32-byte hashes: a same-shaped string can't hide a field
+    // swap (e.g. extrinsic_hash and chain_block_hash exchanged) or a doubled
+    // `0x` prefix landing on the wrong field.
+    const LAST_PROOF_BLOCK_HASH: &str =
+        "0x1111111111111111111111111111111111111111111111111111111111111111";
+    const EXTRINSIC_HASH: &str =
+        "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const CHAIN_BLOCK_HASH: &str =
+        "0x3333333333333333333333333333333333333333333333333333333333333333";
+
+    /// Whether `s` matches `^0x[0-9a-f]{64}$`: one `0x` prefix, exactly 64
+    /// lowercase hex digits. A doubled prefix (`0x0x...`) or a truncated hash
+    /// fails this even when the total length coincidentally matches.
+    fn is_hex_hash(s: &str) -> bool {
+        s.strip_prefix("0x").is_some_and(|h| {
+            h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
     }
 
     /// C8: a submitted, winning result reports every field the dashboard shows.
@@ -840,12 +858,23 @@ mod tests {
         let s = at(&v, "/data/submission");
 
         assert_eq!(at(s, "/threshold_milli"), &json!(-2_500_000));
-        let hash = at(s, "/last_proof_block_hash").as_str().unwrap();
-        assert_ne!(hash, "0x0");
-        assert_eq!(hash.len(), 66, "a 32-byte hex hash is 0x plus 64 digits");
+        // Three distinct fields, checked by shape and by exact value: a
+        // same-shaped 66-char string can't hide a field swap between
+        // extrinsic_hash and chain_block_hash, and the shape check catches a
+        // doubled `0x` prefix even where a swap would not.
+        for (field, expected) in [
+            ("/last_proof_block_hash", LAST_PROOF_BLOCK_HASH),
+            ("/extrinsic_hash", EXTRINSIC_HASH),
+            ("/chain_block_hash", CHAIN_BLOCK_HASH),
+        ] {
+            let hash = at(s, field).as_str().unwrap();
+            assert!(
+                is_hex_hash(hash),
+                "{field}: {hash:?} does not match ^0x[0-9a-f]{{64}}$"
+            );
+            assert_eq!(hash, expected, "{field}: value does not round-trip exactly");
+        }
         assert!(at(s, "/miner_type").as_str().unwrap().starts_with("CPU"));
-        assert!(!at(s, "/extrinsic_hash").is_null());
-        assert!(!at(s, "/chain_block_hash").is_null());
         // Block heights are large by design, so rule N1 makes them strings.
         assert_eq!(at(s, "/chain_block_number"), &json!("10249"));
         assert_eq!(at(s, "/pow_sequence"), &json!(412));

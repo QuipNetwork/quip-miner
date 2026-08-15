@@ -612,7 +612,7 @@ pub async fn feeder_loop<C>(
                 params.metrics.chain().miner_info
             };
             params.metrics.set_chain(crate::metrics::ChainView {
-                head_hash: format!("0x{}", crate::chain::extrinsic::hex_encode(&snap.head_hash)),
+                head_hash: crate::chain::extrinsic::hex_encode(&snap.head_hash),
                 head_number: snap.block_number,
                 is_mining: true,
                 miner_registered: miner_info.is_some(),
@@ -724,10 +724,8 @@ pub async fn feeder_loop<C>(
                     st.set_topology(Some(topo));
                     st.target = Some(target);
                     st.qblock_id = qblock_id;
-                    st.last_proof_block_hash = format!(
-                        "0x{}",
-                        crate::chain::extrinsic::hex_encode(&snap.last_proof_block_hash)
-                    );
+                    st.last_proof_block_hash =
+                        crate::chain::extrinsic::hex_encode(&snap.last_proof_block_hash);
                     st.stash
                         .reset(generation, schedule, last_proof_block, epoch_length);
                 }
