@@ -1299,6 +1299,63 @@ mod tests {
         assert_eq!(at(&v, "/code"), &json!("BAD_PARAM"));
     }
 
+    async fn attempts_status_and_code(tmp: &Path, query: &str) -> (StatusCode, String) {
+        let uri = format!("/api/v1/mining/attempts{query}");
+        let resp = router(test_state(tmp))
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let v = body_json(resp).await;
+        let code = at(&v, "/code").as_str().unwrap_or_default().to_string();
+        (status, code)
+    }
+
+    /// C9: the status code and the `code` field agree, for every row of the
+    /// status-code table. The dashboard maps 404 to a skip that still advances
+    /// the checkpoint, so turning a 404 into a 200 would stall the walk.
+    #[tokio::test]
+    async fn c9_error_paths_return_the_documented_status_and_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), 7, &Fixture::Normal);
+
+        // Found.
+        let (status, code) = attempts_status_and_code(tmp.path(), "?solution_number=7").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(code, "", "a 200 carries no error code");
+
+        // Missing parameter.
+        let (status, code) = attempts_status_and_code(tmp.path(), "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "BAD_PARAM");
+
+        // Unparsable parameter.
+        let (status, code) =
+            attempts_status_and_code(tmp.path(), "?solution_number=not-a-number").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "BAD_PARAM");
+
+        // No directory for that number.
+        let (status, code) = attempts_status_and_code(tmp.path(), "?solution_number=999").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code, "NOT_FOUND");
+    }
+
+    /// An empty attempt file is a 404, not a 200 with an empty body. The
+    /// indexer treats a 404 as a skip; a 200 with no submission makes the
+    /// parser throw, which is a hard error that stalls the checkpoint.
+    #[tokio::test]
+    async fn an_empty_attempts_file_is_a_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("8");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("attempts.jsonl"), "\n\n").unwrap();
+
+        let (status, code) = attempts_status_and_code(tmp.path(), "?solution_number=8").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code, "NOT_FOUND");
+    }
+
     #[test]
     fn safe_i64_passes_in_range_values_through() {
         assert_eq!(safe_i64("best_energy_milli", 42, -14_200), json!(-14_200));
