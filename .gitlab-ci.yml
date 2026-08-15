@@ -46,6 +46,28 @@ rust:
       when: never
     - if: $CI_COMMIT_BRANCH
 
+# The `rust:` job above excludes quip-coordinator, whose integration tests spawn
+# miner binaries CI does not fetch. Its lib tests need no network and hold the
+# dashboard REST conformance suite (C1-C9), so they run here on their own.
+coordinator:
+  stage: test
+  image: rust:1.97.1
+  tags: [linux, amd64]
+  before_script:
+    - apt-get update && apt-get install -y protobuf-compiler
+  script:
+    - cargo clippy -p quip-coordinator --all-targets -- -D warnings
+    - cargo test -p quip-coordinator
+  cache:
+    key: cargo-$CI_COMMIT_REF_SLUG
+    paths: [target/, .cargo/]
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
 conformance:
   stage: test
   image: python:3.11
