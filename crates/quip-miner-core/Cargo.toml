@@ -25,7 +25,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 quip-mock-coordinator = { path = "../quip-mock-coordinator" }
 serde_json = "1"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
+# test-util: `start_paused` clocks only advance while every task is idle, which
+# is how `writer_parks_when_the_read_loop_closes_before_the_sampler` detects a
+# busy-spinning writer.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "test-util"] }
 
 [lints]
 workspace = true

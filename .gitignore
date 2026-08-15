@@ -90,6 +90,11 @@ target/
 python/**/__pycache__/
 
 # Beads / Dolt files (added by bd init)
+.beads/
+.beads.gate.lock
 .dolt/
 *.db
 python/quip_proto/*.so
+
+# Benchmark output
+bench-out/
