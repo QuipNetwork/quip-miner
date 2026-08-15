@@ -1528,6 +1528,35 @@ mod tests {
         assert_eq!(j.job_id, b"late".to_vec());
     }
 
+    /// C7 wiring check: `contexts_dispatched` moves at `dispatch_granted`'s real
+    /// call site, not just through the metrics API directly.
+    #[tokio::test]
+    async fn dispatch_granted_counts_one_context_per_job_dispatched() {
+        let state = Arc::new(Mutex::new(CoordinatorState::new()));
+        let (tx, mut rx) = mpsc::channel::<Result<CoordMsg, Status>>(8);
+        {
+            let mut st = state.lock().await;
+            st.router.register_miner("cpu-0", caps());
+        }
+
+        assert_eq!(state.lock().await.metrics.global().contexts_dispatched, 0);
+
+        // Granting credits with nothing staged dispatches nothing: this catches
+        // a bump placed outside the `while let` drain.
+        assert!(dispatch_granted(&state, "cpu-0", 32, &tx).await);
+        assert!(rx.try_recv().is_err(), "no job exists yet");
+        assert_eq!(state.lock().await.metrics.global().contexts_dispatched, 0);
+
+        // Stage one job and dispatch it.
+        {
+            let mut st = state.lock().await;
+            assert!(st.router.stage_on("cpu-0", job(b"one")));
+        }
+        assert!(dispatch_granted(&state, "cpu-0", 0, &tx).await);
+        assert!(rx.try_recv().is_ok(), "the staged job dispatches");
+        assert_eq!(state.lock().await.metrics.global().contexts_dispatched, 1);
+    }
+
     #[tokio::test]
     async fn waking_an_unregistered_miner_is_harmless() {
         let st = CoordinatorState::new();
