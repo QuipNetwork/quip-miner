@@ -186,15 +186,19 @@ fn miners_json(miners: &[crate::metrics::MinerEntry]) -> Value {
 
 /// Serialize `QuantumPow.Miners[account]`.
 ///
-/// The four balance and count fields are `u128` or `u64` and routinely exceed
-/// the safe integer range, so rule N1 puts them on the wire as decimal strings.
-/// `registered_at` is a block height and stays a guarded number.
+/// This object is intentionally mixed-type: `deposit` and `rewards_earned` are
+/// real `u128` balances, so rule N1 puts them on the wire as decimal strings.
+/// `registered_at` (a substrate block height) and `proofs_submitted` /
+/// `proofs_won` (`u64` lifetime counts) can never approach 2^53, so rule N1's
+/// "large by design" clause does not apply to them; they stay guarded numbers
+/// and agree with `controller.proofs_submitted` in [`counters_json`], which
+/// serializes the same field name as a number.
 fn miner_info_json(info: &crate::chain::MinerInfo) -> Value {
     json!({
         "registered_at": safe_u64("registered_at", 0, info.registered_at),
         "deposit": wire_u128(info.deposit),
-        "proofs_submitted": wire_u128(u128::from(info.proofs_submitted)),
-        "proofs_won": wire_u128(u128::from(info.proofs_won)),
+        "proofs_submitted": safe_u64("proofs_submitted", 0, info.proofs_submitted),
+        "proofs_won": safe_u64("proofs_won", 0, info.proofs_won),
         "rewards_earned": wire_u128(info.rewards_earned),
     })
 }
@@ -204,9 +208,8 @@ fn miner_info_json(info: &crate::chain::MinerInfo) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Indexer stats probe. Reports the process-global controller counters, which
-/// equal the sum across modes for every counter except `heads_observed` — every
-/// backend observes the same chain heads. `/api/v1/status` carries the per-mode
-/// split.
+/// are authoritative; the per-mode split `/api/v1/status` carries may lag them
+/// momentarily under concurrent updates (see [`crate::metrics::CoordinatorMetrics::global`]).
 async fn api_stats(State(state): State<DashboardState>) -> Response {
     success_envelope(&json!({
         "controller": counters_json(&state.metrics.global()),
@@ -347,8 +350,12 @@ fn attempt_from_record(rec: &Map<String, Value>, iter: usize, solution_number: u
         "ts_ns": wire_u128(ts_ns),
         "miner_id": miner_id,
         "miner_type": string_field(rec, "miner_type").unwrap_or_default(),
-        "solution_number": solution_number,
-        "iter": iter,
+        "solution_number": safe_u64("solution_number", solution_number, solution_number),
+        "iter": safe_u64(
+            "iter",
+            solution_number,
+            u64::try_from(iter).unwrap_or(u64::MAX),
+        ),
         "best_energy_milli": best_energy_milli,
         "result_kind": result_kind,
         "num_valid": rec.get("n_valid").and_then(Value::as_u64)
@@ -410,7 +417,7 @@ fn submission_from_records(records: &[Map<String, Value>], solution_number: u64)
     json!({
         "type": "submission",
         "ts_ns": ts_ns,
-        "solution_number": solution_number,
+        "solution_number": safe_u64("solution_number", solution_number, solution_number),
         "miner_id": miner_id,
         "miner_type": string_field(chosen, "miner_type").unwrap_or_default(),
         "energy_milli": energy_milli,
@@ -426,7 +433,7 @@ fn submission_from_records(records: &[Map<String, Value>], solution_number: u64)
         "extrinsic_hash": chosen.get("extrinsic_hash").cloned().unwrap_or(Value::Null),
         "chain_block_hash": chosen.get("chain_block_hash").cloned().unwrap_or(Value::Null),
         "chain_block_number": u64_field(chosen, "chain_block_number")
-            .map_or(Value::Null, |n| wire_u128(u128::from(n))),
+            .map_or(Value::Null, |n| safe_u64("chain_block_number", solution_number, n)),
         "pow_sequence": u64_field(chosen, "pow_sequence")
             .map_or(Value::Null, |n| safe_u64("pow_sequence", solution_number, n)),
         "outcome": outcome,
@@ -670,7 +677,7 @@ mod tests {
         }
     }
 
-    /// The three attempt-file shapes the sweep runs against.
+    /// The attempt-file shapes the sweep and golden tests run against.
     enum Fixture {
         /// Rows that cleared the gate. The ordinary case.
         Normal,
@@ -678,6 +685,9 @@ mod tests {
         AllSentinel,
         /// A row reporting `u64::MAX` device access time. The next sentinel.
         HugeDeviceTime,
+        /// A submitted, winning row with every D4 chain field populated — the
+        /// shape [`submitted_line`] builds for `c8`.
+        Submitted,
     }
 
     fn write_fixture(tmp: &Path, solution_number: u64, fixture: &Fixture) {
@@ -696,6 +706,7 @@ mod tests {
                 "{}\n",
                 attempt_line("cpu-0", -14_200, 250, 6, true, true, u64::MAX),
             ),
+            Fixture::Submitted => format!("{}\n", submitted_line()),
         };
         std::fs::write(dir.join("attempts.jsonl"), body).unwrap();
     }
@@ -729,6 +740,9 @@ mod tests {
             (1_u64, Fixture::Normal),
             (2, Fixture::AllSentinel),
             (3, Fixture::HugeDeviceTime),
+            // Above JS_MAX_SAFE_INTEGER: exercises the `solution_number` guard
+            // itself, not just the fields copied from the attempt record.
+            (9_007_199_254_740_992, Fixture::Normal),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             write_fixture(tmp.path(), n, &fixture);
@@ -875,8 +889,9 @@ mod tests {
             assert_eq!(hash, expected, "{field}: value does not round-trip exactly");
         }
         assert!(at(s, "/miner_type").as_str().unwrap().starts_with("CPU"));
-        // Block heights are large by design, so rule N1 makes them strings.
-        assert_eq!(at(s, "/chain_block_number"), &json!("10249"));
+        // Block heights are `u64` and never approach 2^53, so rule N1's
+        // "large by design" clause does not apply; they stay guarded numbers.
+        assert_eq!(at(s, "/chain_block_number"), &json!(10_249));
         assert_eq!(at(s, "/pow_sequence"), &json!(412));
         assert_eq!(at(&v, "/data/attempts/0/miner_type"), &json!("CPU"));
     }
@@ -1050,20 +1065,23 @@ mod tests {
         assert_eq!(at(&v, "/data/chain/head_hash"), &json!("0x00ff"));
 
         assert!(at(&v, "/data/miner_info").is_object());
-        // u128 and u64 balances cross the wire as decimal strings, per rule N1.
-        for key in [
-            "deposit",
-            "proofs_submitted",
-            "proofs_won",
-            "rewards_earned",
-        ] {
+        // u128 balances cross the wire as decimal strings, per rule N1.
+        for key in ["deposit", "rewards_earned"] {
             assert!(
                 at(&v, &format!("/data/miner_info/{key}")).is_string(),
                 "miner_info.{key} must be a decimal string"
             );
         }
+        // u64 lifetime counts and the block height stay guarded numbers; they
+        // agree with `controller.proofs_submitted` (a number) in stats_body.
+        for key in ["registered_at", "proofs_submitted", "proofs_won"] {
+            assert!(
+                at(&v, &format!("/data/miner_info/{key}")).is_number(),
+                "miner_info.{key} must be a number"
+            );
+        }
         assert_eq!(at(&v, "/data/miner_info/deposit"), &json!("1000000000000"));
-        assert_eq!(at(&v, "/data/miner_info/proofs_submitted"), &json!("412"));
+        assert_eq!(at(&v, "/data/miner_info/proofs_submitted"), &json!(412));
         assert_eq!(at(&v, "/data/miner_info/registered_at"), &json!(8_100));
     }
 
@@ -1430,6 +1448,7 @@ mod tests {
             (1_u64, "normal", Fixture::Normal),
             (2, "all_sentinel", Fixture::AllSentinel),
             (3, "huge_device_time", Fixture::HugeDeviceTime),
+            (4, "submitted", Fixture::Submitted),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             write_fixture(tmp.path(), n, &fixture);

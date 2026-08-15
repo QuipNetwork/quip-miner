@@ -162,8 +162,12 @@ impl CoordinatorMetrics {
         self.started.elapsed().as_secs()
     }
 
-    /// Process-global counters. Equal to the sum across modes for every counter
-    /// except `heads_observed`, which every mode shares.
+    /// Process-global counters. Authoritative: `bump` advances the global
+    /// counter before the owning mode's, with separate `fetch_add`s, so a
+    /// concurrent reader can transiently see the global counter ahead of the
+    /// sum across modes. That race is not worth a lock on the hot mining path
+    /// for a display counter, so callers wanting the true total read this, not
+    /// a sum of [`Self::mode_views`].
     #[must_use]
     pub fn global(&self) -> CounterSnapshot {
         self.global.snapshot()
