@@ -1236,4 +1236,78 @@ mod tests {
             json!("340282366920938463463374607431768211455")
         );
     }
+
+    /// Replace the two fields that change on every run, so the golden file is
+    /// byte-stable. Everything else in the body is a pure projection of the
+    /// fixture.
+    fn normalize_for_golden(v: &mut Value) {
+        if let Some(map) = v.as_object_mut() {
+            if map.contains_key("timestamp") {
+                let _ = map.insert("timestamp".into(), json!(1_786_742_808_u64));
+            }
+            if let Some(data) = map.get_mut("data").and_then(Value::as_object_mut) {
+                if data.contains_key("uptime_seconds") {
+                    let _ = data.insert("uptime_seconds".into(), json!(3_612_u64));
+                }
+            }
+        }
+    }
+
+    /// C4: the committed response bodies the dashboard repo tests against.
+    ///
+    /// Set `UPDATE_DASHBOARD_GOLDEN=1` to rewrite the file after an intentional
+    /// wire change, then commit it and tell the dashboard team.
+    #[tokio::test]
+    async fn c4_dashboard_rest_golden_matches_the_committed_file() {
+        let mut golden = Map::new();
+        for (n, name, fixture) in [
+            (1_u64, "normal", Fixture::Normal),
+            (2, "all_sentinel", Fixture::AllSentinel),
+            (3, "huge_device_time", Fixture::HugeDeviceTime),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_fixture(tmp.path(), n, &fixture);
+            let state = keyed_state(tmp.path());
+            for (endpoint, uri) in [
+                ("status", "/api/v1/status".to_string()),
+                ("stats", "/api/v1/stats".to_string()),
+                (
+                    "mining_attempts",
+                    format!("/api/v1/mining/attempts?solution_number={n}"),
+                ),
+            ] {
+                let resp = router(state.clone())
+                    .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                let mut body = body_json(resp).await;
+                normalize_for_golden(&mut body);
+                assert_safe_integers(&body, &format!("{name}/{endpoint}"));
+                let _ = golden.insert(format!("{name}/{endpoint}"), body);
+            }
+        }
+
+        let rendered = format!("{}\n", serde_json::to_string_pretty(&golden).unwrap());
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../conformance/dashboard_rest_golden.json");
+
+        if std::env::var("UPDATE_DASHBOARD_GOLDEN").is_ok() {
+            std::fs::write(&path, &rendered).unwrap();
+            return;
+        }
+
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e}. Run with UPDATE_DASHBOARD_GOLDEN=1 to create it.",
+                path.display()
+            )
+        });
+        assert_eq!(
+            committed, rendered,
+            "the dashboard REST wire shape changed. Re-run with \
+             UPDATE_DASHBOARD_GOLDEN=1, commit conformance/dashboard_rest_golden.json, \
+             and tell the dashboard team before merging."
+        );
+    }
 }
