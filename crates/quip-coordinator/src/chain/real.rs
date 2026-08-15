@@ -15,7 +15,7 @@ use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
     encode_participate_call, encode_register_miner_call, encode_set_descriptor_call,
     encode_submit_proof_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
-    MinerKind, MiningSnapshotScale, NodeDescriptorV2Input, OrderStatus,
+    MinerInfoScale, MinerKind, MiningSnapshotScale, NodeDescriptorV2Input, OrderStatus,
 };
 use super::submit::{
     classify_descriptor, classify_participation, classify_receipt, classify_registration,
@@ -24,7 +24,7 @@ use super::submit::{
 use super::transport::RpcTransport;
 use super::transport_jsonrpsee::JsonrpseeTransport;
 use super::watch::{parse_tx_status, TxStatus};
-use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot};
+use super::{ChainClient, ChainError, DecayParams, JobOrder, MinerInfo, MiningSnapshot};
 use crate::decay::{
     DEFAULT_BASE_MAX_ENERGY_MILLI, DEFAULT_C_EASY_MILLI, DEFAULT_C_HARD_MILLI,
     DEFAULT_C_KNEE_MILLI, EPOCH_LENGTH_BLOCKS,
@@ -830,6 +830,24 @@ impl ChainClient for RealChainClient {
         };
         let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
         Decode::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))
+    }
+
+    async fn fetch_miner_info(&self, account: [u8; 32]) -> Result<Option<MinerInfo>, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+        let scale: Option<MinerInfoScale> =
+            self.read_storage(&miners_storage_key(&account), at).await?;
+        Ok(scale.map(|s| MinerInfo {
+            registered_at: u64::from(s.registered_at),
+            deposit: s.deposit,
+            proofs_submitted: u64::from(s.proofs_submitted),
+            proofs_won: u64::from(s.proofs_won),
+            rewards_earned: s.rewards_earned,
+        }))
     }
 
     async fn fetch_decay_params(

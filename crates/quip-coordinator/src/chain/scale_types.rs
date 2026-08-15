@@ -198,6 +198,25 @@ pub struct JobOrderScale {
     pub solution_count: u32,
 }
 
+/// SCALE mirror of `pallet_quantum_pow::MinerInfo<Balance, BlockNumber>` with
+/// the runtime's `Balance = u128` and `BlockNumber = u32`.
+///
+/// Field order is the pallet's and must not be reordered: SCALE carries no field
+/// names, so a swap decodes into a wrong number with no error.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct MinerInfoScale {
+    /// Block the account registered at.
+    pub registered_at: u32,
+    /// Reserved miner deposit, in plancks.
+    pub deposit: u128,
+    /// Lifetime accepted proofs.
+    pub proofs_submitted: u32,
+    /// Lifetime winning proofs.
+    pub proofs_won: u32,
+    /// Lifetime rewards, in plancks.
+    pub rewards_earned: u128,
+}
+
 /// Pallet index of `QuantumPow` in the runtime construct.
 pub const QUANTUM_POW_PALLET_INDEX: u8 = 10;
 /// Call index of `submit_proof` within `QuantumPow`.
@@ -742,6 +761,46 @@ mod tests {
     #[test]
     fn job_order_decode_rejects_empty() {
         assert!(JobOrderScale::decode(&mut &[][..]).is_err());
+    }
+
+    /// SCALE field order must match `pallet_quantum_pow::MinerInfo`. A reordered
+    /// field decodes into the wrong number silently, so pin the byte layout.
+    #[test]
+    fn miner_info_decodes_the_pallet_field_order() {
+        let encoded = MinerInfoScale {
+            registered_at: 8_100,
+            deposit: 1_000_000_000_000,
+            proofs_submitted: 412,
+            proofs_won: 7,
+            rewards_earned: 70_000_000_000_000,
+        }
+        .encode();
+        assert_eq!(encoded.len(), 4 + 16 + 4 + 4 + 16);
+
+        let decoded = MinerInfoScale::decode(&mut &encoded[..]).unwrap();
+        assert_eq!(decoded.registered_at, 8_100);
+        assert_eq!(decoded.deposit, 1_000_000_000_000);
+        assert_eq!(decoded.proofs_submitted, 412);
+        assert_eq!(decoded.proofs_won, 7);
+        assert_eq!(decoded.rewards_earned, 70_000_000_000_000);
+    }
+
+    #[test]
+    fn a_truncated_miner_info_blob_fails_to_decode() {
+        let encoded = MinerInfoScale {
+            registered_at: 1,
+            deposit: 2,
+            proofs_submitted: 3,
+            proofs_won: 4,
+            rewards_earned: 5,
+        }
+        .encode();
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "encoded is a full MinerInfoScale encode; len-1 is in bounds"
+        )]
+        let short = &encoded[..encoded.len() - 1];
+        assert!(MinerInfoScale::decode(&mut &short[..]).is_err());
     }
 
     #[test]

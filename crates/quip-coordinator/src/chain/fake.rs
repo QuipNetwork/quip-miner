@@ -2,7 +2,7 @@
 
 use super::sync::{SyncSource, SyncStatus};
 use super::{
-    ChainClient, ChainError, DecayParams, DescriptorOutcome, JobOrder, MiningSnapshot,
+    ChainClient, ChainError, DecayParams, DescriptorOutcome, JobOrder, MinerInfo, MiningSnapshot,
     NodeDescriptorV2Input, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
 };
 use crate::funding::BalanceSource;
@@ -46,6 +46,8 @@ pub struct FakeChain {
     registration_submits: Mutex<usize>,
     /// Accounts passed to [`BalanceSource::free_balance`], in call order.
     balance_accounts: Mutex<Vec<[u8; 32]>>,
+    /// Scripted `QuantumPow.Miners[account]` value (default `None`).
+    miner_info: Mutex<Option<MinerInfo>>,
 }
 
 impl FakeChain {
@@ -78,6 +80,7 @@ impl FakeChain {
             registration_calls: Mutex::new(0),
             registration_submits: Mutex::new(0),
             balance_accounts: Mutex::new(Vec::new()),
+            miner_info: Mutex::new(None),
         }
     }
 
@@ -386,6 +389,20 @@ impl FakeChain {
             std::mem::take(&mut *self.descriptors.lock().unwrap())
         }
     }
+
+    /// Script the value `fetch_miner_info` returns.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_miner_info(&self, info: Option<MinerInfo>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.miner_info.lock().unwrap() = info;
+        }
+    }
 }
 
 #[async_trait]
@@ -519,6 +536,16 @@ impl ChainClient for FakeChain {
         )]
         {
             Ok(self.decay_params.lock().unwrap().clone())
+        }
+    }
+
+    async fn fetch_miner_info(&self, _account: [u8; 32]) -> Result<Option<MinerInfo>, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(*self.miner_info.lock().unwrap())
         }
     }
 }
