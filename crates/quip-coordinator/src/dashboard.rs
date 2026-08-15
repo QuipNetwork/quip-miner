@@ -407,6 +407,69 @@ fn u64_field(rec: &Map<String, Value>, key: &str) -> Option<u64> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Safe-integer guard (rule N1)
+// ---------------------------------------------------------------------------
+
+/// Largest integer an IEEE-754 double holds exactly (`Number.MAX_SAFE_INTEGER`).
+#[expect(dead_code, reason = "Will be called by Task 2 response mappers")]
+const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+/// Smallest integer an IEEE-754 double holds exactly.
+#[expect(dead_code, reason = "Will be called by Task 2 response mappers")]
+const JS_MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
+
+/// Serialize `v` as a JSON number, or `0` when it falls outside the range a
+/// JavaScript `Number()` holds exactly.
+///
+/// The dashboard parses every numeric field through `Number()` and stores the
+/// result in a `PostgreSQL` `BIGINT`. A value past the safe range round-trips to a
+/// different integer and the insert fails, which stalls the indexer checkpoint.
+/// Clamping to `0` keeps the walk moving; the warning names the field so the
+/// real source is still findable.
+#[expect(dead_code, reason = "Will be called by Task 2 response mappers")]
+fn safe_i64(field: &str, solution_number: u64, v: i64) -> Value {
+    if (JS_MIN_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&v) {
+        return Value::from(v);
+    }
+    tracing::warn!(
+        field,
+        solution_number,
+        value = v,
+        "dashboard: integer outside the IEEE-754 safe range; serving 0"
+    );
+    Value::from(0)
+}
+
+/// [`safe_i64`] for unsigned fields. Only the upper bound can be exceeded.
+#[expect(dead_code, reason = "Will be called by Task 2 response mappers")]
+#[expect(clippy::single_match_else, reason = "Brief specifies match structure")]
+fn safe_u64(field: &str, solution_number: u64, v: u64) -> Value {
+    match i64::try_from(v) {
+        Ok(n) => safe_i64(field, solution_number, n),
+        Err(_) => {
+            tracing::warn!(
+                field,
+                solution_number,
+                value = v,
+                "dashboard: integer outside the IEEE-754 safe range; serving 0"
+            );
+            Value::from(0)
+        }
+    }
+}
+
+/// Serialize a field that is large by design as a decimal string.
+///
+/// Balances, nanosecond timestamps, and chain block numbers routinely exceed the
+/// safe range in normal operation, so clamping them to `0` would throw away real
+/// data. Rule N1 puts them on the wire as strings instead. The dashboard parser
+/// already coerces these fields with `String(...)`.
+#[expect(dead_code, reason = "Will be called by Task 2 response mappers")]
+fn wire_u128(v: u128) -> Value {
+    Value::String(v.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +704,52 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(at(&v, "/success"), &json!(false));
         assert_eq!(at(&v, "/code"), &json!("BAD_PARAM"));
+    }
+
+    #[test]
+    fn safe_i64_passes_in_range_values_through() {
+        assert_eq!(safe_i64("best_energy_milli", 42, -14_200), json!(-14_200));
+        assert_eq!(safe_i64("best_energy_milli", 42, 0), json!(0));
+        assert_eq!(
+            safe_i64("best_energy_milli", 42, JS_MAX_SAFE_INTEGER),
+            json!(JS_MAX_SAFE_INTEGER)
+        );
+        assert_eq!(
+            safe_i64("best_energy_milli", 42, JS_MIN_SAFE_INTEGER),
+            json!(JS_MIN_SAFE_INTEGER)
+        );
+    }
+
+    #[test]
+    fn safe_i64_clamps_out_of_range_values_to_zero() {
+        assert_eq!(safe_i64("best_energy_milli", 42, i64::MAX), json!(0));
+        assert_eq!(safe_i64("best_energy_milli", 42, i64::MIN), json!(0));
+        assert_eq!(
+            safe_i64("best_energy_milli", 42, JS_MAX_SAFE_INTEGER + 1),
+            json!(0)
+        );
+        assert_eq!(
+            safe_i64("best_energy_milli", 42, JS_MIN_SAFE_INTEGER - 1),
+            json!(0)
+        );
+    }
+
+    #[test]
+    fn safe_u64_clamps_above_the_safe_range_only() {
+        assert_eq!(safe_u64("qpu_access_time_us", 42, 12_000), json!(12_000));
+        assert_eq!(safe_u64("qpu_access_time_us", 42, 0), json!(0));
+        assert_eq!(safe_u64("qpu_access_time_us", 42, u64::MAX), json!(0));
+    }
+
+    /// Fields that are large by design serialize as decimal strings, so no
+    /// clamp applies and no precision is lost.
+    #[test]
+    fn wire_u128_is_a_decimal_string() {
+        assert_eq!(wire_u128(0), json!("0"));
+        assert_eq!(wire_u128(70_000_000_000_000), json!("70000000000000"));
+        assert_eq!(
+            wire_u128(u128::MAX),
+            json!("340282366920938463463374607431768211455")
+        );
     }
 }
