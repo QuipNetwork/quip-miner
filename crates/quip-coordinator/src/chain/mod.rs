@@ -38,6 +38,7 @@ pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
 pub use submit::{
     classify_descriptor, classify_participation, classify_receipt, classify_registration,
     DescriptorOutcome, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
+    SubmitReceipt,
 };
 pub use transport::{BoxStream, RpcTransport};
 pub use transport_jsonrpsee::JsonrpseeTransport;
@@ -104,7 +105,7 @@ pub trait ChainClient: Send + Sync {
     ) -> Result<Vec<JobOrder>, ChainError>;
 
     /// Hybrid-sign and submit a proof extrinsic; classify the receipt.
-    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError>;
+    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError>;
 
     /// Register the signing account with `QuantumPow.register_miner`, unless
     /// `QuantumPow.Miners` already holds it.

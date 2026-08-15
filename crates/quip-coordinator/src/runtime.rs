@@ -929,7 +929,8 @@ pub async fn feeder_loop<C>(
                     device_access_time_us: cand.device_access_time_us,
                 };
                 let job_hex = crate::chain::extrinsic::hex_encode(&cand.job_id);
-                match chain.submit_proof(&proof).await {
+                let receipt = chain.submit_proof(&proof).await;
+                match receipt.as_ref().map(|r| r.action) {
                     Ok(SubmitAction::Success) => {
                         let mut st = state.lock().await;
                         st.stash.mark_submitted(&cand.job_id);

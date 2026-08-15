@@ -20,6 +20,7 @@ use super::scale_types::{
 use super::submit::{
     classify_descriptor, classify_participation, classify_receipt, classify_registration,
     DescriptorOutcome, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
+    SubmitReceipt,
 };
 use super::transport::RpcTransport;
 use super::transport_jsonrpsee::JsonrpseeTransport;
@@ -332,7 +333,7 @@ impl RealChainClient {
         &self,
         call: &[u8],
         confirmation: Confirmation,
-    ) -> Result<SignedCallOutcome, ChainError> {
+    ) -> Result<(SignedCallOutcome, [u8; 32]), ChainError> {
         let pair = self.pair()?;
         let signed_ctx = self.signed_extension_context(&pair).await?;
         let ext = build_hybrid_signed_extrinsic(&pair, call, &signed_ctx);
@@ -355,7 +356,9 @@ impl RealChainClient {
             // Resubmitting the same bytes cannot change it. Returning an error
             // here would let the caller read a permanent rejection as transient
             // and retry the same proof forever, which is how a lost win hides.
-            Err(ChainError::Submit(message)) => return Ok(SignedCallOutcome::Invalid { message }),
+            Err(ChainError::Submit(message)) => {
+                return Ok((SignedCallOutcome::Invalid { message }, want_hash))
+            }
             Err(e) => return Err(e),
         };
 
@@ -363,12 +366,17 @@ impl RealChainClient {
             let value = item?;
             match parse_tx_status(&value) {
                 TxStatus::InBlock(block) | TxStatus::Finalized(block) => {
-                    return self
+                    let outcome = self
                         .confirm_in_block(&block, &want_hash, confirmation)
-                        .await;
+                        .await?;
+                    return Ok((outcome, want_hash));
                 }
-                TxStatus::Invalid(message) => return Ok(SignedCallOutcome::Invalid { message }),
-                TxStatus::Dropped(message) => return Ok(SignedCallOutcome::Dropped { message }),
+                TxStatus::Invalid(message) => {
+                    return Ok((SignedCallOutcome::Invalid { message }, want_hash))
+                }
+                TxStatus::Dropped(message) => {
+                    return Ok((SignedCallOutcome::Dropped { message }, want_hash))
+                }
                 TxStatus::Other(s) => {
                     tracing::debug!(status = %s, "unmodelled transaction status");
                 }
@@ -390,9 +398,18 @@ impl RealChainClient {
         let included = self.block_contains(block_hex, want_hash).await?;
         let confirmed = self.confirmation_present(block_hex, &confirmation).await?;
         match classify_state_outcome(included, confirmed) {
-            StateOutcome::Won => Ok(SignedCallOutcome::Success {
-                block: block_hex.to_string(),
-            }),
+            StateOutcome::Won => {
+                let header = self
+                    .rpc_call(
+                        "chain_getHeader",
+                        Value::Array(vec![Value::String(block_hex.to_string())]),
+                    )
+                    .await?;
+                Ok(SignedCallOutcome::Success {
+                    block: block_hex.to_string(),
+                    number: parse_block_number(&header)?,
+                })
+            }
             StateOutcome::IncludedButNotWon => {
                 let (error, lost_race) = self.explain_failure(block_hex, &confirmation).await;
                 Ok(SignedCallOutcome::DispatchFailed { error, lost_race })
@@ -663,7 +680,12 @@ pub(crate) enum Confirmation {
 /// On-chain result of a hybrid-signed extrinsic, before pallet-specific classify.
 pub(crate) enum SignedCallOutcome {
     /// Included and the dispatch succeeded.
-    Success { block: String },
+    Success {
+        /// `0x`-prefixed hash of the including block.
+        block: String,
+        /// Height of that block.
+        number: u64,
+    },
     /// Included but the dispatch failed.
     DispatchFailed {
         error: String,
@@ -1000,7 +1022,7 @@ impl ChainClient for RealChainClient {
         Ok(orders)
     }
 
-    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError> {
+    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError> {
         let pair = self.pair()?;
         let snap = self
             .last_snapshot
@@ -1043,32 +1065,60 @@ impl ChainClient for RealChainClient {
         let call = encode_submit_proof_call(&quantum);
         let account = signer_account_bytes(&pair);
 
-        match self
+        let (outcome, extrinsic_hash) = self
             .submit_signed_call(&call, Confirmation::ProofWin { account })
-            .await?
-        {
-            SignedCallOutcome::Success { block } => {
-                tracing::info!(block = %block, "proof included and dispatched successfully");
-                Ok(SubmitAction::Success)
+            .await?;
+        match outcome {
+            SignedCallOutcome::Success { block, number } => {
+                tracing::info!(block = %block, number, "proof included and dispatched successfully");
+                let block_hash = hex_decode(&block)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+                Ok(SubmitReceipt {
+                    action: SubmitAction::Success,
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash,
+                    block_number: Some(number),
+                })
             }
             SignedCallOutcome::DispatchFailed {
                 error,
                 lost_race: true,
             } => {
                 tracing::info!(reason = %error, "proof included but another miner took the qblock");
-                Ok(SubmitAction::StopRoundStale)
+                Ok(SubmitReceipt {
+                    action: SubmitAction::StopRoundStale,
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash: None,
+                    block_number: None,
+                })
             }
             SignedCallOutcome::DispatchFailed { error, .. } => {
                 tracing::warn!(error = %error, "proof included but ExtrinsicFailed");
-                Ok(classify_receipt(Some(&error)))
+                Ok(SubmitReceipt {
+                    action: classify_receipt(Some(&error)),
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash: None,
+                    block_number: None,
+                })
             }
             SignedCallOutcome::Invalid { message } => {
                 tracing::warn!(%message, "proof rejected as invalid before inclusion");
-                Ok(classify_receipt(Some(&message)))
+                Ok(SubmitReceipt {
+                    action: classify_receipt(Some(&message)),
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash: None,
+                    block_number: None,
+                })
             }
             SignedCallOutcome::Dropped { message } => {
                 tracing::warn!(%message, "proof dropped by node before inclusion");
-                Ok(SubmitAction::Retry)
+                Ok(SubmitReceipt {
+                    action: SubmitAction::Retry,
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash: None,
+                    block_number: None,
+                })
             }
         }
     }
@@ -1079,10 +1129,10 @@ impl ChainClient for RealChainClient {
             return Ok(RegistrationOutcome::AlreadyRegistered);
         }
         let call = encode_register_miner_call();
-        match self
+        let (outcome, _) = self
             .submit_signed_call(&call, Confirmation::MinerRegistered { account })
-            .await?
-        {
+            .await?;
+        match outcome {
             SignedCallOutcome::Success { .. } => Ok(RegistrationOutcome::Registered),
             SignedCallOutcome::DispatchFailed { error, .. }
             | SignedCallOutcome::Invalid { message: error } => {
@@ -1098,10 +1148,10 @@ impl ChainClient for RealChainClient {
     ) -> Result<DescriptorOutcome, ChainError> {
         let call = encode_set_descriptor_call(descriptor);
         let account = signer_account_bytes(&self.pair()?);
-        match self
+        let (outcome, _) = self
             .submit_signed_call(&call, Confirmation::Descriptor { account })
-            .await?
-        {
+            .await?;
+        match outcome {
             SignedCallOutcome::Success { .. } => Ok(DescriptorOutcome::Filed),
             SignedCallOutcome::DispatchFailed { error, .. }
             | SignedCallOutcome::Invalid { message: error } => {
@@ -1117,10 +1167,10 @@ impl ChainClient for RealChainClient {
     ) -> Result<ParticipationOutcome, ChainError> {
         let call = encode_participate_call(qblock_id, self.participate_kind, None);
         let account = signer_account_bytes(&self.pair()?);
-        match self
+        let (outcome, _) = self
             .submit_signed_call(&call, Confirmation::Participation { qblock_id, account })
-            .await?
-        {
+            .await?;
+        match outcome {
             SignedCallOutcome::Success { .. } => Ok(ParticipationOutcome::Declared),
             SignedCallOutcome::DispatchFailed { error, .. }
             | SignedCallOutcome::Invalid { message: error } => {

@@ -615,7 +615,7 @@ async fn devnet_submit_proof_end_to_end() {
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
-    let reported_success = matches!(action, Ok(SubmitAction::Success));
+    let reported_success = matches!(action.as_ref().map(|r| r.action), Ok(SubmitAction::Success));
     let event = scan_recent_events(&url, &alice_bytes, 8).await;
     println!(
         "  F9 check: reported_success={reported_success} on_chain_incremented={incremented} event={}",

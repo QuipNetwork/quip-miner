@@ -4,6 +4,7 @@ use super::sync::{SyncSource, SyncStatus};
 use super::{
     ChainClient, ChainError, DecayParams, DescriptorOutcome, JobOrder, MinerInfo, MiningSnapshot,
     NodeDescriptorV2Input, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
+    SubmitReceipt,
 };
 use crate::funding::BalanceSource;
 use async_trait::async_trait;
@@ -15,8 +16,8 @@ pub struct FakeChain {
     orders: Mutex<Vec<JobOrder>>,
     /// Captured proofs from [`ChainClient::submit_proof`].
     pub submitted: Mutex<Vec<Proof>>,
-    /// Optional scripted submit result (default Success).
-    submit_result: Mutex<Result<SubmitAction, ChainError>>,
+    /// Optional scripted submit receipt (default `Success`, no chain detail).
+    submit_result: Mutex<Result<SubmitReceipt, ChainError>>,
     /// Scripted `latest_qblock_id` (default `None`).
     qblock_id: Mutex<Option<u64>>,
     /// Scripted `fetch_decay_params` (default `None`).
@@ -58,7 +59,7 @@ impl FakeChain {
             snapshot: Mutex::new(Some(snapshot)),
             orders: Mutex::new(order.into_iter().collect()),
             submitted: Mutex::new(Vec::new()),
-            submit_result: Mutex::new(Ok(SubmitAction::Success)),
+            submit_result: Mutex::new(Ok(SubmitReceipt::action_only(SubmitAction::Success))),
             qblock_id: Mutex::new(None),
             decay_params: Mutex::new(None),
             balance: Mutex::new(Ok(u128::MAX)),
@@ -167,6 +168,30 @@ impl FakeChain {
         )]
         {
             std::mem::take(&mut *self.submitted.lock().unwrap())
+        }
+    }
+
+    /// Script the next `submit_proof` action. The receipt carries no chain
+    /// detail; use [`Self::set_submit_receipt`] when a test needs the hashes.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_submit_result(&self, action: Result<SubmitAction, ChainError>) {
+        let receipt = action.map(SubmitReceipt::action_only);
+        self.set_submit_receipt(receipt);
+    }
+
+    /// Script the next `submit_proof` receipt in full.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_submit_receipt(&self, receipt: Result<SubmitReceipt, ChainError>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.submit_result.lock().unwrap() = receipt;
         }
     }
 
@@ -435,7 +460,7 @@ impl ChainClient for FakeChain {
         }
     }
 
-    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError> {
+    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError> {
         #[expect(
             clippy::unwrap_used,
             reason = "test double; Mutex poison is a test failure"
@@ -445,7 +470,7 @@ impl ChainClient for FakeChain {
             // Can't move out of Mutex guard for Result with ChainError (not Clone);
             // reconstruct Success/Retry/etc from a stored pattern.
             match &*self.submit_result.lock().unwrap() {
-                Ok(a) => Ok(*a),
+                Ok(r) => Ok(*r),
                 Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
                 Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
                 Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),

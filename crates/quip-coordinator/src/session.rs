@@ -605,7 +605,8 @@ async fn run_session<C: ChainClient>(
                                     .map_or(0, |m| m.device_access_time_us),
                             };
                             let job_hex = crate::chain::extrinsic::hex_encode(&result.job_id);
-                            match chain.submit_proof(&proof).await {
+                            let receipt = chain.submit_proof(&proof).await;
+                            match receipt.as_ref().map(|r| r.action) {
                                 Ok(SubmitAction::Success) => {
                                     let mut st = state.lock().await;
                                     st.current_best_milli = Some(validated.best_energy_milli);
@@ -1308,7 +1309,8 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                             .map_or(0, |m| m.device_access_time_us),
                                     };
                                     let submit_result = chain.submit_proof(&proof).await;
-                                    if !matches!(submit_result, Ok(SubmitAction::Success)) {
+                                    let submit_action = submit_result.as_ref().map(|r| r.action);
+                                    if !matches!(submit_action, Ok(SubmitAction::Success)) {
                                         match &submit_result {
                                             Ok(_) => tracing::warn!(
                                                 job = %crate::chain::extrinsic::hex_encode(&result.job_id),
@@ -1321,7 +1323,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                             ),
                                         }
                                     }
-                                    if let Ok(SubmitAction::Success) = submit_result {
+                                    if let Ok(SubmitAction::Success) = submit_action {
                                         {
                                             let mut st = state.lock().await;
                                             st.current_best_milli =
