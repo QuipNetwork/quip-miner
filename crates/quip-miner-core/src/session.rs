@@ -65,6 +65,20 @@ const PROGRESS_LOG_INTERVAL: u64 = 10;
 /// practice while still bounding memory if the peer stops reading entirely.
 const CTRL_CHANNEL_DEPTH: usize = 256;
 
+/// How often to send an HTTP/2 PING on an otherwise quiet session.
+///
+/// A miner grinding one hard nonce sends nothing for minutes at a time, so the
+/// PINGs have to keep going while idle (`keep_alive_while_idle`) or the exact
+/// case they exist for is the case they skip.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// How long to wait for a PING ack before treating the coordinator as gone.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How often to re-check whether the sampler worker has finished, while waiting
+/// out the shutdown grace window.
+const SAMPLER_JOIN_POLL: Duration = Duration::from_millis(20);
+
 /// What the read loop knew about a job at prepare time, held until the writer
 /// finalizes it.
 ///
@@ -199,6 +213,102 @@ fn log_attempt(backend: &str, sr: &StreamResult, pending: Option<&PendingJob>) {
     }
 }
 
+/// Outbound half of a session, and the SOLE owner of the outbound sender.
+///
+/// Reading the inbound stream and writing to the outbound one must not live in
+/// the same task. A `tx.send().await` blocks once the outbound channel fills,
+/// which happens whenever the coordinator is slow to read — and if that await
+/// sits in the same loop as `inbound.message()`, the miner stops reading jobs
+/// precisely because it is busy returning results. The coordinator,
+/// symmetrically blocked writing jobs, then stops reading results, and both
+/// peers park forever. This was reproducible: a 480-credit grant (~89 MB of
+/// inline h/J in flight) deadlocked the session within three dispatches.
+///
+/// So the read loop hands outbound traffic here and never awaits the wire
+/// itself. Results (large) arrive on `res_rx` straight from the sampler;
+/// control replies (small, rare) arrive on `ctrl_rx` from the read loop.
+///
+/// Returns once both inputs are finished, or as soon as the outbound channel
+/// closes.
+async fn outbound_writer(
+    tx: mpsc::Sender<MinerMsg>,
+    mut res_rx: mpsc::Receiver<StreamResult>,
+    mut ctrl_rx: mpsc::Receiver<MinerMsg>,
+    pending: PendingParams,
+    jobs_done: Arc<AtomicU64>,
+    backend: &'static str,
+) {
+    // Progress logging (mirrors v0.2 mine_work_item's every-N-attempts line).
+    let session_start = std::time::Instant::now();
+    let mut best_energy_milli: i64 = i64::MAX;
+    let mut done: u64 = 0;
+    // Disables the control branch once the read loop is gone. A closed
+    // `ctrl_rx` completes `recv()` with `None` immediately and forever, so
+    // leaving the branch enabled turns this `select!` into a hot spin for the
+    // whole shutdown drain — the stretch between `drop(ctrl_tx)` and the sampler
+    // releasing `res_tx`, which lasts as long as the last in-flight job. Results
+    // still drain: the branch that stays enabled is the one that waits properly.
+    let mut ctrl_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            // Drain completed results first so a busy sampler never backs up.
+            Some(sr) = res_rx.recv() => {
+                let entry = {
+                    let mut p = match pending.lock() {
+                        Ok(p) => p,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    p.remove(&sr.job_id)
+                };
+                let (reads, sweeps) = entry
+                    .as_ref()
+                    .map_or((0, 0), |e| (e.num_reads, e.num_sweeps));
+                // A Cancelled job neither advances progress nor updates
+                // best energy; finalize_result just refunds its credit.
+                let completed = matches!(sr.outcome, StreamOutcome::Completed(_));
+                if let StreamOutcome::Completed(Ok(samples)) = &sr.outcome {
+                    if let Some(e) = samples.iter().map(|r| r.energy_milli).min() {
+                        best_energy_milli = best_energy_milli.min(e);
+                    }
+                }
+                log_attempt(backend, &sr, entry.as_ref());
+                for reply in finalize_result(sr, reads, sweeps, &mut done) {
+                    if tx.send(reply).await.is_err() {
+                        return;
+                    }
+                }
+                jobs_done.store(done, Ordering::Relaxed);
+                if completed && done > 0 && done.is_multiple_of(PROGRESS_LOG_INTERVAL) {
+                    log_progress(
+                        backend,
+                        done,
+                        session_start.elapsed(),
+                        best_energy_milli,
+                        entry.as_ref(),
+                    );
+                }
+            }
+            ctrl = ctrl_rx.recv(), if ctrl_open => {
+                if let Some(msg) = ctrl {
+                    if tx.send(msg).await.is_err() {
+                        return;
+                    }
+                } else {
+                    // Read loop is gone. Finish if the sampler has already
+                    // drained too, otherwise keep draining results with this
+                    // branch switched off.
+                    ctrl_open = false;
+                    if res_rx.is_closed() {
+                        return;
+                    }
+                }
+            }
+            else => return,
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "single bidi session select-loop; splitting would obscure the control flow"
@@ -225,6 +335,20 @@ async fn run_session<S: Sampler>(
 
     let path = uri.strip_prefix("unix://").unwrap_or(uri).to_string();
     let channel = Endpoint::try_from("http://[::]:50051")? // dummy authority for UDS
+        // The keepalive the read loop's comment below assumes. It has to be
+        // configured to exist: tonic's defaults leave HTTP/2 PINGs off, so a
+        // coordinator that vanished without closing the socket left this session
+        // parked in `inbound.message()` indefinitely, with no application-level
+        // timeout to catch it by design.
+        //
+        // Scope, stated so the claim is not overread a second time: PINGs are
+        // answered by the peer's HTTP/2 layer, not its application. This detects
+        // a peer that is *gone*. It does nothing for a peer that is alive but
+        // has stopped reading — that is a flow-control stall, and it needs
+        // different tools.
+        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
         .connect_with_connector(tower::service_fn(move |_: Uri| {
             let p = path.clone();
             async move {
@@ -251,7 +375,7 @@ async fn run_session<S: Sampler>(
     let prefetch = width.saturating_mul(2);
     let cap = prefetch.max(8);
     let (job_tx, job_rx) = mpsc::channel::<StreamJob>(cap);
-    let (res_tx, mut res_rx) = mpsc::channel::<StreamResult>(cap);
+    let (res_tx, res_rx) = mpsc::channel::<StreamResult>(cap);
     // Control-plane cancellation watermark: bumped here on `Cancel`, read by the
     // sampler thread to skip/abort jobs from generations the coordinator
     // abandoned on reseed.
@@ -259,7 +383,14 @@ async fn run_session<S: Sampler>(
     let sampler_thread = {
         let s = Arc::clone(&sampler);
         let cancel = cancel.clone();
-        std::thread::spawn(move || s.sample_stream(job_rx, res_tx, cancel))
+        // Named, because this is the thread anyone diagnosing a stalled miner
+        // needs to find first. An unnamed thread inherits the process name, and
+        // in a live stall this one sat among three other threads all reporting
+        // `quip-cuda-sa` in `top -H`, identifiable only by elimination. Held to
+        // 15 bytes, which is what Linux stores in `/proc/<pid>/task/*/comm`.
+        std::thread::Builder::new()
+            .name("quip-sampler".to_owned())
+            .spawn(move || s.sample_stream(job_rx, res_tx, cancel))?
     };
 
     let mut grace_ms: u64 = 5000;
@@ -273,89 +404,15 @@ async fn run_session<S: Sampler>(
     // Published by the writer, read here for `Status.jobs_done`.
     let jobs_done = Arc::new(AtomicU64::new(0));
 
-    // Writer task: the SOLE owner of the outbound sender.
-    //
-    // Reading the inbound stream and writing to the outbound one must not live
-    // in the same task. A `tx.send().await` blocks once the outbound channel
-    // fills, which happens whenever the coordinator is slow to read — and if
-    // that await sits in the same loop as `inbound.message()`, the miner stops
-    // reading jobs precisely because it is busy returning results. The
-    // coordinator, symmetrically blocked writing jobs, then stops reading
-    // results, and both peers park forever. This was reproducible: a 480-credit
-    // grant (~89 MB of inline h/J in flight) deadlocked the session within
-    // three dispatches.
-    //
-    // So the read loop hands outbound traffic to this task and never awaits the
-    // wire itself. Results (large) arrive on `res_rx` straight from the sampler;
-    // control replies (small, rare) arrive on `ctrl_rx` from the read loop.
-    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<MinerMsg>(CTRL_CHANNEL_DEPTH);
-    let writer = {
-        let tx = tx.clone();
-        let pending = Arc::clone(&pending);
-        let jobs_done = Arc::clone(&jobs_done);
-        let backend = id.backend;
-        tokio::spawn(async move {
-            // Progress logging (mirrors v0.2 mine_work_item's every-N-attempts line).
-            let session_start = std::time::Instant::now();
-            let mut best_energy_milli: i64 = i64::MAX;
-            let mut done: u64 = 0;
-            loop {
-                tokio::select! {
-                    biased;
-                    // Drain completed results first so a busy sampler never backs up.
-                    Some(sr) = res_rx.recv() => {
-                        let entry = {
-                            let mut p = match pending.lock() {
-                                Ok(p) => p,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            p.remove(&sr.job_id)
-                        };
-                        let (reads, sweeps) = entry
-                            .as_ref()
-                            .map_or((0, 0), |e| (e.num_reads, e.num_sweeps));
-                        // A Cancelled job neither advances progress nor updates
-                        // best energy; finalize_result just refunds its credit.
-                        let completed = matches!(sr.outcome, StreamOutcome::Completed(_));
-                        if let StreamOutcome::Completed(Ok(samples)) = &sr.outcome {
-                            if let Some(e) = samples.iter().map(|r| r.energy_milli).min() {
-                                best_energy_milli = best_energy_milli.min(e);
-                            }
-                        }
-                        log_attempt(backend, &sr, entry.as_ref());
-                        for reply in finalize_result(sr, reads, sweeps, &mut done) {
-                            if tx.send(reply).await.is_err() {
-                                return;
-                            }
-                        }
-                        jobs_done.store(done, Ordering::Relaxed);
-                        if completed && done > 0 && done.is_multiple_of(PROGRESS_LOG_INTERVAL) {
-                            log_progress(
-                                backend,
-                                done,
-                                session_start.elapsed(),
-                                best_energy_milli,
-                                entry.as_ref(),
-                            );
-                        }
-                    }
-                    ctrl = ctrl_rx.recv() => {
-                        match ctrl {
-                            Some(msg) => {
-                                if tx.send(msg).await.is_err() {
-                                    return;
-                                }
-                            }
-                            // Read loop is gone and the sampler has drained.
-                            None if res_rx.is_closed() => return,
-                            None => {}
-                        }
-                    }
-                    else => return,
-                }
-            }
-        })
-    };
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<MinerMsg>(CTRL_CHANNEL_DEPTH);
+    let writer = tokio::spawn(outbound_writer(
+        tx.clone(),
+        res_rx,
+        ctrl_rx,
+        Arc::clone(&pending),
+        Arc::clone(&jobs_done),
+        id.backend,
+    ));
 
     loop {
         // Read loop: owns the inbound stream and nothing else. Every outbound
@@ -525,8 +582,26 @@ async fn run_session<S: Sampler>(
     if tokio::time::timeout(grace, writer).await.is_err() {
         tracing::warn!("outbound writer did not finish within the shutdown grace window");
     }
-    // Surface sampler-worker panics: join Err is a panic payload, not a clean drain.
-    if let Err(panic) = sampler_thread.join() {
+    // Bounded wait for the sampler worker, then surface panics: a join `Err` is
+    // a panic payload, not a clean drain.
+    //
+    // `JoinHandle::join` is unbounded and uninterruptible, and the worker is not
+    // guaranteed to return. One parked in `blocking_send` on a result channel
+    // nobody is draining never does, so joining unconditionally made the process
+    // ignore SIGTERM and sit until something external sent SIGKILL — observed as
+    // multi-minute container restarts on a miner that had already stopped
+    // producing. Poll `is_finished` against the same grace window instead and
+    // abandon the thread if it overruns: the process is exiting, so a detached
+    // worker costs nothing, while a hung join costs the entire shutdown.
+    let sampler_deadline = tokio::time::Instant::now() + grace;
+    while !sampler_thread.is_finished() && tokio::time::Instant::now() < sampler_deadline {
+        tokio::time::sleep(SAMPLER_JOIN_POLL).await;
+    }
+    if !sampler_thread.is_finished() {
+        tracing::error!(
+            "sampler thread did not finish within the shutdown grace window; abandoning it"
+        );
+    } else if let Err(panic) = sampler_thread.join() {
         let payload = panic_payload_message(&*panic);
         tracing::error!(panic = %payload, "sampler thread panicked");
         return Err(format!("sampler thread panicked: {payload}").into());
@@ -645,5 +720,68 @@ pub fn run<S: Sampler>(
     )) {
         Ok(()) => StdExitCode::SUCCESS,
         Err(e) => map_err_to_exit(e, id.backend),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The writer waits, rather than spins, once the read loop is gone while the
+    /// sampler still holds `res_tx`.
+    ///
+    /// That window is every shutdown: `run_session` drops `ctrl_tx` first and
+    /// the sampler keeps `res_tx` until its last in-flight job finishes. A
+    /// closed `ctrl_rx` completes `recv()` with `None` immediately and forever,
+    /// so a `select!` that leaves the branch enabled burns a core for the whole
+    /// drain.
+    ///
+    /// The paused clock is what makes that observable rather than a matter of
+    /// opinion: tokio advances a paused clock only while every task is idle, so
+    /// a spinning writer stops the sleep below from ever returning and this test
+    /// hangs instead of passing.
+    #[tokio::test(start_paused = true)]
+    async fn writer_parks_when_the_read_loop_closes_before_the_sampler() {
+        let (tx, mut out_rx) = mpsc::channel::<MinerMsg>(16);
+        let (res_tx, res_rx) = mpsc::channel::<StreamResult>(4);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<MinerMsg>(4);
+        let writer = tokio::spawn(outbound_writer(
+            tx,
+            res_rx,
+            ctrl_rx,
+            Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(AtomicU64::new(0)),
+            "test",
+        ));
+
+        // Read loop exits, as it does on Shutdown; the sampler is still working.
+        drop(ctrl_tx);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(
+            !writer.is_finished(),
+            "writer must keep draining results until the sampler releases res_tx"
+        );
+
+        // And it is still serving the result side while the control side is shut.
+        res_tx
+            .send(StreamResult {
+                job_id: vec![1, 2, 3],
+                outcome: StreamOutcome::Cancelled,
+                device_access_time_us: 0,
+            })
+            .await
+            .unwrap();
+        let msg = out_rx.recv().await.expect("credit refund reached the wire");
+        assert!(
+            matches!(msg.msg, Some(miner_msg::Msg::JobRequest(_))),
+            "a Cancelled result refunds its credit and sends nothing else"
+        );
+
+        // Sampler finishes: both inputs are done, so the writer returns.
+        drop(res_tx);
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("writer returned once both inputs closed")
+            .expect("writer did not panic");
     }
 }
