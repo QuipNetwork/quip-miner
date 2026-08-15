@@ -412,11 +412,17 @@ fn u64_field(rec: &Map<String, Value>, key: &str) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 /// Largest integer an IEEE-754 double holds exactly (`Number.MAX_SAFE_INTEGER`).
-#[expect(dead_code, reason = "Will be called by Task 2 response mappers")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Will be called by Task 2 response mappers")
+)]
 const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 /// Smallest integer an IEEE-754 double holds exactly.
-#[expect(dead_code, reason = "Will be called by Task 2 response mappers")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Will be called by Task 2 response mappers")
+)]
 const JS_MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
 
 /// Serialize `v` as a JSON number, or `0` when it falls outside the range a
@@ -427,7 +433,10 @@ const JS_MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
 /// different integer and the insert fails, which stalls the indexer checkpoint.
 /// Clamping to `0` keeps the walk moving; the warning names the field so the
 /// real source is still findable.
-#[expect(dead_code, reason = "Will be called by Task 2 response mappers")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Will be called by Task 2 response mappers")
+)]
 fn safe_i64(field: &str, solution_number: u64, v: i64) -> Value {
     if (JS_MIN_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&v) {
         return Value::from(v);
@@ -442,7 +451,10 @@ fn safe_i64(field: &str, solution_number: u64, v: i64) -> Value {
 }
 
 /// [`safe_i64`] for unsigned fields. Only the upper bound can be exceeded.
-#[expect(dead_code, reason = "Will be called by Task 2 response mappers")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Will be called by Task 2 response mappers")
+)]
 #[expect(clippy::single_match_else, reason = "Brief specifies match structure")]
 fn safe_u64(field: &str, solution_number: u64, v: u64) -> Value {
     match i64::try_from(v) {
@@ -465,7 +477,10 @@ fn safe_u64(field: &str, solution_number: u64, v: u64) -> Value {
 /// safe range in normal operation, so clamping them to `0` would throw away real
 /// data. Rule N1 puts them on the wire as strings instead. The dashboard parser
 /// already coerces these fields with `String(...)`.
-#[expect(dead_code, reason = "Will be called by Task 2 response mappers")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Will be called by Task 2 response mappers")
+)]
 fn wire_u128(v: u128) -> Value {
     Value::String(v.to_string())
 }
