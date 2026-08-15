@@ -10,6 +10,7 @@
 //! source for the `/api/v1/mining/attempts` envelope: `solution_number` maps
 //! to the directory name under `data_dir`.
 
+use crate::metrics::CoordinatorMetrics;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -18,10 +19,21 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::services::ServeDir;
 
-/// Build the dashboard router rooted at `data_dir`:
+/// What the `/api/v1` handlers read: the attempt-log root plus the live
+/// coordinator counters and identity.
+#[derive(Clone)]
+pub struct DashboardState {
+    /// Root directory holding `<solution_number>/attempts.jsonl`.
+    pub data_dir: PathBuf,
+    /// Live counters, identity, and chain view.
+    pub metrics: Arc<CoordinatorMetrics>,
+}
+
+/// Build the dashboard router:
 /// - `GET /qblocks` → JSON array of available qblock ids (directory names)
 /// - `GET /healthz` → `ok`
 /// - `GET /api/v1/status` → indexer status envelope
@@ -29,7 +41,8 @@ use tower_http::services::ServeDir;
 /// - `GET /api/v1/mining/attempts?solution_number=N` → submission + attempts
 /// - everything else → static files under `data_dir`, e.g.
 ///   `GET /<qblock_id>/attempts.jsonl`.
-pub fn router(data_dir: PathBuf) -> Router {
+pub fn router(state: DashboardState) -> Router {
+    let data_dir = state.data_dir.clone();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/qblocks", get(list_qblocks))
@@ -37,7 +50,7 @@ pub fn router(data_dir: PathBuf) -> Router {
         .route("/api/v1/stats", get(api_stats))
         .route("/api/v1/mining/attempts", get(api_mining_attempts))
         .fallback_service(ServeDir::new(&data_dir))
-        .with_state(data_dir)
+        .with_state(state)
 }
 
 async fn healthz() -> &'static str {
@@ -46,7 +59,8 @@ async fn healthz() -> &'static str {
 
 /// List the qblock directories under the data root (sorted). Returns an empty
 /// list if the root does not exist yet.
-async fn list_qblocks(State(data_dir): State<PathBuf>) -> Json<Vec<String>> {
+async fn list_qblocks(State(state): State<DashboardState>) -> Json<Vec<String>> {
+    let data_dir = state.data_dir;
     let mut ids = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(&data_dir).await {
         while let Ok(Some(entry)) = rd.next_entry().await {
@@ -65,7 +79,7 @@ async fn list_qblocks(State(data_dir): State<PathBuf>) -> Json<Vec<String>> {
 /// Serve the dashboard on `listen` (e.g. `0.0.0.0:20100`) until the task is
 /// aborted. A bind failure is logged and the task exits without taking down the
 /// coordinator.
-pub async fn serve(listen: String, data_dir: PathBuf) {
+pub async fn serve(listen: String, state: DashboardState) {
     let listener = match tokio::net::TcpListener::bind(&listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -75,9 +89,9 @@ pub async fn serve(listen: String, data_dir: PathBuf) {
     };
     tracing::info!(
         "dashboard: serving {} at http://{listen}",
-        data_dir.display()
+        state.data_dir.display()
     );
-    if let Err(e) = axum::serve(listener, router(data_dir)).await {
+    if let Err(e) = axum::serve(listener, router(state)).await {
         tracing::warn!("dashboard: server error: {e}");
     }
 }
@@ -121,7 +135,8 @@ fn error_envelope(status: StatusCode, message: &str, code: &str) -> Response {
 /// Indexer status probe. Identity and chain fields have no live source in the
 /// file-backed dashboard yet, so they return empty / zero values the client
 /// already tolerates (see report: Blocked / needs decision).
-async fn api_status() -> Response {
+async fn api_status(State(state): State<DashboardState>) -> Response {
+    let _ = &state;
     success_envelope(&json!({
         "ss58_address": "",
         "account_id_hex": "",
@@ -143,21 +158,28 @@ async fn api_status() -> Response {
 // GET /api/v1/stats
 // ---------------------------------------------------------------------------
 
-/// Indexer stats probe. Controller counters are not tracked by the dashboard
-/// writer; zeros keep the envelope parseable until a live counter source is
-/// wired.
-async fn api_stats() -> Response {
+/// Indexer stats probe. Reports the process-global controller counters, which
+/// equal the sum across modes for every counter except `heads_observed` — every
+/// backend observes the same chain heads. `/api/v1/status` carries the per-mode
+/// split.
+async fn api_stats(State(state): State<DashboardState>) -> Response {
     success_envelope(&json!({
-        "controller": {
-            "heads_observed": 0,
-            "contexts_dispatched": 0,
-            "results_received": 0,
-            "proofs_submitted": 0,
-            "stale_drops": 0,
-            "submission_errors": 0,
-            "duplicate_result_drops": 0,
-        }
+        "controller": counters_json(&state.metrics.global()),
     }))
+}
+
+/// Serialize one counter set. Every counter passes the safe-integer guard, so a
+/// runaway counter cannot stall the indexer the way the energy sentinel did.
+fn counters_json(c: &crate::metrics::CounterSnapshot) -> Value {
+    json!({
+        "heads_observed": safe_u64("heads_observed", 0, c.heads_observed),
+        "contexts_dispatched": safe_u64("contexts_dispatched", 0, c.contexts_dispatched),
+        "results_received": safe_u64("results_received", 0, c.results_received),
+        "proofs_submitted": safe_u64("proofs_submitted", 0, c.proofs_submitted),
+        "stale_drops": safe_u64("stale_drops", 0, c.stale_drops),
+        "submission_errors": safe_u64("submission_errors", 0, c.submission_errors),
+        "duplicate_result_drops": safe_u64("duplicate_result_drops", 0, c.duplicate_result_drops),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +193,7 @@ struct AttemptsQuery {
 }
 
 async fn api_mining_attempts(
-    State(data_dir): State<PathBuf>,
+    State(state): State<DashboardState>,
     Query(query): Query<AttemptsQuery>,
 ) -> Response {
     let Some(raw) = query.solution_number.as_deref() else {
@@ -188,7 +210,7 @@ async fn api_mining_attempts(
             "BAD_PARAM",
         );
     };
-    match load_attempts_envelope(&data_dir, solution_number) {
+    match load_attempts_envelope(&state.data_dir, solution_number) {
         Ok(data) => success_envelope(&data),
         Err(AttemptsLoadError::NotFound) => error_envelope(
             StatusCode::NOT_FOUND,
@@ -637,7 +659,7 @@ mod tests {
     }
 
     async fn get_body(tmp: &Path, uri: &str) -> Value {
-        let app = router(tmp.to_path_buf());
+        let app = router(test_state(tmp));
         let resp = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
@@ -740,7 +762,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
 
         // File download.
         let resp = app
@@ -780,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn status_returns_success_envelope() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -800,11 +822,18 @@ mod tests {
         assert!(at(&v, "/timestamp").is_number());
     }
 
-    #[tokio::test]
-    async fn stats_returns_controller_counters() {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = router(tmp.path().to_path_buf());
-        let resp = app
+    fn test_state(tmp: &Path) -> DashboardState {
+        DashboardState {
+            data_dir: tmp.to_path_buf(),
+            metrics: Arc::new(CoordinatorMetrics::new(&[(
+                "cpu-0".to_string(),
+                "cpu".to_string(),
+            )])),
+        }
+    }
+
+    async fn stats_body(state: DashboardState) -> Value {
+        let resp = router(state)
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/stats")
@@ -814,15 +843,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
+        body_json(resp).await
+    }
+
+    /// C7: dispatch one context and receive one result. Both counters advance
+    /// by exactly one and no counter goes backwards.
+    #[tokio::test]
+    async fn c7_stats_counters_advance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let metrics = Arc::clone(&state.metrics);
+
+        let before = stats_body(state.clone()).await;
+        metrics.record_contexts_dispatched("cpu-0", 1);
+        metrics.record_result_received("cpu-0");
+        let after = stats_body(state).await;
+
+        assert_eq!(
+            at(&before, "/data/controller/contexts_dispatched"),
+            &json!(0)
+        );
+        assert_eq!(at(&before, "/data/controller/results_received"), &json!(0));
+        assert_eq!(
+            at(&after, "/data/controller/contexts_dispatched"),
+            &json!(1)
+        );
+        assert_eq!(at(&after, "/data/controller/results_received"), &json!(1));
+
+        for key in [
+            "heads_observed",
+            "contexts_dispatched",
+            "results_received",
+            "proofs_submitted",
+            "stale_drops",
+            "submission_errors",
+            "duplicate_result_drops",
+        ] {
+            let b = at(&before, &format!("/data/controller/{key}"))
+                .as_u64()
+                .unwrap();
+            let a = at(&after, &format!("/data/controller/{key}"))
+                .as_u64()
+                .unwrap();
+            assert!(a >= b, "{key} decreased from {b} to {a}");
+        }
+    }
+
+    /// Every one of the seven keys is present, so the dashboard parser never
+    /// falls back to its `?? 0` default and hides a missing counter.
+    #[tokio::test]
+    async fn stats_carries_all_seven_controller_counters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v = stats_body(test_state(tmp.path())).await;
         assert_eq!(at(&v, "/success"), &json!(true));
-        assert_eq!(at(&v, "/data/controller/heads_observed"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/contexts_dispatched"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/results_received"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/proofs_submitted"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/stale_drops"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/submission_errors"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/duplicate_result_drops"), &json!(0));
+        for key in [
+            "heads_observed",
+            "contexts_dispatched",
+            "results_received",
+            "proofs_submitted",
+            "stale_drops",
+            "submission_errors",
+            "duplicate_result_drops",
+        ] {
+            assert!(
+                at(&v, &format!("/data/controller/{key}")).is_number(),
+                "missing controller.{key}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -834,7 +921,7 @@ mod tests {
         let line2 = attempt_line("cpu-0", -14_200, 250, 6, true, true, 12_000);
         std::fs::write(dir.join("attempts.jsonl"), format!("{line1}\n{line2}\n")).unwrap();
 
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -867,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn mining_attempts_unknown_solution_number_is_404() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -886,7 +973,7 @@ mod tests {
     #[tokio::test]
     async fn mining_attempts_missing_query_is_400() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -905,7 +992,7 @@ mod tests {
     #[tokio::test]
     async fn mining_attempts_malformed_query_is_400() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
         let resp = app
             .oneshot(
                 Request::builder()

@@ -97,6 +97,8 @@ pub struct FeederParams {
     /// Consecutive failed submissions of one proof, inside one quantum block,
     /// before the coordinator stops retrying it.
     pub max_submit_attempts: u32,
+    /// Live controller counters, for `heads_observed`.
+    pub metrics: Arc<crate::metrics::CoordinatorMetrics>,
 }
 
 /// EMA smoothing for the per-miner consumption signal. Lower reacts slower but
@@ -520,6 +522,7 @@ pub async fn feeder_loop<C>(
     C: ChainClient + SyncSource + BalanceSource,
 {
     let mut current_head: Option<[u8; 32]> = None;
+    let mut last_block_number: u64 = 0;
     let mut generation: u64 = 0;
     let mut salt_ctr: u64 = 0;
     // Monotonic anchor for block-time estimation (win-time submission).
@@ -582,6 +585,14 @@ pub async fn feeder_loop<C>(
         }
 
         if let Some(mut snap) = snap {
+            // The chain advances every block; `last_proof_block_hash` changes
+            // only on a win. Counting block-number advances is what makes
+            // `heads_observed` track chain height, which is what the dashboard
+            // charts against.
+            if snap.block_number > last_block_number {
+                params.metrics.record_head_observed();
+                last_block_number = snap.block_number;
+            }
             let head = snap.last_proof_block_hash;
             if current_head != Some(head) {
                 let next = match round {
@@ -998,13 +1009,30 @@ where
         }
     }
 
+    // Live counters and identity, shared by the session path, the feeder, and
+    // the dashboard router. Built from the launch plan so `modes` carries one
+    // entry per backend group.
+    let metrics = Arc::new(crate::metrics::CoordinatorMetrics::new(
+        &launch
+            .iter()
+            .map(|e| (e.miner_id.clone(), e.backend.clone()))
+            .collect::<Vec<_>>(),
+    ));
+    state.lock().await.metrics = Arc::clone(&metrics);
+
     // Optional mining-attempt dashboard: a single writer thread records every
     // solved model to `<data_dir>/<qblock_id>/attempts.jsonl`, and an HTTP task
-    // serves those files statically.
+    // serves those files plus the three `/api/v1` endpoints.
     let dashboard_server = if let Some((listen, data_dir)) = params.dashboard.clone() {
         let tx = crate::attempt::spawn_writer(data_dir.clone());
         state.lock().await.attempt_tx = Some(tx);
-        Some(tokio::spawn(crate::dashboard::serve(listen, data_dir)))
+        Some(tokio::spawn(crate::dashboard::serve(
+            listen,
+            crate::dashboard::DashboardState {
+                data_dir,
+                metrics: Arc::clone(&metrics),
+            },
+        )))
     } else {
         None
     };
@@ -1049,6 +1077,7 @@ where
             descriptor_filed: params.descriptor_filed,
             miner_registered: params.miner_registered,
             max_submit_attempts: params.max_submit_attempts,
+            metrics: Arc::clone(&metrics),
         },
         stop_rx.clone(),
     ));

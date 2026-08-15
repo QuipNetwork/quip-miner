@@ -53,6 +53,8 @@ async fn dispatch_granted(
             staged = st.router.staged_len(miner_id),
             "dispatch drain"
         );
+        st.metrics
+            .record_contexts_dispatched(miner_id, jobs.len() as u64);
         jobs
     };
     for job in jobs {
@@ -61,6 +63,12 @@ async fn dispatch_granted(
         }
     }
     true
+}
+
+/// Record a stale drop without holding the coordinator mutex across an await.
+async fn st_metrics_stale(state: &Arc<Mutex<CoordinatorState>>, miner_id: &str) {
+    let metrics = Arc::clone(&state.lock().await.metrics);
+    metrics.record_stale_drop(miner_id);
 }
 
 /// Unguessable per-spawn session token (32 random bytes, hex-encoded).
@@ -189,6 +197,9 @@ pub struct CoordinatorState {
     /// Per-miner last-known self-reported liveness (mining/paused + round),
     /// updated from ping-reply `Status` messages.
     pub miner_liveness: HashMap<String, crate::liveness::MinerLiveness>,
+    /// Live controller counters. Shared with the dashboard router, so the HTTP
+    /// handlers never take this mutex.
+    pub metrics: Arc<crate::metrics::CoordinatorMetrics>,
 }
 
 impl CoordinatorState {
@@ -216,6 +227,7 @@ impl CoordinatorState {
             timing: crate::timing::TimingTracker::with_defaults(),
             generation: 0,
             miner_liveness: HashMap::new(),
+            metrics: Arc::new(crate::metrics::CoordinatorMetrics::new(&[])),
         }
     }
 
@@ -537,19 +549,28 @@ async fn run_session<C: ChainClient>(
                 }
             }
             Some(miner_msg::Msg::Result(result)) => {
-                let (job, salt, topo, best, gates) = {
+                let (job, salt, topo, best, gates, generation) = {
                     let mut st = state.lock().await;
+                    st.metrics.record_result_received(&miner_id);
                     let job = st.complete_inflight(&result.job_id);
                     if job.is_some() {
                         st.router.record_completion(&miner_id);
+                    } else {
+                        // The job id is unknown or already completed: either the
+                        // miner sent the same result twice, or the job was
+                        // cancelled when the round turned over.
+                        st.metrics.record_duplicate_result_drop(&miner_id);
                     }
                     let salt = st.take_salt(&result.job_id);
                     let topo = Arc::clone(&st.resolved_topo);
                     let best = st.current_best_milli;
                     let gates = crate::validate::gates_from_target(st.target.as_ref());
-                    (job, salt, topo, best, gates)
+                    (job, salt, topo, best, gates, st.generation)
                 };
                 if let Some(job) = job {
+                    if job.generation < generation {
+                        st_metrics_stale(&state, &miner_id).await;
+                    }
                     if let Some(ising) = job.ising.as_ref() {
                         let validated = validate_result(ising, &result.solutions, &gates, &topo);
                         let mut submitted = false;
@@ -588,6 +609,7 @@ async fn run_session<C: ChainClient>(
                                 Ok(SubmitAction::Success) => {
                                     let mut st = state.lock().await;
                                     st.current_best_milli = Some(validated.best_energy_milli);
+                                    st.metrics.record_proof_submitted(&miner_id);
                                     if let Some(n) = submit_notify.lock().await.take() {
                                         let _ = n.send(());
                                     }
@@ -595,16 +617,32 @@ async fn run_session<C: ChainClient>(
                                 }
                                 Ok(SubmitAction::Retry) => {
                                     tracing::warn!(job = %job_hex, "session submit rejected (retryable); retaining accepted candidate for win-time retry");
+                                    state
+                                        .lock()
+                                        .await
+                                        .metrics
+                                        .record_submission_error(&miner_id);
                                     retain_for_retry = true;
                                 }
                                 Ok(SubmitAction::StopRoundStale) => {
                                     tracing::info!(job = %job_hex, "session submit stale for round; dropping candidate");
+                                    state.lock().await.metrics.record_stale_drop(&miner_id);
                                 }
                                 Ok(SubmitAction::StopFatal) => {
                                     tracing::error!(job = %job_hex, "session submit fatally rejected by pallet; dropping candidate");
+                                    state
+                                        .lock()
+                                        .await
+                                        .metrics
+                                        .record_submission_error(&miner_id);
                                 }
                                 Err(e) => {
                                     tracing::error!(job = %job_hex, error = %e, "session submit failed (transient); retaining accepted candidate for win-time retry");
+                                    state
+                                        .lock()
+                                        .await
+                                        .metrics
+                                        .record_submission_error(&miner_id);
                                     retain_for_retry = true;
                                 }
                             }
