@@ -785,6 +785,33 @@ mod tests {
         assert_eq!(decoded.rewards_earned, 70_000_000_000_000);
     }
 
+    /// Fixture built from the pallet's declared layout directly, independent of
+    /// `MinerInfoScale`'s own field order. `miner_info_decodes_the_pallet_field_order`
+    /// above encodes and decodes with the same struct, so it round-trips even if
+    /// the struct's field order drifted from the pallet's — it cannot catch a
+    /// transposition. This test can, because the blob comes from
+    /// `quip-validator/pallets/quantum-pow/src/types.rs`'s
+    /// `MinerInfo<Balance, BlockNumber>` field order (`registered_at, deposit,
+    /// proofs_submitted, proofs_won, rewards_earned`), not from the struct.
+    /// Any change to that pallet layout must be mirrored here.
+    #[test]
+    fn miner_info_blob_built_from_the_pallet_layout_decodes_correctly() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1_234_u32.to_le_bytes()); // registered_at
+        blob.extend_from_slice(&1_000_000_000_000_u128.to_le_bytes()); // deposit
+        blob.extend_from_slice(&7_u32.to_le_bytes()); // proofs_submitted
+        blob.extend_from_slice(&3_u32.to_le_bytes()); // proofs_won
+        blob.extend_from_slice(&70_000_000_000_000_u128.to_le_bytes()); // rewards_earned
+        assert_eq!(blob.len(), 44);
+
+        let decoded = MinerInfoScale::decode(&mut &blob[..]).unwrap();
+        assert_eq!(decoded.registered_at, 1_234);
+        assert_eq!(decoded.deposit, 1_000_000_000_000);
+        assert_eq!(decoded.proofs_submitted, 7);
+        assert_eq!(decoded.proofs_won, 3);
+        assert_eq!(decoded.rewards_earned, 70_000_000_000_000);
+    }
+
     #[test]
     fn a_truncated_miner_info_blob_fails_to_decode() {
         let encoded = MinerInfoScale {
