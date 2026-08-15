@@ -13,6 +13,38 @@ pub enum SubmitAction {
     StopFatal,
 }
 
+/// What a submit attempt produced: the action the fire-loop takes, plus the
+/// chain detail the dashboard reports on the submission row.
+///
+/// `extrinsic_hash` is known as soon as the extrinsic is signed, so it is set on
+/// every path that reached the node. `block_hash` and `block_number` are set only
+/// on [`SubmitAction::Success`], which the pallet confirmation defines as a win:
+/// `QuantumPow.QBlocks[block_number].miner` equals the signing account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitReceipt {
+    /// Action the fire-loop should take.
+    pub action: SubmitAction,
+    /// Hash of the signed extrinsic, once it is signed.
+    pub extrinsic_hash: Option<[u8; 32]>,
+    /// Hash of the winning block. `None` when the submission did not win.
+    pub block_hash: Option<[u8; 32]>,
+    /// Height of the winning block. `None` when the submission did not win.
+    pub block_number: Option<u64>,
+}
+
+impl SubmitReceipt {
+    /// A receipt that carries an action and no chain detail.
+    #[must_use]
+    pub const fn action_only(action: SubmitAction) -> Self {
+        Self {
+            action,
+            extrinsic_hash: None,
+            block_hash: None,
+            block_number: None,
+        }
+    }
+}
+
 /// A validated proof ready for chain submission.
 #[derive(Debug, Clone)]
 pub struct Proof {
@@ -255,5 +287,29 @@ mod tests {
             Some(ParticipationOutcome::DescriptorMissing)
         );
         assert_eq!(classify_participation(Some("SomethingUnknown")), None);
+    }
+
+    /// A receipt with no chain detail is the shape every non-winning path
+    /// returns. Keeping one constructor for it stops each call site inventing
+    /// its own `None` triple.
+    #[test]
+    fn action_only_carries_no_chain_detail() {
+        let r = SubmitReceipt::action_only(SubmitAction::Retry);
+        assert_eq!(r.action, SubmitAction::Retry);
+        assert_eq!(r.extrinsic_hash, None);
+        assert_eq!(r.block_hash, None);
+        assert_eq!(r.block_number, None);
+    }
+
+    #[test]
+    fn a_winning_receipt_carries_the_extrinsic_and_the_block() {
+        let r = SubmitReceipt {
+            action: SubmitAction::Success,
+            extrinsic_hash: Some([0xab; 32]),
+            block_hash: Some([0xcd; 32]),
+            block_number: Some(10_249),
+        };
+        assert_eq!(r.action, SubmitAction::Success);
+        assert_eq!(r.block_number, Some(10_249));
     }
 }

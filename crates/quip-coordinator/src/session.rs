@@ -1,6 +1,6 @@
 //! tonic `MinerService` server: token verify, handshake, job dispatch, results.
 
-use crate::chain::{ChainClient, Proof, SubmitAction};
+use crate::chain::{ChainClient, ChainError, Proof, SubmitAction, SubmitReceipt};
 use crate::config::LaunchEntry;
 use crate::router::{MinerCaps, Router};
 use crate::topology::Topology;
@@ -53,6 +53,8 @@ async fn dispatch_granted(
             staged = st.router.staged_len(miner_id),
             "dispatch drain"
         );
+        st.metrics
+            .record_contexts_dispatched(miner_id, jobs.len() as u64);
         jobs
     };
     for job in jobs {
@@ -61,6 +63,12 @@ async fn dispatch_granted(
         }
     }
     true
+}
+
+/// Record a stale drop without holding the coordinator mutex across an await.
+async fn st_metrics_stale(state: &Arc<Mutex<CoordinatorState>>, miner_id: &str) {
+    let metrics = Arc::clone(&state.lock().await.metrics);
+    metrics.record_stale_drop(miner_id);
 }
 
 /// Unguessable per-spawn session token (32 random bytes, hex-encoded).
@@ -189,6 +197,15 @@ pub struct CoordinatorState {
     /// Per-miner last-known self-reported liveness (mining/paused + round),
     /// updated from ping-reply `Status` messages.
     pub miner_liveness: HashMap<String, crate::liveness::MinerLiveness>,
+    /// Live controller counters. Shared with the dashboard router, so the HTTP
+    /// handlers never take this mutex.
+    pub metrics: Arc<crate::metrics::CoordinatorMetrics>,
+    /// `LastProofBlockHash` the current round's jobs were built on, as
+    /// `0x`-prefixed hex. Set by the feeder on reseed.
+    pub last_proof_block_hash: String,
+    /// `miner_id` to its backend label (`CPU`, `GPU-CUDA`). Seeded from the
+    /// launch plan so the session can stamp every attempt.
+    pub miner_types: HashMap<String, String>,
 }
 
 impl CoordinatorState {
@@ -216,6 +233,9 @@ impl CoordinatorState {
             timing: crate::timing::TimingTracker::with_defaults(),
             generation: 0,
             miner_liveness: HashMap::new(),
+            metrics: Arc::new(crate::metrics::CoordinatorMetrics::new(&[])),
+            last_proof_block_hash: String::new(),
+            miner_types: HashMap::new(),
         }
     }
 
@@ -537,19 +557,28 @@ async fn run_session<C: ChainClient>(
                 }
             }
             Some(miner_msg::Msg::Result(result)) => {
-                let (job, salt, topo, best, gates) = {
+                let (job, salt, topo, best, gates, generation) = {
                     let mut st = state.lock().await;
+                    st.metrics.record_result_received(&miner_id);
                     let job = st.complete_inflight(&result.job_id);
                     if job.is_some() {
                         st.router.record_completion(&miner_id);
+                    } else {
+                        // The job id is unknown or already completed: either the
+                        // miner sent the same result twice, or the job was
+                        // cancelled when the round turned over.
+                        st.metrics.record_duplicate_result_drop(&miner_id);
                     }
                     let salt = st.take_salt(&result.job_id);
                     let topo = Arc::clone(&st.resolved_topo);
                     let best = st.current_best_milli;
                     let gates = crate::validate::gates_from_target(st.target.as_ref());
-                    (job, salt, topo, best, gates)
+                    (job, salt, topo, best, gates, st.generation)
                 };
                 if let Some(job) = job {
+                    if job.generation < generation {
+                        st_metrics_stale(&state, &miner_id).await;
+                    }
                     if let Some(ising) = job.ising.as_ref() {
                         let validated = validate_result(ising, &result.solutions, &gates, &topo);
                         let mut submitted = false;
@@ -557,6 +586,10 @@ async fn run_session<C: ChainClient>(
                         // transient reason: keep it for the win-time retry loop
                         // instead of dropping a genuine winner.
                         let mut retain_for_retry = false;
+                        // Chain detail of the submit attempt, kept for the
+                        // attempt record below; `None` when this result never
+                        // reached the gate that triggers a submit.
+                        let mut receipt: Option<Result<SubmitReceipt, ChainError>> = None;
                         if validated.accepted && beats_current(validated.best_energy_milli, best) {
                             let proof = Proof {
                                 job_id: result.job_id.clone(),
@@ -584,10 +617,12 @@ async fn run_session<C: ChainClient>(
                                     .map_or(0, |m| m.device_access_time_us),
                             };
                             let job_hex = crate::chain::extrinsic::hex_encode(&result.job_id);
-                            match chain.submit_proof(&proof).await {
+                            let submit_result = chain.submit_proof(&proof).await;
+                            match submit_result.as_ref().map(|r| r.action) {
                                 Ok(SubmitAction::Success) => {
                                     let mut st = state.lock().await;
                                     st.current_best_milli = Some(validated.best_energy_milli);
+                                    st.metrics.record_proof_submitted(&miner_id);
                                     if let Some(n) = submit_notify.lock().await.take() {
                                         let _ = n.send(());
                                     }
@@ -595,19 +630,36 @@ async fn run_session<C: ChainClient>(
                                 }
                                 Ok(SubmitAction::Retry) => {
                                     tracing::warn!(job = %job_hex, "session submit rejected (retryable); retaining accepted candidate for win-time retry");
+                                    state
+                                        .lock()
+                                        .await
+                                        .metrics
+                                        .record_submission_error(&miner_id);
                                     retain_for_retry = true;
                                 }
                                 Ok(SubmitAction::StopRoundStale) => {
                                     tracing::info!(job = %job_hex, "session submit stale for round; dropping candidate");
+                                    state.lock().await.metrics.record_stale_drop(&miner_id);
                                 }
                                 Ok(SubmitAction::StopFatal) => {
                                     tracing::error!(job = %job_hex, "session submit fatally rejected by pallet; dropping candidate");
+                                    state
+                                        .lock()
+                                        .await
+                                        .metrics
+                                        .record_submission_error(&miner_id);
                                 }
                                 Err(e) => {
                                     tracing::error!(job = %job_hex, error = %e, "session submit failed (transient); retaining accepted candidate for win-time retry");
+                                    state
+                                        .lock()
+                                        .await
+                                        .metrics
+                                        .record_submission_error(&miner_id);
                                     retain_for_retry = true;
                                 }
                             }
+                            receipt = Some(submit_result);
                         }
                         // Record the attempt; stash sub-threshold candidates so
                         // the easing difficulty can still win them; refresh the
@@ -675,6 +727,37 @@ async fn run_session<C: ChainClient>(
                                 );
                             }
 
+                            let pow_sequence = submitted
+                                .then(|| st.metrics.chain().miner_info.map(|i| i.proofs_submitted))
+                                .flatten();
+                            let ctx = crate::attempt::AttemptContext {
+                                miner_type: st
+                                    .miner_types
+                                    .get(&miner_id)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                // The ceiling the coordinator checked this
+                                // result against, not the base difficulty: the
+                                // gate is what decided accept or reject.
+                                threshold_milli: gates.min_energy_milli,
+                                last_proof_block_hash: st.last_proof_block_hash.clone(),
+                                extrinsic_hash: receipt
+                                    .as_ref()
+                                    .and_then(|r| r.as_ref().ok())
+                                    .and_then(|r| r.extrinsic_hash)
+                                    .map(|h| crate::chain::extrinsic::hex_encode(&h)),
+                                chain_block_hash: receipt
+                                    .as_ref()
+                                    .and_then(|r| r.as_ref().ok())
+                                    .and_then(|r| r.block_hash)
+                                    .map(|h| crate::chain::extrinsic::hex_encode(&h)),
+                                chain_block_number: receipt
+                                    .as_ref()
+                                    .and_then(|r| r.as_ref().ok())
+                                    .and_then(|r| r.block_number),
+                                pow_sequence,
+                                device_access_time_us: device_us,
+                            };
                             let attempt = crate::attempt::AttemptRecord::new(
                                 qblock_id,
                                 &miner_id,
@@ -682,7 +765,7 @@ async fn run_session<C: ChainClient>(
                                 &job,
                                 &validated,
                                 submitted,
-                                device_us,
+                                &ctx,
                             );
                             let summary = (stash_changed || submitted).then(|| {
                                 crate::attempt::summary_body(
@@ -693,7 +776,8 @@ async fn run_session<C: ChainClient>(
                                 )
                             });
                             if let Some(tx) = st.attempt_tx.as_ref() {
-                                let _ = tx.send(crate::attempt::WriterMsg::Attempt(attempt));
+                                let _ =
+                                    tx.send(crate::attempt::WriterMsg::Attempt(Box::new(attempt)));
                                 if let Some(body) = summary {
                                     let _ = tx.send(crate::attempt::WriterMsg::Summary {
                                         qblock_id,
@@ -885,6 +969,7 @@ pub async fn serve_one_session_expecting(
     // Chain is unused for handshake-only; use a no-op fake with empty snapshot.
     let chain = Arc::new(crate::chain::FakeChain::new(
         crate::chain::MiningSnapshot {
+            head_hash: [0u8; 32],
             last_proof_block_hash: [0u8; 32],
             topology_hash: vec![0u8; 32],
             nodes: vec![],
@@ -1269,7 +1354,8 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                             .map_or(0, |m| m.device_access_time_us),
                                     };
                                     let submit_result = chain.submit_proof(&proof).await;
-                                    if !matches!(submit_result, Ok(SubmitAction::Success)) {
+                                    let submit_action = submit_result.as_ref().map(|r| r.action);
+                                    if !matches!(submit_action, Ok(SubmitAction::Success)) {
                                         match &submit_result {
                                             Ok(_) => tracing::warn!(
                                                 job = %crate::chain::extrinsic::hex_encode(&result.job_id),
@@ -1282,7 +1368,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                             ),
                                         }
                                     }
-                                    if let Ok(SubmitAction::Success) = submit_result {
+                                    if let Ok(SubmitAction::Success) = submit_action {
                                         {
                                             let mut st = state.lock().await;
                                             st.current_best_milli =
@@ -1488,6 +1574,35 @@ mod tests {
             panic!("expected a Job message");
         };
         assert_eq!(j.job_id, b"late".to_vec());
+    }
+
+    /// C7 wiring check: `contexts_dispatched` moves at `dispatch_granted`'s real
+    /// call site, not just through the metrics API directly.
+    #[tokio::test]
+    async fn dispatch_granted_counts_one_context_per_job_dispatched() {
+        let state = Arc::new(Mutex::new(CoordinatorState::new()));
+        let (tx, mut rx) = mpsc::channel::<Result<CoordMsg, Status>>(8);
+        {
+            let mut st = state.lock().await;
+            st.router.register_miner("cpu-0", caps());
+        }
+
+        assert_eq!(state.lock().await.metrics.global().contexts_dispatched, 0);
+
+        // Granting credits with nothing staged dispatches nothing: this catches
+        // a bump placed outside the `while let` drain.
+        assert!(dispatch_granted(&state, "cpu-0", 32, &tx).await);
+        assert!(rx.try_recv().is_err(), "no job exists yet");
+        assert_eq!(state.lock().await.metrics.global().contexts_dispatched, 0);
+
+        // Stage one job and dispatch it.
+        {
+            let mut st = state.lock().await;
+            assert!(st.router.stage_on("cpu-0", job(b"one")));
+        }
+        assert!(dispatch_granted(&state, "cpu-0", 0, &tx).await);
+        assert!(rx.try_recv().is_ok(), "the staged job dispatches");
+        assert_eq!(state.lock().await.metrics.global().contexts_dispatched, 1);
     }
 
     #[tokio::test]

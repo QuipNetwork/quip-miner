@@ -51,6 +51,7 @@ fn mock_miner() -> String {
 /// only held by the service and never queried.
 fn trivial_snapshot() -> MiningSnapshot {
     MiningSnapshot {
+        head_hash: [0u8; 32],
         last_proof_block_hash: [0u8; 32],
         topology_hash: vec![0u8; 32],
         nodes: vec![],
@@ -103,6 +104,7 @@ async fn runtime_serves_supervises_and_shuts_down_clean() {
         descriptor: quip_coordinator::config::DescriptorParams::default(),
         descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        identity: quip_coordinator::metrics::Identity::default(),
     };
     let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
 
@@ -155,6 +157,7 @@ fn ising_snapshot() -> MiningSnapshot {
     let topology_hash =
         quip_coordinator::topology::topology_hash_sets(&nodes, &edges, &h, &j, &spin).to_vec();
     MiningSnapshot {
+        head_hash: [0u8; 32],
         last_proof_block_hash: [7u8; 32],
         topology_hash,
         nodes,
@@ -204,6 +207,7 @@ async fn feeder_tops_up_to_buffer_depth_records_salts_and_sets_target() {
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metrics: Arc::new(quip_coordinator::metrics::CoordinatorMetrics::new(&[])),
         },
         stop_rx,
     ));
@@ -269,6 +273,7 @@ async fn feeder_funds_the_account_and_derives_jobs_from_the_identity() {
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metrics: Arc::new(quip_coordinator::metrics::CoordinatorMetrics::new(&[])),
         },
         stop_rx,
     ));
@@ -403,6 +408,7 @@ async fn feeder_grows_window_for_drainer_and_holds_floor_for_idle() {
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metrics: Arc::new(quip_coordinator::metrics::CoordinatorMetrics::new(&[])),
         },
         stop_rx,
     ));
@@ -469,6 +475,7 @@ async fn feeder_broadcasts_set_target_once_per_difficulty() {
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metrics: Arc::new(quip_coordinator::metrics::CoordinatorMetrics::new(&[])),
         },
         stop_rx,
     ));
@@ -528,6 +535,7 @@ fn feeder_params(buffer_depth: usize, poll_ms: u64) -> FeederParams {
         descriptor: quip_coordinator::config::DescriptorParams::default(),
         descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        metrics: Arc::new(quip_coordinator::metrics::CoordinatorMetrics::new(&[])),
     }
 }
 

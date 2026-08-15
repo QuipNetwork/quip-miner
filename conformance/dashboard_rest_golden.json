@@ -1,0 +1,450 @@
+{
+  "all_sentinel/mining_attempts": {
+    "data": {
+      "attempts": [
+        {
+          "accepted": false,
+          "best_energy_milli": -500,
+          "diversity_milli": 0,
+          "iter": 1,
+          "job_id": "ab",
+          "miner_id": "cpu-0",
+          "miner_type": "",
+          "num_valid": 0,
+          "qpu_access_time_us": null,
+          "result_kind": "rejected",
+          "solution_number": 2,
+          "submitted": false,
+          "ts_ns": "1700000000000000000",
+          "type": "attempt"
+        },
+        {
+          "accepted": false,
+          "best_energy_milli": 0,
+          "diversity_milli": 0,
+          "iter": 2,
+          "job_id": "ab",
+          "miner_id": "cpu-0",
+          "miner_type": "",
+          "num_valid": 0,
+          "qpu_access_time_us": null,
+          "result_kind": "rejected",
+          "solution_number": 2,
+          "submitted": false,
+          "ts_ns": "1700000000000000000",
+          "type": "attempt"
+        }
+      ],
+      "submission": {
+        "chain_block_hash": null,
+        "chain_block_number": null,
+        "diversity_milli": 0,
+        "energy_milli": 0,
+        "extrinsic_hash": null,
+        "last_proof_block_hash": "0x0",
+        "miner_id": "cpu-0",
+        "miner_type": "",
+        "num_valid": 0,
+        "outcome": "rejected",
+        "pow_sequence": null,
+        "solution_number": 2,
+        "threshold_milli": 0,
+        "ts_ns": "1700000000000000000",
+        "type": "submission"
+      }
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "all_sentinel/stats": {
+    "data": {
+      "controller": {
+        "contexts_dispatched": 0,
+        "duplicate_result_drops": 0,
+        "heads_observed": 0,
+        "proofs_submitted": 0,
+        "results_received": 0,
+        "stale_drops": 0,
+        "submission_errors": 0
+      }
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "all_sentinel/status": {
+    "data": {
+      "account_id_hex": "0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d",
+      "chain": {
+        "head_hash": "0x00ff",
+        "head_number": 10249
+      },
+      "is_mining": true,
+      "miner_info": {
+        "deposit": "1000000000000",
+        "proofs_submitted": 412,
+        "proofs_won": 7,
+        "registered_at": 8100,
+        "rewards_earned": "70000000000000"
+      },
+      "miner_registered": true,
+      "miners": [
+        {
+          "id": "cpu-0",
+          "type": "CPU"
+        }
+      ],
+      "modes": {
+        "cpu": {
+          "controller": {
+            "contexts_dispatched": 0,
+            "duplicate_result_drops": 0,
+            "heads_observed": 0,
+            "proofs_submitted": 0,
+            "results_received": 0,
+            "stale_drops": 0,
+            "submission_errors": 0
+          },
+          "miners": [
+            {
+              "id": "cpu-0",
+              "type": "CPU"
+            }
+          ]
+        }
+      },
+      "node_id": "quip-miner-pow-CPU-1",
+      "ss58_address": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+      "uptime_seconds": 3612
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "huge_device_time/mining_attempts": {
+    "data": {
+      "attempts": [
+        {
+          "accepted": true,
+          "best_energy_milli": -14200,
+          "diversity_milli": 250,
+          "iter": 1,
+          "job_id": "ab",
+          "miner_id": "cpu-0",
+          "miner_type": "",
+          "num_valid": 6,
+          "qpu_access_time_us": 0,
+          "result_kind": "submitted",
+          "solution_number": 3,
+          "submitted": true,
+          "ts_ns": "1700000000000000000",
+          "type": "attempt"
+        }
+      ],
+      "submission": {
+        "chain_block_hash": null,
+        "chain_block_number": null,
+        "diversity_milli": 250,
+        "energy_milli": -14200,
+        "extrinsic_hash": null,
+        "last_proof_block_hash": "0x0",
+        "miner_id": "cpu-0",
+        "miner_type": "",
+        "num_valid": 6,
+        "outcome": "submitted",
+        "pow_sequence": null,
+        "solution_number": 3,
+        "threshold_milli": 0,
+        "ts_ns": "1700000000000000000",
+        "type": "submission"
+      }
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "huge_device_time/stats": {
+    "data": {
+      "controller": {
+        "contexts_dispatched": 0,
+        "duplicate_result_drops": 0,
+        "heads_observed": 0,
+        "proofs_submitted": 0,
+        "results_received": 0,
+        "stale_drops": 0,
+        "submission_errors": 0
+      }
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "huge_device_time/status": {
+    "data": {
+      "account_id_hex": "0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d",
+      "chain": {
+        "head_hash": "0x00ff",
+        "head_number": 10249
+      },
+      "is_mining": true,
+      "miner_info": {
+        "deposit": "1000000000000",
+        "proofs_submitted": 412,
+        "proofs_won": 7,
+        "registered_at": 8100,
+        "rewards_earned": "70000000000000"
+      },
+      "miner_registered": true,
+      "miners": [
+        {
+          "id": "cpu-0",
+          "type": "CPU"
+        }
+      ],
+      "modes": {
+        "cpu": {
+          "controller": {
+            "contexts_dispatched": 0,
+            "duplicate_result_drops": 0,
+            "heads_observed": 0,
+            "proofs_submitted": 0,
+            "results_received": 0,
+            "stale_drops": 0,
+            "submission_errors": 0
+          },
+          "miners": [
+            {
+              "id": "cpu-0",
+              "type": "CPU"
+            }
+          ]
+        }
+      },
+      "node_id": "quip-miner-pow-CPU-1",
+      "ss58_address": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+      "uptime_seconds": 3612
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "normal/mining_attempts": {
+    "data": {
+      "attempts": [
+        {
+          "accepted": true,
+          "best_energy_milli": -14000,
+          "diversity_milli": 200,
+          "iter": 1,
+          "job_id": "ab",
+          "miner_id": "cpu-0",
+          "miner_type": "",
+          "num_valid": 3,
+          "qpu_access_time_us": null,
+          "result_kind": "stored",
+          "solution_number": 1,
+          "submitted": false,
+          "ts_ns": "1700000000000000000",
+          "type": "attempt"
+        },
+        {
+          "accepted": true,
+          "best_energy_milli": -14200,
+          "diversity_milli": 250,
+          "iter": 2,
+          "job_id": "ab",
+          "miner_id": "cpu-0",
+          "miner_type": "",
+          "num_valid": 6,
+          "qpu_access_time_us": 12000,
+          "result_kind": "submitted",
+          "solution_number": 1,
+          "submitted": true,
+          "ts_ns": "1700000000000000000",
+          "type": "attempt"
+        }
+      ],
+      "submission": {
+        "chain_block_hash": null,
+        "chain_block_number": null,
+        "diversity_milli": 250,
+        "energy_milli": -14200,
+        "extrinsic_hash": null,
+        "last_proof_block_hash": "0x0",
+        "miner_id": "cpu-0",
+        "miner_type": "",
+        "num_valid": 6,
+        "outcome": "submitted",
+        "pow_sequence": null,
+        "solution_number": 1,
+        "threshold_milli": 0,
+        "ts_ns": "1700000000000000000",
+        "type": "submission"
+      }
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "normal/stats": {
+    "data": {
+      "controller": {
+        "contexts_dispatched": 0,
+        "duplicate_result_drops": 0,
+        "heads_observed": 0,
+        "proofs_submitted": 0,
+        "results_received": 0,
+        "stale_drops": 0,
+        "submission_errors": 0
+      }
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "normal/status": {
+    "data": {
+      "account_id_hex": "0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d",
+      "chain": {
+        "head_hash": "0x00ff",
+        "head_number": 10249
+      },
+      "is_mining": true,
+      "miner_info": {
+        "deposit": "1000000000000",
+        "proofs_submitted": 412,
+        "proofs_won": 7,
+        "registered_at": 8100,
+        "rewards_earned": "70000000000000"
+      },
+      "miner_registered": true,
+      "miners": [
+        {
+          "id": "cpu-0",
+          "type": "CPU"
+        }
+      ],
+      "modes": {
+        "cpu": {
+          "controller": {
+            "contexts_dispatched": 0,
+            "duplicate_result_drops": 0,
+            "heads_observed": 0,
+            "proofs_submitted": 0,
+            "results_received": 0,
+            "stale_drops": 0,
+            "submission_errors": 0
+          },
+          "miners": [
+            {
+              "id": "cpu-0",
+              "type": "CPU"
+            }
+          ]
+        }
+      },
+      "node_id": "quip-miner-pow-CPU-1",
+      "ss58_address": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+      "uptime_seconds": 3612
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "submitted/mining_attempts": {
+    "data": {
+      "attempts": [
+        {
+          "accepted": true,
+          "best_energy_milli": -14200,
+          "diversity_milli": 250,
+          "iter": 1,
+          "job_id": "ab",
+          "miner_id": "cpu-0",
+          "miner_type": "CPU",
+          "num_valid": 6,
+          "qpu_access_time_us": 12000,
+          "result_kind": "submitted",
+          "solution_number": 4,
+          "submitted": true,
+          "ts_ns": "1700000000000000000",
+          "type": "attempt"
+        }
+      ],
+      "submission": {
+        "chain_block_hash": "0x3333333333333333333333333333333333333333333333333333333333333333",
+        "chain_block_number": 10249,
+        "diversity_milli": 250,
+        "energy_milli": -14200,
+        "extrinsic_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+        "last_proof_block_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "miner_id": "cpu-0",
+        "miner_type": "CPU",
+        "num_valid": 6,
+        "outcome": "submitted",
+        "pow_sequence": 412,
+        "solution_number": 4,
+        "threshold_milli": -2500000,
+        "ts_ns": "1700000000000000000",
+        "type": "submission"
+      }
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "submitted/stats": {
+    "data": {
+      "controller": {
+        "contexts_dispatched": 0,
+        "duplicate_result_drops": 0,
+        "heads_observed": 0,
+        "proofs_submitted": 0,
+        "results_received": 0,
+        "stale_drops": 0,
+        "submission_errors": 0
+      }
+    },
+    "success": true,
+    "timestamp": 1786742808
+  },
+  "submitted/status": {
+    "data": {
+      "account_id_hex": "0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d",
+      "chain": {
+        "head_hash": "0x00ff",
+        "head_number": 10249
+      },
+      "is_mining": true,
+      "miner_info": {
+        "deposit": "1000000000000",
+        "proofs_submitted": 412,
+        "proofs_won": 7,
+        "registered_at": 8100,
+        "rewards_earned": "70000000000000"
+      },
+      "miner_registered": true,
+      "miners": [
+        {
+          "id": "cpu-0",
+          "type": "CPU"
+        }
+      ],
+      "modes": {
+        "cpu": {
+          "controller": {
+            "contexts_dispatched": 0,
+            "duplicate_result_drops": 0,
+            "heads_observed": 0,
+            "proofs_submitted": 0,
+            "results_received": 0,
+            "stale_drops": 0,
+            "submission_errors": 0
+          },
+          "miners": [
+            {
+              "id": "cpu-0",
+              "type": "CPU"
+            }
+          ]
+        }
+      },
+      "node_id": "quip-miner-pow-CPU-1",
+      "ss58_address": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+      "uptime_seconds": 3612
+    },
+    "success": true,
+    "timestamp": 1786742808
+  }
+}

@@ -369,6 +369,18 @@ mod tests {
     use crate::chain::scale_types::{encode_submit_proof_call, QuantumProof};
     use sp_core::{H256, U256};
 
+    /// `hex_encode` already prepends `0x` (see its doc comment); a caller that
+    /// wraps its output in another `format!("0x{}", ...)` doubles the prefix.
+    /// This pins the contract so that regression is a one-line diff away from
+    /// this test failing, not just a doc comment to reread.
+    #[test]
+    fn hex_encode_prepends_exactly_one_0x_prefix() {
+        let out = hex_encode(&[0xab_u8; 32]);
+        assert_eq!(out.len(), 66, "0x plus 64 hex digits for a 32-byte hash");
+        assert!(!out.starts_with("0x0x"));
+        assert_eq!(out, format!("0x{}", "ab".repeat(32)));
+    }
+
     #[test]
     fn hybrid_extrinsic_has_signed_v4_prefix_and_compact_len() {
         let pair = HybridPair::from_string("//Alice", None).expect("alice");

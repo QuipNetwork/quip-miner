@@ -72,6 +72,9 @@ pub struct RuntimeParams {
     pub descriptor_filed: Arc<AtomicBool>,
     /// Set once `QuantumPow.Miners` is known to hold the signing account.
     pub miner_registered: Arc<AtomicBool>,
+    /// Chain identity advertised on `/api/v1/status`. Empty when the process
+    /// holds no usable signer key.
+    pub identity: crate::metrics::Identity,
 }
 
 /// Inputs to the feeder loop.
@@ -97,6 +100,8 @@ pub struct FeederParams {
     /// Consecutive failed submissions of one proof, inside one quantum block,
     /// before the coordinator stops retrying it.
     pub max_submit_attempts: u32,
+    /// Live controller counters, for `heads_observed`.
+    pub metrics: Arc<crate::metrics::CoordinatorMetrics>,
 }
 
 /// EMA smoothing for the per-miner consumption signal. Lower reacts slower but
@@ -520,6 +525,7 @@ pub async fn feeder_loop<C>(
     C: ChainClient + SyncSource + BalanceSource,
 {
     let mut current_head: Option<[u8; 32]> = None;
+    let mut last_block_number: u64 = 0;
     let mut generation: u64 = 0;
     let mut salt_ctr: u64 = 0;
     // Monotonic anchor for block-time estimation (win-time submission).
@@ -582,6 +588,37 @@ pub async fn feeder_loop<C>(
         }
 
         if let Some(mut snap) = snap {
+            // The chain advances every block; `last_proof_block_hash` changes
+            // only on a win. Counting block-number advances is what makes
+            // `heads_observed` track chain height, which is what the dashboard
+            // charts against.
+            if snap.block_number > last_block_number {
+                params.metrics.record_head_observed();
+                last_block_number = snap.block_number;
+            }
+
+            // Refresh the dashboard's chain view. `miner_info` is a storage read,
+            // so it is refreshed on a round turnover only, not on every poll.
+            let refresh_miner_info = current_head != Some(snap.last_proof_block_hash);
+            let miner_info = if refresh_miner_info {
+                match chain.fetch_miner_info(params.miner_account).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "feeder: miner info read failed");
+                        params.metrics.chain().miner_info
+                    }
+                }
+            } else {
+                params.metrics.chain().miner_info
+            };
+            params.metrics.set_chain(crate::metrics::ChainView {
+                head_hash: crate::chain::extrinsic::hex_encode(&snap.head_hash),
+                head_number: snap.block_number,
+                is_mining: true,
+                miner_registered: miner_info.is_some(),
+                miner_info,
+            });
+
             let head = snap.last_proof_block_hash;
             if current_head != Some(head) {
                 let next = match round {
@@ -687,6 +724,8 @@ pub async fn feeder_loop<C>(
                     st.set_topology(Some(topo));
                     st.target = Some(target);
                     st.qblock_id = qblock_id;
+                    st.last_proof_block_hash =
+                        crate::chain::extrinsic::hex_encode(&snap.last_proof_block_hash);
                     st.stash
                         .reset(generation, schedule, last_proof_block, epoch_length);
                 }
@@ -892,7 +931,8 @@ pub async fn feeder_loop<C>(
                     device_access_time_us: cand.device_access_time_us,
                 };
                 let job_hex = crate::chain::extrinsic::hex_encode(&cand.job_id);
-                match chain.submit_proof(&proof).await {
+                let receipt = chain.submit_proof(&proof).await;
+                match receipt.as_ref().map(|r| r.action) {
                     Ok(SubmitAction::Success) => {
                         let mut st = state.lock().await;
                         st.stash.mark_submitted(&cand.job_id);
@@ -949,6 +989,10 @@ pub async fn feeder_loop<C>(
                     }
                 }
             }
+        } else {
+            let mut view = params.metrics.chain();
+            view.is_mining = false;
+            params.metrics.set_chain(view);
         }
 
         tokio::select! {
@@ -995,16 +1039,38 @@ where
         let mut st = state.lock().await;
         for e in &launch {
             let _ = st.configure.insert(e.miner_id.clone(), e.configure.clone());
+            let _ = st.miner_types.insert(
+                e.miner_id.clone(),
+                crate::metrics::miner_type_label(&e.backend),
+            );
         }
     }
 
+    // Live counters and identity, shared by the session path, the feeder, and
+    // the dashboard router. Built from the launch plan so `modes` carries one
+    // entry per backend group.
+    let metrics = Arc::new(crate::metrics::CoordinatorMetrics::new(
+        &launch
+            .iter()
+            .map(|e| (e.miner_id.clone(), e.backend.clone()))
+            .collect::<Vec<_>>(),
+    ));
+    metrics.set_identity(params.identity.clone());
+    state.lock().await.metrics = Arc::clone(&metrics);
+
     // Optional mining-attempt dashboard: a single writer thread records every
     // solved model to `<data_dir>/<qblock_id>/attempts.jsonl`, and an HTTP task
-    // serves those files statically.
+    // serves those files plus the three `/api/v1` endpoints.
     let dashboard_server = if let Some((listen, data_dir)) = params.dashboard.clone() {
         let tx = crate::attempt::spawn_writer(data_dir.clone());
         state.lock().await.attempt_tx = Some(tx);
-        Some(tokio::spawn(crate::dashboard::serve(listen, data_dir)))
+        Some(tokio::spawn(crate::dashboard::serve(
+            listen,
+            crate::dashboard::DashboardState {
+                data_dir,
+                metrics: Arc::clone(&metrics),
+            },
+        )))
     } else {
         None
     };
@@ -1049,6 +1115,7 @@ where
             descriptor_filed: params.descriptor_filed,
             miner_registered: params.miner_registered,
             max_submit_attempts: params.max_submit_attempts,
+            metrics: Arc::clone(&metrics),
         },
         stop_rx.clone(),
     ));

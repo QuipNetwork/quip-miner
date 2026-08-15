@@ -61,6 +61,7 @@ fn loose_snapshot() -> MiningSnapshot {
     let hash =
         quip_coordinator::topology::topology_hash_sets(&nodes, &edges, &h, &j, &spin).to_vec();
     MiningSnapshot {
+        head_hash: [0u8; 32],
         last_proof_block_hash: [7u8; 32],
         topology_hash: hash,
         nodes,

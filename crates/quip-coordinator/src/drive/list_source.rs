@@ -220,6 +220,7 @@ mod tests {
 
     fn snapshot() -> MiningSnapshot {
         MiningSnapshot {
+            head_hash: [0u8; 32],
             last_proof_block_hash: [0u8; 32],
             topology_hash: vec![9u8; 32],
             nodes: vec![0, 1, 2, 3],

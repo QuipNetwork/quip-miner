@@ -227,8 +227,9 @@ async fn dispatch(
     confirmation: Confirmation,
 ) -> Result<String, ChainError> {
     tracing::info!(call = what, "submitting sudo call");
-    match client.submit_signed_call(call, confirmation).await? {
-        SignedCallOutcome::Success { block } => {
+    let (outcome, _) = client.submit_signed_call(call, confirmation).await?;
+    match outcome {
+        SignedCallOutcome::Success { block, .. } => {
             tracing::info!(call = what, block = %block, "sudo call included");
             Ok(block)
         }

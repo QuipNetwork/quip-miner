@@ -46,6 +46,30 @@ rust:
       when: never
     - if: $CI_COMMIT_BRANCH
 
+# The `rust:` job above excludes quip-coordinator from the workspace jobs; it
+# runs here instead. This job runs the full package, including its integration
+# targets — which spawn `quip-mock-miner`, a workspace member each test builds
+# itself, not a fetched miner binary — and the nine dashboard REST conformance
+# tests.
+coordinator:
+  stage: test
+  image: rust:1.97.1
+  tags: [linux, amd64]
+  before_script:
+    - apt-get update && apt-get install -y protobuf-compiler
+  script:
+    - cargo clippy -p quip-coordinator --all-targets -- -D warnings
+    - cargo test -p quip-coordinator
+  cache:
+    key: cargo-coordinator-$CI_COMMIT_REF_SLUG
+    paths: [target/, .cargo/]
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
 conformance:
   stage: test
   image: python:3.11

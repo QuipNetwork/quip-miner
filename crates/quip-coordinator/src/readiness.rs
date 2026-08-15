@@ -232,9 +232,10 @@ pub(crate) async fn register_round_miner<C: ChainClient>(
     false
 }
 
-/// 64-char lowercase hex of the miner account. Fits `MaxNodeIdBytes`.
+/// Default `node_id`: 64-char lowercase hex of the miner account, with no
+/// `0x` prefix. Fits `MaxNodeIdBytes`.
 #[must_use]
-pub(crate) fn node_id_from_account(account: &[u8; 32]) -> String {
+pub fn node_id_from_account(account: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for b in account {
         use std::fmt::Write as _;
@@ -455,6 +456,7 @@ mod tests {
 
     fn snap() -> MiningSnapshot {
         MiningSnapshot {
+            head_hash: [0u8; 32],
             last_proof_block_hash: [1u8; 32],
             topology_hash: vec![0u8; 32],
             nodes: vec![0, 1],

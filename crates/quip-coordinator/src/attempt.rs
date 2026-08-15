@@ -35,6 +35,12 @@ pub struct AttemptRecord {
     pub order_id: String,
     /// Best solution energy in milli-units.
     pub best_energy_milli: i64,
+    /// Minimum energy over every shape-valid row, ignoring the current gate.
+    ///
+    /// `best_energy_milli` holds the `i64::MAX` no-solution sentinel when no row
+    /// cleared the gate. This field holds the true best the miner found, so the
+    /// dashboard reader has a real number to serve in that case.
+    pub raw_best_energy_milli: i64,
     /// Pairwise diversity of the accepted set in milli-units.
     pub diversity_milli: u32,
     /// Count of gate-passing solutions in the result.
@@ -45,11 +51,52 @@ pub struct AttemptRecord {
     pub submitted: bool,
     /// Device access time reported by the miner, in microseconds.
     pub device_access_time_us: u64,
+    /// Solving backend: `CPU`, `GPU`, or `QPU`, with an optional suffix.
+    pub miner_type: String,
+    /// Energy ceiling the coordinator checked this result against.
+    pub threshold_milli: i64,
+    /// `LastProofBlockHash` the job was built on, `0x`-prefixed hex.
+    pub last_proof_block_hash: String,
+    /// Submission extrinsic hash, `0x`-prefixed hex. `None` until it is signed.
+    pub extrinsic_hash: Option<String>,
+    /// Winning block hash, `0x`-prefixed hex. `None` when this did not win.
+    pub chain_block_hash: Option<String>,
+    /// Winning block height. `None` when this did not win.
+    pub chain_block_number: Option<u64>,
+    /// On-chain `proofs_submitted` sequence at submit time. `None` when the
+    /// coordinator did not submit.
+    pub pow_sequence: Option<u64>,
+}
+
+/// The chain-side facts one attempt records, gathered by the session at submit
+/// time.
+///
+/// Grouped rather than passed as loose arguments: eight positional parameters of
+/// mostly-optional hex strings is how a caller silently swaps two of them.
+#[derive(Debug, Clone, Default)]
+pub struct AttemptContext {
+    /// Solving backend label.
+    pub miner_type: String,
+    /// Energy ceiling checked against.
+    pub threshold_milli: i64,
+    /// `LastProofBlockHash` the job was built on.
+    pub last_proof_block_hash: String,
+    /// Extrinsic hash, once signed.
+    pub extrinsic_hash: Option<String>,
+    /// Winning block hash.
+    pub chain_block_hash: Option<String>,
+    /// Winning block height.
+    pub chain_block_number: Option<u64>,
+    /// On-chain `proofs_submitted` sequence.
+    pub pow_sequence: Option<u64>,
+    /// Device access time reported by the miner, in microseconds.
+    pub device_access_time_us: u64,
 }
 
 impl AttemptRecord {
     /// Build a record from a validated result. `miner_id` is the solving miner;
-    /// `submitted` is whether the coordinator submitted it as a proof.
+    /// `submitted` is whether the coordinator submitted it as a proof; `ctx`
+    /// carries the chain-side facts gathered at submit time.
     #[must_use]
     pub fn new(
         qblock_id: Option<u64>,
@@ -58,7 +105,7 @@ impl AttemptRecord {
         job: &Job,
         v: &Validated,
         submitted: bool,
-        device_access_time_us: u64,
+        ctx: &AttemptContext,
     ) -> Self {
         let (is_pow, order_id) = job
             .provenance
@@ -73,11 +120,19 @@ impl AttemptRecord {
             is_pow,
             order_id,
             best_energy_milli: v.best_energy_milli,
+            raw_best_energy_milli: v.raw_best_energy_milli,
             diversity_milli: v.diversity_milli,
             n_valid: v.n_valid,
             accepted: v.accepted,
             submitted,
-            device_access_time_us,
+            device_access_time_us: ctx.device_access_time_us,
+            miner_type: ctx.miner_type.clone(),
+            threshold_milli: ctx.threshold_milli,
+            last_proof_block_hash: ctx.last_proof_block_hash.clone(),
+            extrinsic_hash: ctx.extrinsic_hash.clone(),
+            chain_block_hash: ctx.chain_block_hash.clone(),
+            chain_block_number: ctx.chain_block_number,
+            pow_sequence: ctx.pow_sequence,
         }
     }
 }
@@ -127,7 +182,7 @@ fn qblock_dir_name(qblock_id: Option<u64>) -> String {
 /// rewrite of a qblock's `attempts.json` summary.
 pub enum WriterMsg {
     /// Append one attempt to `<qblock>/attempts.jsonl`.
-    Attempt(AttemptRecord),
+    Attempt(Box<AttemptRecord>),
     /// Overwrite `<qblock>/attempts.json` with `body` (a serialized summary).
     Summary {
         /// Quantum-block id for the directory segment (or `None` → `pending`).
@@ -233,7 +288,11 @@ mod tests {
             raw_best_energy_milli: -14_200,
             stash_solutions: Vec::new(),
         };
-        AttemptRecord::new(qblock_id, "cpu-0", job_id, &job, &v, is_pow, 1234)
+        let ctx = AttemptContext {
+            device_access_time_us: 1234,
+            ..Default::default()
+        };
+        AttemptRecord::new(qblock_id, "cpu-0", job_id, &job, &v, is_pow, &ctx)
     }
 
     #[test]

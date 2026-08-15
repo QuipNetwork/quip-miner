@@ -10,6 +10,7 @@
 //! source for the `/api/v1/mining/attempts` envelope: `solution_number` maps
 //! to the directory name under `data_dir`.
 
+use crate::metrics::CoordinatorMetrics;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -18,10 +19,21 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::services::ServeDir;
 
-/// Build the dashboard router rooted at `data_dir`:
+/// What the `/api/v1` handlers read: the attempt-log root plus the live
+/// coordinator counters and identity.
+#[derive(Clone)]
+pub struct DashboardState {
+    /// Root directory holding `<solution_number>/attempts.jsonl`.
+    pub data_dir: PathBuf,
+    /// Live counters, identity, and chain view.
+    pub metrics: Arc<CoordinatorMetrics>,
+}
+
+/// Build the dashboard router:
 /// - `GET /qblocks` → JSON array of available qblock ids (directory names)
 /// - `GET /healthz` → `ok`
 /// - `GET /api/v1/status` → indexer status envelope
@@ -29,7 +41,8 @@ use tower_http::services::ServeDir;
 /// - `GET /api/v1/mining/attempts?solution_number=N` → submission + attempts
 /// - everything else → static files under `data_dir`, e.g.
 ///   `GET /<qblock_id>/attempts.jsonl`.
-pub fn router(data_dir: PathBuf) -> Router {
+pub fn router(state: DashboardState) -> Router {
+    let data_dir = state.data_dir.clone();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/qblocks", get(list_qblocks))
@@ -37,7 +50,7 @@ pub fn router(data_dir: PathBuf) -> Router {
         .route("/api/v1/stats", get(api_stats))
         .route("/api/v1/mining/attempts", get(api_mining_attempts))
         .fallback_service(ServeDir::new(&data_dir))
-        .with_state(data_dir)
+        .with_state(state)
 }
 
 async fn healthz() -> &'static str {
@@ -46,7 +59,8 @@ async fn healthz() -> &'static str {
 
 /// List the qblock directories under the data root (sorted). Returns an empty
 /// list if the root does not exist yet.
-async fn list_qblocks(State(data_dir): State<PathBuf>) -> Json<Vec<String>> {
+async fn list_qblocks(State(state): State<DashboardState>) -> Json<Vec<String>> {
+    let data_dir = state.data_dir;
     let mut ids = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(&data_dir).await {
         while let Ok(Some(entry)) = rd.next_entry().await {
@@ -65,7 +79,7 @@ async fn list_qblocks(State(data_dir): State<PathBuf>) -> Json<Vec<String>> {
 /// Serve the dashboard on `listen` (e.g. `0.0.0.0:20100`) until the task is
 /// aborted. A bind failure is logged and the task exits without taking down the
 /// coordinator.
-pub async fn serve(listen: String, data_dir: PathBuf) {
+pub async fn serve(listen: String, state: DashboardState) {
     let listener = match tokio::net::TcpListener::bind(&listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -75,9 +89,9 @@ pub async fn serve(listen: String, data_dir: PathBuf) {
     };
     tracing::info!(
         "dashboard: serving {} at http://{listen}",
-        data_dir.display()
+        state.data_dir.display()
     );
-    if let Err(e) = axum::serve(listener, router(data_dir)).await {
+    if let Err(e) = axum::serve(listener, router(state)).await {
         tracing::warn!("dashboard: server error: {e}");
     }
 }
@@ -118,46 +132,102 @@ fn error_envelope(status: StatusCode, message: &str, code: &str) -> Response {
 // GET /api/v1/status
 // ---------------------------------------------------------------------------
 
-/// Indexer status probe. Identity and chain fields have no live source in the
-/// file-backed dashboard yet, so they return empty / zero values the client
-/// already tolerates (see report: Blocked / needs decision).
-async fn api_status() -> Response {
+/// Indexer status probe: chain identity, the coordinator's own view of the chain
+/// head, on-chain miner registration, the advertised miner roster, and the
+/// per-backend `modes` split.
+///
+/// Every field is live. An unkeyed coordinator serves empty strings, an empty
+/// roster, and `miner_info: null`, and still answers 200 — that is a valid state,
+/// not an error.
+async fn api_status(State(state): State<DashboardState>) -> Response {
+    let identity = state.metrics.identity();
+    let chain = state.metrics.chain();
+    let modes = state
+        .metrics
+        .mode_views()
+        .into_iter()
+        .map(|(backend, view)| {
+            (
+                backend,
+                json!({
+                    "controller": counters_json(&view.counters),
+                    "miners": miners_json(&view.miners),
+                }),
+            )
+        })
+        .collect::<Map<String, Value>>();
+
     success_envelope(&json!({
-        "ss58_address": "",
-        "account_id_hex": "",
-        "node_id": "",
-        "is_mining": false,
-        "uptime_seconds": 0,
+        "ss58_address": identity.ss58_address,
+        "account_id_hex": identity.account_id_hex,
+        "node_id": identity.node_id,
+        "is_mining": chain.is_mining,
+        "uptime_seconds": safe_u64("uptime_seconds", 0, state.metrics.uptime_seconds()),
         "chain": {
-            "head_hash": "",
-            "head_number": 0,
+            "head_hash": chain.head_hash,
+            "head_number": safe_u64("head_number", 0, chain.head_number),
         },
-        "miner_registered": false,
-        "miner_info": null,
-        "miners": [],
-        "modes": {},
+        "miner_registered": chain.miner_registered,
+        "miner_info": chain.miner_info.map_or(Value::Null, |i| miner_info_json(&i)),
+        "miners": miners_json(&state.metrics.miners()),
+        "modes": Value::Object(modes),
     }))
+}
+
+/// Serialize a miner roster for the `miners` array.
+fn miners_json(miners: &[crate::metrics::MinerEntry]) -> Value {
+    Value::Array(
+        miners
+            .iter()
+            .map(|m| json!({ "id": m.id, "type": m.miner_type }))
+            .collect(),
+    )
+}
+
+/// Serialize `QuantumPow.Miners[account]`.
+///
+/// This object is intentionally mixed-type: `deposit` and `rewards_earned` are
+/// real `u128` balances, so rule N1 puts them on the wire as decimal strings.
+/// `registered_at` (a substrate block height) and `proofs_submitted` /
+/// `proofs_won` (`u64` lifetime counts) can never approach 2^53, so rule N1's
+/// "large by design" clause does not apply to them; they stay guarded numbers
+/// and agree with `controller.proofs_submitted` in [`counters_json`], which
+/// serializes the same field name as a number.
+fn miner_info_json(info: &crate::chain::MinerInfo) -> Value {
+    json!({
+        "registered_at": safe_u64("registered_at", 0, info.registered_at),
+        "deposit": wire_u128(info.deposit),
+        "proofs_submitted": safe_u64("proofs_submitted", 0, info.proofs_submitted),
+        "proofs_won": safe_u64("proofs_won", 0, info.proofs_won),
+        "rewards_earned": wire_u128(info.rewards_earned),
+    })
 }
 
 // ---------------------------------------------------------------------------
 // GET /api/v1/stats
 // ---------------------------------------------------------------------------
 
-/// Indexer stats probe. Controller counters are not tracked by the dashboard
-/// writer; zeros keep the envelope parseable until a live counter source is
-/// wired.
-async fn api_stats() -> Response {
+/// Indexer stats probe. Reports the process-global controller counters, which
+/// are authoritative; the per-mode split `/api/v1/status` carries may lag them
+/// momentarily under concurrent updates (see [`crate::metrics::CoordinatorMetrics::global`]).
+async fn api_stats(State(state): State<DashboardState>) -> Response {
     success_envelope(&json!({
-        "controller": {
-            "heads_observed": 0,
-            "contexts_dispatched": 0,
-            "results_received": 0,
-            "proofs_submitted": 0,
-            "stale_drops": 0,
-            "submission_errors": 0,
-            "duplicate_result_drops": 0,
-        }
+        "controller": counters_json(&state.metrics.global()),
     }))
+}
+
+/// Serialize one counter set. Every counter passes the safe-integer guard, so a
+/// runaway counter cannot stall the indexer the way the energy sentinel did.
+fn counters_json(c: &crate::metrics::CounterSnapshot) -> Value {
+    json!({
+        "heads_observed": safe_u64("heads_observed", 0, c.heads_observed),
+        "contexts_dispatched": safe_u64("contexts_dispatched", 0, c.contexts_dispatched),
+        "results_received": safe_u64("results_received", 0, c.results_received),
+        "proofs_submitted": safe_u64("proofs_submitted", 0, c.proofs_submitted),
+        "stale_drops": safe_u64("stale_drops", 0, c.stale_drops),
+        "submission_errors": safe_u64("submission_errors", 0, c.submission_errors),
+        "duplicate_result_drops": safe_u64("duplicate_result_drops", 0, c.duplicate_result_drops),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +241,7 @@ struct AttemptsQuery {
 }
 
 async fn api_mining_attempts(
-    State(data_dir): State<PathBuf>,
+    State(state): State<DashboardState>,
     Query(query): Query<AttemptsQuery>,
 ) -> Response {
     let Some(raw) = query.solution_number.as_deref() else {
@@ -188,7 +258,7 @@ async fn api_mining_attempts(
             "BAD_PARAM",
         );
     };
-    match load_attempts_envelope(&data_dir, solution_number) {
+    match load_attempts_envelope(&state.data_dir, solution_number) {
         Ok(data) => success_envelope(&data),
         Err(AttemptsLoadError::NotFound) => error_envelope(
             StatusCode::NOT_FOUND,
@@ -265,28 +335,33 @@ fn load_attempts_envelope(
 /// Map one v0.3 [`crate::attempt::AttemptRecord`] JSON object onto the v0.2
 /// attempt wire shape the indexer parser reads.
 fn attempt_from_record(rec: &Map<String, Value>, iter: usize, solution_number: u64) -> Value {
-    let best_energy_milli = i64_field(rec, "best_energy_milli").unwrap_or(0);
+    let best_energy_milli = wire_energy_milli(rec, solution_number);
     let result_kind = result_kind_of(rec);
     let miner_id = string_field(rec, "miner_id").unwrap_or_default();
     let ts_ns = ts_ns_of(rec);
     // Map device access time onto the QPU field the indexer sums. CPU/GPU
     // miners also record this; the indexer treats the sum as QPU compute.
     let qpu_access_time_us = match u64_field(rec, "device_access_time_us") {
-        Some(us) if us > 0 => Value::from(us),
+        Some(us) if us > 0 => safe_u64("qpu_access_time_us", solution_number, us),
         _ => Value::Null,
     };
-    // AttemptRecord has no backend type; empty string is the indexer default.
     json!({
         "type": "attempt",
-        "ts_ns": ts_ns,
+        "ts_ns": wire_u128(ts_ns),
         "miner_id": miner_id,
-        "miner_type": "",
-        "solution_number": solution_number,
-        "iter": iter,
+        "miner_type": string_field(rec, "miner_type").unwrap_or_default(),
+        "solution_number": safe_u64("solution_number", solution_number, solution_number),
+        "iter": safe_u64(
+            "iter",
+            solution_number,
+            u64::try_from(iter).unwrap_or(u64::MAX),
+        ),
         "best_energy_milli": best_energy_milli,
         "result_kind": result_kind,
-        "num_valid": u64_field(rec, "n_valid"),
-        "diversity_milli": u64_field(rec, "diversity_milli"),
+        "num_valid": rec.get("n_valid").and_then(Value::as_u64)
+            .map_or(Value::Null, |n| safe_u64("num_valid", solution_number, n)),
+        "diversity_milli": rec.get("diversity_milli").and_then(Value::as_u64)
+            .map_or(Value::Null, |n| safe_u64("diversity_milli", solution_number, n)),
         "qpu_access_time_us": qpu_access_time_us,
         "job_id": string_field(rec, "job_id"),
         "accepted": bool_field(rec, "accepted"),
@@ -296,13 +371,6 @@ fn attempt_from_record(rec: &Map<String, Value>, iter: usize, solution_number: u
 
 /// Build a submission object from the attempt trail. v0.3 does not write
 /// `submission.json`; the indexer still requires the submission object.
-///
-/// Fields with no v0.3 source:
-/// - `threshold_milli` → `0`
-/// - `last_proof_block_hash` → `"0x0"` (non-empty so the parser accepts it)
-/// - `extrinsic_hash`, `chain_block_hash`, `chain_block_number`, `pow_sequence`
-///   → `null`
-/// - `miner_type` → `""`
 fn submission_from_records(records: &[Map<String, Value>], solution_number: u64) -> Value {
     // Prefer the last submitted attempt; else the last accepted; else the last.
     // Caller guarantees `records` is non-empty; fall back to an empty map only
@@ -322,10 +390,15 @@ fn submission_from_records(records: &[Map<String, Value>], solution_number: u64)
         .unwrap_or(&empty);
 
     let miner_id = string_field(chosen, "miner_id").unwrap_or_else(|| "unknown".into());
-    let energy_milli = i64_field(chosen, "best_energy_milli").unwrap_or(0);
-    let diversity_milli = u64_field(chosen, "diversity_milli").unwrap_or(0);
-    let num_valid = u64_field(chosen, "n_valid");
-    let ts_ns = ts_ns_of(chosen);
+    let energy_milli = wire_energy_milli(chosen, solution_number);
+    let diversity_milli = safe_u64(
+        "diversity_milli",
+        solution_number,
+        u64_field(chosen, "diversity_milli").unwrap_or(0),
+    );
+    let num_valid = u64_field(chosen, "n_valid")
+        .map_or(Value::Null, |n| safe_u64("num_valid", solution_number, n));
+    let ts_ns = wire_u128(ts_ns_of(chosen));
 
     let any_submitted = records
         .iter()
@@ -344,20 +417,25 @@ fn submission_from_records(records: &[Map<String, Value>], solution_number: u64)
     json!({
         "type": "submission",
         "ts_ns": ts_ns,
-        "solution_number": solution_number,
+        "solution_number": safe_u64("solution_number", solution_number, solution_number),
         "miner_id": miner_id,
-        "miner_type": "",
+        "miner_type": string_field(chosen, "miner_type").unwrap_or_default(),
         "energy_milli": energy_milli,
         "diversity_milli": diversity_milli,
-        // No max-energy / threshold is stored on AttemptRecord.
-        "threshold_milli": 0,
+        "threshold_milli": safe_i64(
+            "threshold_milli",
+            solution_number,
+            i64_field(chosen, "threshold_milli").unwrap_or(0),
+        ),
         "num_valid": num_valid,
-        // No last-proof block hash is stored on AttemptRecord.
-        "last_proof_block_hash": "0x0",
-        "extrinsic_hash": null,
-        "chain_block_hash": null,
-        "chain_block_number": null,
-        "pow_sequence": null,
+        "last_proof_block_hash": string_field(chosen, "last_proof_block_hash")
+            .unwrap_or_else(|| "0x0".to_string()),
+        "extrinsic_hash": chosen.get("extrinsic_hash").cloned().unwrap_or(Value::Null),
+        "chain_block_hash": chosen.get("chain_block_hash").cloned().unwrap_or(Value::Null),
+        "chain_block_number": u64_field(chosen, "chain_block_number")
+            .map_or(Value::Null, |n| safe_u64("chain_block_number", solution_number, n)),
+        "pow_sequence": u64_field(chosen, "pow_sequence")
+            .map_or(Value::Null, |n| safe_u64("pow_sequence", solution_number, n)),
         "outcome": outcome,
     })
 }
@@ -407,6 +485,81 @@ fn u64_field(rec: &Map<String, Value>, key: &str) -> Option<u64> {
     })
 }
 
+/// Resolve the energy a record puts on the wire.
+///
+/// Order: the gate-passing best when it is not the sentinel, then the raw best
+/// when it is not the sentinel, then `0`. Legacy rows written before
+/// `raw_best_energy_milli` existed fall to `0` here, which is why the guard in
+/// [`safe_i64`] is a backstop and not the fix.
+fn wire_energy_milli(rec: &Map<String, Value>, solution_number: u64) -> Value {
+    let resolved = match i64_field(rec, "best_energy_milli") {
+        Some(best) if best != i64::MAX => best,
+        _ => match i64_field(rec, "raw_best_energy_milli") {
+            Some(raw) if raw != i64::MAX => raw,
+            _ => 0,
+        },
+    };
+    safe_i64("best_energy_milli", solution_number, resolved)
+}
+
+// ---------------------------------------------------------------------------
+// Safe-integer guard (rule N1)
+// ---------------------------------------------------------------------------
+
+/// Largest integer an IEEE-754 double holds exactly (`Number.MAX_SAFE_INTEGER`).
+const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+/// Smallest integer an IEEE-754 double holds exactly.
+const JS_MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
+
+/// Serialize `v` as a JSON number, or `0` when it falls outside the range a
+/// JavaScript `Number()` holds exactly.
+///
+/// The dashboard parses every numeric field through `Number()` and stores the
+/// result in a `PostgreSQL` `BIGINT`. A value past the safe range round-trips to a
+/// different integer and the insert fails, which stalls the indexer checkpoint.
+/// Clamping to `0` keeps the walk moving; the warning names the field so the
+/// real source is still findable.
+fn safe_i64(field: &str, solution_number: u64, v: i64) -> Value {
+    if (JS_MIN_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&v) {
+        return Value::from(v);
+    }
+    tracing::warn!(
+        field,
+        solution_number,
+        value = v,
+        "dashboard: integer outside the IEEE-754 safe range; serving 0"
+    );
+    Value::from(0)
+}
+
+/// [`safe_i64`] for unsigned fields. Only the upper bound can be exceeded.
+#[expect(clippy::single_match_else, reason = "Brief specifies match structure")]
+fn safe_u64(field: &str, solution_number: u64, v: u64) -> Value {
+    match i64::try_from(v) {
+        Ok(n) => safe_i64(field, solution_number, n),
+        Err(_) => {
+            tracing::warn!(
+                field,
+                solution_number,
+                value = v,
+                "dashboard: integer outside the IEEE-754 safe range; serving 0"
+            );
+            Value::from(0)
+        }
+    }
+}
+
+/// Serialize a field that is large by design as a decimal string.
+///
+/// Balances, nanosecond timestamps, and chain block numbers routinely exceed the
+/// safe range in normal operation, so clamping them to `0` would throw away real
+/// data. Rule N1 puts them on the wire as strings instead. The dashboard parser
+/// already coerces these fields with `String(...)`.
+fn wire_u128(v: u128) -> Value {
+    Value::String(v.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +605,322 @@ mod tests {
         v.pointer(path).unwrap_or(&Value::Null)
     }
 
+    fn sentinel_line(raw_best_energy_milli: i64) -> String {
+        serde_json::json!({
+            "ts_ms": 1_700_000_000_000_u64,
+            "qblock_id": 42,
+            "generation": 1,
+            "miner_id": "cpu-0",
+            "job_id": "ab",
+            "is_pow": true,
+            "order_id": "",
+            "best_energy_milli": i64::MAX,
+            "raw_best_energy_milli": raw_best_energy_milli,
+            "diversity_milli": 0,
+            "n_valid": 0,
+            "accepted": false,
+            "submitted": false,
+            "device_access_time_us": 0,
+        })
+        .to_string()
+    }
+
+    fn legacy_sentinel_line() -> String {
+        serde_json::json!({
+            "ts_ms": 1_700_000_000_000_u64,
+            "qblock_id": 42,
+            "generation": 1,
+            "miner_id": "cpu-0",
+            "job_id": "ab",
+            "is_pow": true,
+            "order_id": "",
+            "best_energy_milli": i64::MAX,
+            "diversity_milli": 0,
+            "n_valid": 0,
+            "accepted": false,
+            "submitted": false,
+            "device_access_time_us": 0,
+        })
+        .to_string()
+    }
+
+    /// Walk every number in a response body and assert rule N1 holds.
+    ///
+    /// `path` accumulates a JSON-pointer-like trail so a failure names the exact
+    /// field, not just the value.
+    fn assert_safe_integers(v: &Value, path: &str) {
+        match v {
+            Value::Number(n) => {
+                let as_i128 = n
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| n.as_u64().map(i128::from));
+                let Some(x) = as_i128 else {
+                    panic!("{path}: {n} is not an integer; the wire shape has no floats");
+                };
+                assert!(
+                    x >= i128::from(JS_MIN_SAFE_INTEGER) && x <= i128::from(JS_MAX_SAFE_INTEGER),
+                    "{path}: {x} is outside the IEEE-754 safe integer range"
+                );
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    assert_safe_integers(item, &format!("{path}/{i}"));
+                }
+            }
+            Value::Object(map) => {
+                for (k, item) in map {
+                    assert_safe_integers(item, &format!("{path}/{k}"));
+                }
+            }
+            Value::String(_) | Value::Bool(_) | Value::Null => {}
+        }
+    }
+
+    /// The attempt-file shapes the sweep and golden tests run against.
+    enum Fixture {
+        /// Rows that cleared the gate. The ordinary case.
+        Normal,
+        /// Every row carries the `i64::MAX` no-solution sentinel.
+        AllSentinel,
+        /// A row reporting `u64::MAX` device access time. The next sentinel.
+        HugeDeviceTime,
+        /// A submitted, winning row with every D4 chain field populated — the
+        /// shape [`submitted_line`] builds for `c8`.
+        Submitted,
+    }
+
+    fn write_fixture(tmp: &Path, solution_number: u64, fixture: &Fixture) {
+        let dir = tmp.join(solution_number.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = match fixture {
+            Fixture::Normal => format!(
+                "{}\n{}\n",
+                attempt_line("cpu-0", -14_000, 200, 3, true, false, 0),
+                attempt_line("cpu-0", -14_200, 250, 6, true, true, 12_000),
+            ),
+            Fixture::AllSentinel => {
+                format!("{}\n{}\n", sentinel_line(-500), legacy_sentinel_line())
+            }
+            Fixture::HugeDeviceTime => format!(
+                "{}\n",
+                attempt_line("cpu-0", -14_200, 250, 6, true, true, u64::MAX),
+            ),
+            Fixture::Submitted => format!("{}\n", submitted_line()),
+        };
+        std::fs::write(dir.join("attempts.jsonl"), body).unwrap();
+    }
+
+    async fn get_body(tmp: &Path, uri: &str) -> Value {
+        let app = router(test_state(tmp));
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri} did not return 200");
+        body_json(resp).await
+    }
+
+    async fn sweep_all_endpoints(tmp: &Path, solution_number: u64) {
+        for uri in [
+            "/api/v1/status".to_string(),
+            "/api/v1/stats".to_string(),
+            format!("/api/v1/mining/attempts?solution_number={solution_number}"),
+        ] {
+            let body = get_body(tmp, &uri).await;
+            assert_safe_integers(&body, &uri);
+        }
+    }
+
+    /// C3: no response from any endpoint carries an unsafe integer, whatever
+    /// the attempt file holds.
+    #[tokio::test]
+    async fn c3_every_response_number_is_a_safe_integer() {
+        for (n, fixture) in [
+            (1_u64, Fixture::Normal),
+            (2, Fixture::AllSentinel),
+            (3, Fixture::HugeDeviceTime),
+            // Above JS_MAX_SAFE_INTEGER: exercises the `solution_number` guard
+            // itself, not just the fields copied from the attempt record.
+            (9_007_199_254_740_992, Fixture::Normal),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_fixture(tmp.path(), n, &fixture);
+            sweep_all_endpoints(tmp.path(), n).await;
+        }
+    }
+
+    async fn attempts_body(tmp: &Path, solution_number: u64) -> Value {
+        let uri = format!("/api/v1/mining/attempts?solution_number={solution_number}");
+        get_body(tmp, &uri).await
+    }
+
+    /// C1: every row holds the no-solution sentinel; the raw best is served.
+    #[tokio::test]
+    async fn c1_no_sentinel_reaches_the_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("42");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!("{}\n{}\n", sentinel_line(-500), sentinel_line(-500));
+        std::fs::write(dir.join("attempts.jsonl"), body).unwrap();
+
+        let v = attempts_body(tmp.path(), 42).await;
+        assert_eq!(at(&v, "/data/submission/energy_milli"), &json!(-500));
+        assert_eq!(at(&v, "/data/attempts/0/best_energy_milli"), &json!(-500));
+    }
+
+    /// C2: the legacy on-disk shape has no raw field. It must read as 0, not
+    /// as the sentinel, and the request must still return 200.
+    #[tokio::test]
+    async fn c2_legacy_rows_without_the_raw_field_read_as_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("42");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!("{}\n{}\n", legacy_sentinel_line(), legacy_sentinel_line());
+        std::fs::write(dir.join("attempts.jsonl"), body).unwrap();
+
+        let v = attempts_body(tmp.path(), 42).await;
+        assert_eq!(at(&v, "/data/submission/energy_milli"), &json!(0));
+        assert_eq!(at(&v, "/data/attempts/0/best_energy_milli"), &json!(0));
+    }
+
+    /// The raw field is a fallback, not an override: a row that cleared the
+    /// gate still serves its gate-passing best.
+    #[tokio::test]
+    async fn gate_passing_rows_keep_their_own_best_energy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("9");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attempts.jsonl"),
+            format!(
+                "{}\n",
+                attempt_line("cpu-0", -14_200, 250, 6, true, true, 0)
+            ),
+        )
+        .unwrap();
+
+        let v = attempts_body(tmp.path(), 9).await;
+        assert_eq!(at(&v, "/data/submission/energy_milli"), &json!(-14_200));
+        assert_eq!(
+            at(&v, "/data/attempts/0/best_energy_milli"),
+            &json!(-14_200)
+        );
+    }
+
+    fn submitted_line() -> String {
+        serde_json::json!({
+            "ts_ms": 1_700_000_000_000_u64,
+            "qblock_id": 42,
+            "generation": 1,
+            "miner_id": "cpu-0",
+            "miner_type": "CPU",
+            "job_id": "ab",
+            "is_pow": true,
+            "order_id": "",
+            "best_energy_milli": -14_200,
+            "raw_best_energy_milli": -14_200,
+            "diversity_milli": 250,
+            "n_valid": 6,
+            "accepted": true,
+            "submitted": true,
+            "device_access_time_us": 12_000,
+            "threshold_milli": -2_500_000,
+            "last_proof_block_hash": LAST_PROOF_BLOCK_HASH,
+            "extrinsic_hash": EXTRINSIC_HASH,
+            "chain_block_hash": CHAIN_BLOCK_HASH,
+            "chain_block_number": 10_249_u64,
+            "pow_sequence": 412_u64,
+        })
+        .to_string()
+    }
+
+    // Three distinct 32-byte hashes: a same-shaped string can't hide a field
+    // swap (e.g. extrinsic_hash and chain_block_hash exchanged) or a doubled
+    // `0x` prefix landing on the wrong field.
+    const LAST_PROOF_BLOCK_HASH: &str =
+        "0x1111111111111111111111111111111111111111111111111111111111111111";
+    const EXTRINSIC_HASH: &str =
+        "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const CHAIN_BLOCK_HASH: &str =
+        "0x3333333333333333333333333333333333333333333333333333333333333333";
+
+    /// Whether `s` matches `^0x[0-9a-f]{64}$`: one `0x` prefix, exactly 64
+    /// lowercase hex digits. A doubled prefix (`0x0x...`) or a truncated hash
+    /// fails this even when the total length coincidentally matches.
+    fn is_hex_hash(s: &str) -> bool {
+        s.strip_prefix("0x").is_some_and(|h| {
+            h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }
+
+    /// C8: a submitted, winning result reports every field the dashboard shows.
+    #[tokio::test]
+    async fn c8_submission_reports_the_real_chain_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("42");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attempts.jsonl"),
+            format!("{}\n", submitted_line()),
+        )
+        .unwrap();
+
+        let v = attempts_body(tmp.path(), 42).await;
+        let s = at(&v, "/data/submission");
+
+        assert_eq!(at(s, "/threshold_milli"), &json!(-2_500_000));
+        // Three distinct fields, checked by shape and by exact value: a
+        // same-shaped 66-char string can't hide a field swap between
+        // extrinsic_hash and chain_block_hash, and the shape check catches a
+        // doubled `0x` prefix even where a swap would not.
+        for (field, expected) in [
+            ("/last_proof_block_hash", LAST_PROOF_BLOCK_HASH),
+            ("/extrinsic_hash", EXTRINSIC_HASH),
+            ("/chain_block_hash", CHAIN_BLOCK_HASH),
+        ] {
+            let hash = at(s, field).as_str().unwrap();
+            assert!(
+                is_hex_hash(hash),
+                "{field}: {hash:?} does not match ^0x[0-9a-f]{{64}}$"
+            );
+            assert_eq!(hash, expected, "{field}: value does not round-trip exactly");
+        }
+        assert!(at(s, "/miner_type").as_str().unwrap().starts_with("CPU"));
+        // Block heights are `u64` and never approach 2^53, so rule N1's
+        // "large by design" clause does not apply; they stay guarded numbers.
+        assert_eq!(at(s, "/chain_block_number"), &json!(10_249));
+        assert_eq!(at(s, "/pow_sequence"), &json!(412));
+        assert_eq!(at(&v, "/data/attempts/0/miner_type"), &json!("CPU"));
+    }
+
+    /// A rejected attempt has no chain outcome. The four nullable fields stay
+    /// null and the two non-nullable ones keep their types, or the dashboard
+    /// parser throws.
+    #[tokio::test]
+    async fn a_non_winning_submission_nulls_only_the_nullable_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("43");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attempts.jsonl"),
+            format!("{}\n", sentinel_line(-500)),
+        )
+        .unwrap();
+
+        let v = attempts_body(tmp.path(), 43).await;
+        let s = at(&v, "/data/submission");
+
+        assert!(at(s, "/extrinsic_hash").is_null());
+        assert!(at(s, "/chain_block_hash").is_null());
+        assert!(at(s, "/chain_block_number").is_null());
+        assert!(at(s, "/pow_sequence").is_null());
+        assert!(at(s, "/threshold_milli").is_number());
+        assert!(at(s, "/miner_type").is_string());
+    }
+
     #[tokio::test]
     async fn serves_attempts_file_and_lists_qblocks() {
         let tmp = tempfile::tempdir().unwrap();
@@ -462,7 +931,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
 
         // File download.
         let resp = app
@@ -502,7 +971,7 @@ mod tests {
     #[tokio::test]
     async fn status_returns_success_envelope() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -519,14 +988,161 @@ mod tests {
         assert!(at(&v, "/data/ss58_address").is_string());
         assert!(at(&v, "/data/chain").is_object());
         assert!(at(&v, "/data/miners").is_array());
+        assert!(at(&v, "/data/modes").is_object());
         assert!(at(&v, "/timestamp").is_number());
     }
 
+    fn keyed_state(tmp: &Path) -> DashboardState {
+        let metrics = Arc::new(CoordinatorMetrics::new(&[(
+            "cpu-0".to_string(),
+            "cpu".to_string(),
+        )]));
+        metrics.set_identity(crate::metrics::Identity {
+            ss58_address: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into(),
+            account_id_hex: "0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d"
+                .into(),
+            node_id: "quip-miner-pow-CPU-1".into(),
+        });
+        metrics.set_chain(crate::metrics::ChainView {
+            head_hash: "0x00ff".into(),
+            head_number: 10_249,
+            is_mining: true,
+            miner_registered: true,
+            miner_info: Some(crate::chain::MinerInfo {
+                registered_at: 8_100,
+                deposit: 1_000_000_000_000,
+                proofs_submitted: 412,
+                proofs_won: 7,
+                rewards_earned: 70_000_000_000_000,
+            }),
+        });
+        DashboardState {
+            data_dir: tmp.to_path_buf(),
+            metrics,
+        }
+    }
+
+    async fn status_body(state: DashboardState) -> Value {
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    }
+
+    /// C5: a keyed coordinator with one registered CPU miner.
     #[tokio::test]
-    async fn stats_returns_controller_counters() {
+    async fn c5_status_reports_the_configured_identity() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(tmp.path().to_path_buf());
-        let resp = app
+        let v = status_body(keyed_state(tmp.path())).await;
+
+        assert_eq!(
+            at(&v, "/data/ss58_address"),
+            &json!("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+        );
+        assert_eq!(at(&v, "/data/node_id"), &json!("quip-miner-pow-CPU-1"));
+        assert_eq!(at(&v, "/data/is_mining"), &json!(true));
+        assert_eq!(at(&v, "/data/miner_registered"), &json!(true));
+
+        let miners = at(&v, "/data/miners").as_array().unwrap();
+        assert_eq!(miners.len(), 1);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "asserted len() == 1 above; index 0 exists"
+        )]
+        {
+            assert_eq!(at(&miners[0], "/id"), &json!("cpu-0"));
+            assert!(at(&miners[0], "/type").as_str().unwrap().starts_with("CPU"));
+        }
+
+        assert!(at(&v, "/data/chain/head_number").as_u64().unwrap() > 0);
+        assert_eq!(at(&v, "/data/chain/head_hash"), &json!("0x00ff"));
+
+        assert!(at(&v, "/data/miner_info").is_object());
+        // u128 balances cross the wire as decimal strings, per rule N1.
+        for key in ["deposit", "rewards_earned"] {
+            assert!(
+                at(&v, &format!("/data/miner_info/{key}")).is_string(),
+                "miner_info.{key} must be a decimal string"
+            );
+        }
+        // u64 lifetime counts and the block height stay guarded numbers; they
+        // agree with `controller.proofs_submitted` (a number) in stats_body.
+        for key in ["registered_at", "proofs_submitted", "proofs_won"] {
+            assert!(
+                at(&v, &format!("/data/miner_info/{key}")).is_number(),
+                "miner_info.{key} must be a number"
+            );
+        }
+        assert_eq!(at(&v, "/data/miner_info/deposit"), &json!("1000000000000"));
+        assert_eq!(at(&v, "/data/miner_info/proofs_submitted"), &json!(412));
+        assert_eq!(at(&v, "/data/miner_info/registered_at"), &json!(8_100));
+    }
+
+    /// C6: an unkeyed coordinator is a valid state, not an error.
+    #[tokio::test]
+    async fn c6_status_with_no_identity_returns_200_and_empty_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = DashboardState {
+            data_dir: tmp.path().to_path_buf(),
+            metrics: Arc::new(CoordinatorMetrics::new(&[])),
+        };
+        let v = status_body(state).await;
+
+        assert_eq!(at(&v, "/success"), &json!(true));
+        assert_eq!(at(&v, "/data/ss58_address"), &json!(""));
+        assert_eq!(at(&v, "/data/miners"), &json!([]));
+        assert_eq!(at(&v, "/data/miner_info"), &Value::Null);
+        assert_eq!(at(&v, "/data/miner_registered"), &json!(false));
+        assert_eq!(at(&v, "/data/modes"), &json!({}));
+    }
+
+    /// The per-backend panel needs one `modes` entry per active backend group,
+    /// each with its own counters and roster.
+    #[tokio::test]
+    async fn status_modes_carry_one_entry_per_backend_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(CoordinatorMetrics::new(&[
+            ("cpu-0".to_string(), "cpu".to_string()),
+            ("cuda-0".to_string(), "cuda".to_string()),
+        ]));
+        metrics.record_contexts_dispatched("cuda-0", 3);
+        let state = DashboardState {
+            data_dir: tmp.path().to_path_buf(),
+            metrics,
+        };
+        let v = status_body(state).await;
+
+        assert_eq!(
+            at(&v, "/data/modes/cpu/controller/contexts_dispatched"),
+            &json!(0)
+        );
+        assert_eq!(
+            at(&v, "/data/modes/cuda/controller/contexts_dispatched"),
+            &json!(3)
+        );
+        assert_eq!(at(&v, "/data/modes/cuda/miners/0/id"), &json!("cuda-0"));
+        assert_eq!(at(&v, "/data/modes/cuda/miners/0/type"), &json!("GPU-CUDA"));
+    }
+
+    fn test_state(tmp: &Path) -> DashboardState {
+        DashboardState {
+            data_dir: tmp.to_path_buf(),
+            metrics: Arc::new(CoordinatorMetrics::new(&[(
+                "cpu-0".to_string(),
+                "cpu".to_string(),
+            )])),
+        }
+    }
+
+    async fn stats_body(state: DashboardState) -> Value {
+        let resp = router(state)
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/stats")
@@ -536,15 +1152,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
+        body_json(resp).await
+    }
+
+    /// C7: dispatch one context and receive one result. Both counters advance
+    /// by exactly one and no counter goes backwards.
+    #[tokio::test]
+    async fn c7_stats_counters_advance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let metrics = Arc::clone(&state.metrics);
+
+        let before = stats_body(state.clone()).await;
+        metrics.record_contexts_dispatched("cpu-0", 1);
+        metrics.record_result_received("cpu-0");
+        let after = stats_body(state).await;
+
+        assert_eq!(
+            at(&before, "/data/controller/contexts_dispatched"),
+            &json!(0)
+        );
+        assert_eq!(at(&before, "/data/controller/results_received"), &json!(0));
+        assert_eq!(
+            at(&after, "/data/controller/contexts_dispatched"),
+            &json!(1)
+        );
+        assert_eq!(at(&after, "/data/controller/results_received"), &json!(1));
+
+        for key in [
+            "heads_observed",
+            "contexts_dispatched",
+            "results_received",
+            "proofs_submitted",
+            "stale_drops",
+            "submission_errors",
+            "duplicate_result_drops",
+        ] {
+            let b = at(&before, &format!("/data/controller/{key}"))
+                .as_u64()
+                .unwrap();
+            let a = at(&after, &format!("/data/controller/{key}"))
+                .as_u64()
+                .unwrap();
+            assert!(a >= b, "{key} decreased from {b} to {a}");
+        }
+    }
+
+    /// Every one of the seven keys is present, so the dashboard parser never
+    /// falls back to its `?? 0` default and hides a missing counter.
+    #[tokio::test]
+    async fn stats_carries_all_seven_controller_counters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v = stats_body(test_state(tmp.path())).await;
         assert_eq!(at(&v, "/success"), &json!(true));
-        assert_eq!(at(&v, "/data/controller/heads_observed"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/contexts_dispatched"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/results_received"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/proofs_submitted"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/stale_drops"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/submission_errors"), &json!(0));
-        assert_eq!(at(&v, "/data/controller/duplicate_result_drops"), &json!(0));
+        for key in [
+            "heads_observed",
+            "contexts_dispatched",
+            "results_received",
+            "proofs_submitted",
+            "stale_drops",
+            "submission_errors",
+            "duplicate_result_drops",
+        ] {
+            assert!(
+                at(&v, &format!("/data/controller/{key}")).is_number(),
+                "missing controller.{key}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -556,7 +1230,7 @@ mod tests {
         let line2 = attempt_line("cpu-0", -14_200, 250, 6, true, true, 12_000);
         std::fs::write(dir.join("attempts.jsonl"), format!("{line1}\n{line2}\n")).unwrap();
 
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -589,7 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn mining_attempts_unknown_solution_number_is_404() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -608,7 +1282,7 @@ mod tests {
     #[tokio::test]
     async fn mining_attempts_missing_query_is_400() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -627,7 +1301,7 @@ mod tests {
     #[tokio::test]
     async fn mining_attempts_malformed_query_is_400() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(tmp.path().to_path_buf());
+        let app = router(test_state(tmp.path()));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -641,5 +1315,184 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(at(&v, "/success"), &json!(false));
         assert_eq!(at(&v, "/code"), &json!("BAD_PARAM"));
+    }
+
+    async fn attempts_status_and_code(tmp: &Path, query: &str) -> (StatusCode, String) {
+        let uri = format!("/api/v1/mining/attempts{query}");
+        let resp = router(test_state(tmp))
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let v = body_json(resp).await;
+        let code = at(&v, "/code").as_str().unwrap_or_default().to_string();
+        (status, code)
+    }
+
+    /// C9: the status code and the `code` field agree, for every row of the
+    /// status-code table. The dashboard maps 404 to a skip that still advances
+    /// the checkpoint, so turning a 404 into a 200 would stall the walk.
+    #[tokio::test]
+    async fn c9_error_paths_return_the_documented_status_and_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), 7, &Fixture::Normal);
+
+        // Found.
+        let (status, code) = attempts_status_and_code(tmp.path(), "?solution_number=7").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(code, "", "a 200 carries no error code");
+
+        // Missing parameter.
+        let (status, code) = attempts_status_and_code(tmp.path(), "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "BAD_PARAM");
+
+        // Unparsable parameter.
+        let (status, code) =
+            attempts_status_and_code(tmp.path(), "?solution_number=not-a-number").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "BAD_PARAM");
+
+        // No directory for that number.
+        let (status, code) = attempts_status_and_code(tmp.path(), "?solution_number=999").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code, "NOT_FOUND");
+    }
+
+    /// An empty attempt file is a 404, not a 200 with an empty body. The
+    /// indexer treats a 404 as a skip; a 200 with no submission makes the
+    /// parser throw, which is a hard error that stalls the checkpoint.
+    #[tokio::test]
+    async fn an_empty_attempts_file_is_a_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("8");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("attempts.jsonl"), "\n\n").unwrap();
+
+        let (status, code) = attempts_status_and_code(tmp.path(), "?solution_number=8").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code, "NOT_FOUND");
+    }
+
+    #[test]
+    fn safe_i64_passes_in_range_values_through() {
+        assert_eq!(safe_i64("best_energy_milli", 42, -14_200), json!(-14_200));
+        assert_eq!(safe_i64("best_energy_milli", 42, 0), json!(0));
+        assert_eq!(
+            safe_i64("best_energy_milli", 42, JS_MAX_SAFE_INTEGER),
+            json!(JS_MAX_SAFE_INTEGER)
+        );
+        assert_eq!(
+            safe_i64("best_energy_milli", 42, JS_MIN_SAFE_INTEGER),
+            json!(JS_MIN_SAFE_INTEGER)
+        );
+    }
+
+    #[test]
+    fn safe_i64_clamps_out_of_range_values_to_zero() {
+        assert_eq!(safe_i64("best_energy_milli", 42, i64::MAX), json!(0));
+        assert_eq!(safe_i64("best_energy_milli", 42, i64::MIN), json!(0));
+        assert_eq!(
+            safe_i64("best_energy_milli", 42, JS_MAX_SAFE_INTEGER + 1),
+            json!(0)
+        );
+        assert_eq!(
+            safe_i64("best_energy_milli", 42, JS_MIN_SAFE_INTEGER - 1),
+            json!(0)
+        );
+    }
+
+    #[test]
+    fn safe_u64_clamps_above_the_safe_range_only() {
+        assert_eq!(safe_u64("qpu_access_time_us", 42, 12_000), json!(12_000));
+        assert_eq!(safe_u64("qpu_access_time_us", 42, 0), json!(0));
+        assert_eq!(safe_u64("qpu_access_time_us", 42, u64::MAX), json!(0));
+    }
+
+    /// Fields that are large by design serialize as decimal strings, so no
+    /// clamp applies and no precision is lost.
+    #[test]
+    fn wire_u128_is_a_decimal_string() {
+        assert_eq!(wire_u128(0), json!("0"));
+        assert_eq!(wire_u128(70_000_000_000_000), json!("70000000000000"));
+        assert_eq!(
+            wire_u128(u128::MAX),
+            json!("340282366920938463463374607431768211455")
+        );
+    }
+
+    /// Replace the two fields that change on every run, so the golden file is
+    /// byte-stable. Everything else in the body is a pure projection of the
+    /// fixture.
+    fn normalize_for_golden(v: &mut Value) {
+        if let Some(map) = v.as_object_mut() {
+            if map.contains_key("timestamp") {
+                let _ = map.insert("timestamp".into(), json!(1_786_742_808_u64));
+            }
+            if let Some(data) = map.get_mut("data").and_then(Value::as_object_mut) {
+                if data.contains_key("uptime_seconds") {
+                    let _ = data.insert("uptime_seconds".into(), json!(3_612_u64));
+                }
+            }
+        }
+    }
+
+    /// C4: the committed response bodies the dashboard repo tests against.
+    ///
+    /// Set `UPDATE_DASHBOARD_GOLDEN=1` to rewrite the file after an intentional
+    /// wire change, then commit it and tell the dashboard team.
+    #[tokio::test]
+    async fn c4_dashboard_rest_golden_matches_the_committed_file() {
+        let mut golden = Map::new();
+        for (n, name, fixture) in [
+            (1_u64, "normal", Fixture::Normal),
+            (2, "all_sentinel", Fixture::AllSentinel),
+            (3, "huge_device_time", Fixture::HugeDeviceTime),
+            (4, "submitted", Fixture::Submitted),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_fixture(tmp.path(), n, &fixture);
+            let state = keyed_state(tmp.path());
+            for (endpoint, uri) in [
+                ("status", "/api/v1/status".to_string()),
+                ("stats", "/api/v1/stats".to_string()),
+                (
+                    "mining_attempts",
+                    format!("/api/v1/mining/attempts?solution_number={n}"),
+                ),
+            ] {
+                let resp = router(state.clone())
+                    .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                let mut body = body_json(resp).await;
+                normalize_for_golden(&mut body);
+                assert_safe_integers(&body, &format!("{name}/{endpoint}"));
+                let _ = golden.insert(format!("{name}/{endpoint}"), body);
+            }
+        }
+
+        let rendered = format!("{}\n", serde_json::to_string_pretty(&golden).unwrap());
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../conformance/dashboard_rest_golden.json");
+
+        if std::env::var("UPDATE_DASHBOARD_GOLDEN").is_ok() {
+            std::fs::write(&path, &rendered).unwrap();
+            return;
+        }
+
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e}. Run with UPDATE_DASHBOARD_GOLDEN=1 to create it.",
+                path.display()
+            )
+        });
+        assert_eq!(
+            committed, rendered,
+            "the dashboard REST wire shape changed. Re-run with \
+             UPDATE_DASHBOARD_GOLDEN=1, commit conformance/dashboard_rest_golden.json, \
+             and tell the dashboard team before merging."
+        );
     }
 }

@@ -5,6 +5,10 @@ use crate::topology::{topology_hash_sets, DEFAULT_SPIN_SET};
 /// Chain mining snapshot consumed by the `PoW` producer.
 #[derive(Debug, Clone)]
 pub struct MiningSnapshot {
+    /// Hash of the block the snapshot was taken at. The coordinator's own view
+    /// of the chain head, distinct from [`Self::last_proof_block_hash`], which
+    /// changes only when a proof wins.
+    pub head_hash: [u8; 32],
     /// Hash of the block that contained the last winning proof.
     pub last_proof_block_hash: [u8; 32],
     /// Topology identity bytes (32-byte hash when provided by the chain).
@@ -110,6 +114,7 @@ mod tests {
 
     fn sample() -> MiningSnapshot {
         MiningSnapshot {
+            head_hash: [0u8; 32],
             last_proof_block_hash: [7u8; 32],
             topology_hash: vec![9u8; 32],
             nodes: vec![0, 1],
