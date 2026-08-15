@@ -23,6 +23,14 @@ RUN cargo build --release -p quip-coordinator
 # --- runtime (NVIDIA CUDA + Python) ---
 # Create the D-Wave venv here (same base as runtime) so /opt/venv/bin/python
 # resolves to this image's /usr/bin/python3, not the bookworm builder's path.
+#
+# The CUDA major here must match the cudarc `cuda-12090` feature the miner is
+# built with: the miner dlopens `libnvrtc.so.12`. 12.9 is a deployment
+# decision — NVRTC 12.9 targets sm_50..sm_121, the widest range available
+# (see quip-miner-cuda's Cargo.toml). `-base` (not `-runtime`) is enough:
+# cudarc dynamic-loads only libcuda (injected by the NVIDIA container
+# runtime) and libnvrtc (installed below); -runtime's cudart/cuBLAS/NCCL
+# would never be opened.
 FROM nvidia/cuda:12.9.1-base-ubuntu24.04
 
 LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
@@ -31,11 +39,22 @@ LABEL description="quip-miner-cuda v0.3 — coordinator + CPU + D-Wave + CUDA"
 ARG QUIP_DOCKER_IMAGE=""
 ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE} \
     DEBIAN_FRONTEND=noninteractive \
-    PATH="/opt/venv/bin:/usr/local/bin:${PATH}"
+    PATH="/opt/venv/bin:/usr/local/bin:${PATH}" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
+# cuda-nvrtc-12-9 gives the CUDA miner libnvrtc.so.12. The miner compiles its
+# kernels with NVRTC at startup, and the NVIDIA container runtime injects only
+# driver libraries (libcuda, libnvidia-ml, libnvidia-ptxjitcompiler), never
+# toolkit ones — so without this the miner panics on first GPU use.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tini gosu curl ca-certificates python3 python3-venv python3-pip \
+        cuda-nvrtc-12-9 \
     && rm -rf /var/lib/apt/lists/*
+# The nvrtc package ships no ld.so.conf.d entry (that comes with the full
+# toolkit), so prove the loader reaches it via LD_LIBRARY_PATH. Same dlopen
+# path the miner takes: a base-image bump that loses nvrtc fails here, not
+# as a runtime panic.
+RUN python3 -c "import ctypes; ctypes.CDLL('libnvrtc.so.12')"
 # ubuntu:24.04 (the nvidia/cuda base) ships a default ubuntu:ubuntu at 1000:1000;
 # drop it so quip can own UID/GID 1000, consistent with the non-CUDA image.
 RUN userdel --remove ubuntu 2>/dev/null || true; \

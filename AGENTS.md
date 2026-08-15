@@ -24,6 +24,18 @@ For deeper detail, see the companion guides: `COORDINATOR.md` covers how the coo
 
 The miner binaries live in their own repos: `quip.network/quip-miner-{cpu,cuda,metal,dwave}`.
 
+## CUDA card support requirement
+
+The CUDA miner supports NVIDIA GPUs with compute capability 7.0 through 12.1
+(the kernels need sm_70 for `__nanosleep`; NVRTC 12.9 supplies the 12.1
+ceiling), host driver from a CUDA 12.9 branch (r535+). The cudarc pin in
+`quip-miner-cuda` (`cuda-12090`) and the runtime image's `cuda-nvrtc-12-9`
+package must move together — the CUDA major of the pin decides which
+`libnvrtc.so.N` the miner dlopens, and `docker/Dockerfile.quip-miner-cuda`
+asserts the load at build time. Widening or narrowing card support is a
+reviewed change to `SUPPORTED_ARCHS` in `quip-miner-cuda`
+(`tests/arch_coverage.rs` enforces it), not a side effect of a toolkit bump.
+
 ## Build and test
 
 The workspace builds from the repo root. The toolchain is pinned to 1.97.1 (`rust-toolchain.toml`).
@@ -97,10 +109,6 @@ mnemonic phrase. `.env` holds credentials such as `DWAVE_API_KEY` — **never re
 `quip_proto` is the only Python surface. It re-exports the Rust consensus primitives (`scoring`, `wire`, `ExitCode`) from `quip_proto._core` and the generated gRPC stubs from `quip.v1`. The Rust in `quip-protocol` is the source of truth; the Python can't drift from it. The D-Wave miner repo depends on this wheel.
 
 Regenerate the `quip.v1` stubs from `proto/` with the pinned `grpcio-tools==1.82.1`; CI diffs the result against the checked-in copies, so a version bump and a stub regen go together.
-
-## Task tracking
-
-This project tracks work in beads (`bd`), not to-do lists or markdown. Run `bd prime` for the workflow and `bd ready` for available work.
 
 ## Conventions
 

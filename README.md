@@ -27,6 +27,18 @@ binaries ship from their own repositories.
 
 The miner binaries live in `quip.network/quip-miner-{cpu,cuda,metal,dwave}`.
 
+## CUDA card support
+
+The CUDA miner supports NVIDIA GPUs with compute capability 7.0 through 12.1
+(Volta through consumer Blackwell). The floor is set by the kernels (they use
+`__nanosleep`, an sm_70+ instruction); the ceiling by NVRTC 12.9, which the
+`quip-miner-cuda` image ships. The host needs an NVIDIA driver from a
+CUDA 12.9-supported branch (r535 or newer) and the NVIDIA container runtime
+(`--gpus all`). Kernels are JIT-compiled per card for its detected
+capability; capabilities outside the range are clamped, and capabilities the
+toolkit lacks (for example 8.8) fall back to the next lower architecture via
+the driver's forward-compatible PTX JIT.
+
 ## Documentation
 
 - `AGENTS.md` — build, test, and run commands; repository conventions.

@@ -92,6 +92,4 @@ python/**/__pycache__/
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
-.beads-credential-key
-.beads/
 python/quip_proto/*.so
