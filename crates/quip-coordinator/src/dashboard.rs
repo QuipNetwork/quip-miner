@@ -573,15 +573,108 @@ mod tests {
         .to_string()
     }
 
-    async fn attempts_body(tmp: &Path, solution_number: u64) -> Value {
+    /// Walk every number in a response body and assert rule N1 holds.
+    ///
+    /// `path` accumulates a JSON-pointer-like trail so a failure names the exact
+    /// field, not just the value.
+    fn assert_safe_integers(v: &Value, path: &str) {
+        match v {
+            Value::Number(n) => {
+                let as_i128 = n
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| n.as_u64().map(i128::from));
+                let Some(x) = as_i128 else {
+                    panic!("{path}: {n} is not an integer; the wire shape has no floats");
+                };
+                assert!(
+                    x >= i128::from(JS_MIN_SAFE_INTEGER) && x <= i128::from(JS_MAX_SAFE_INTEGER),
+                    "{path}: {x} is outside the IEEE-754 safe integer range"
+                );
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    assert_safe_integers(item, &format!("{path}/{i}"));
+                }
+            }
+            Value::Object(map) => {
+                for (k, item) in map {
+                    assert_safe_integers(item, &format!("{path}/{k}"));
+                }
+            }
+            Value::String(_) | Value::Bool(_) | Value::Null => {}
+        }
+    }
+
+    /// The three attempt-file shapes the sweep runs against.
+    enum Fixture {
+        /// Rows that cleared the gate. The ordinary case.
+        Normal,
+        /// Every row carries the `i64::MAX` no-solution sentinel.
+        AllSentinel,
+        /// A row reporting `u64::MAX` device access time. The next sentinel.
+        HugeDeviceTime,
+    }
+
+    fn write_fixture(tmp: &Path, solution_number: u64, fixture: &Fixture) {
+        let dir = tmp.join(solution_number.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = match fixture {
+            Fixture::Normal => format!(
+                "{}\n{}\n",
+                attempt_line("cpu-0", -14_000, 200, 3, true, false, 0),
+                attempt_line("cpu-0", -14_200, 250, 6, true, true, 12_000),
+            ),
+            Fixture::AllSentinel => {
+                format!("{}\n{}\n", sentinel_line(-500), legacy_sentinel_line())
+            }
+            Fixture::HugeDeviceTime => format!(
+                "{}\n",
+                attempt_line("cpu-0", -14_200, 250, 6, true, true, u64::MAX),
+            ),
+        };
+        std::fs::write(dir.join("attempts.jsonl"), body).unwrap();
+    }
+
+    async fn get_body(tmp: &Path, uri: &str) -> Value {
         let app = router(tmp.to_path_buf());
-        let uri = format!("/api/v1/mining/attempts?solution_number={solution_number}");
         let resp = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::OK, "{uri} did not return 200");
         body_json(resp).await
+    }
+
+    async fn sweep_all_endpoints(tmp: &Path, solution_number: u64) {
+        for uri in [
+            "/api/v1/status".to_string(),
+            "/api/v1/stats".to_string(),
+            format!("/api/v1/mining/attempts?solution_number={solution_number}"),
+        ] {
+            let body = get_body(tmp, &uri).await;
+            assert_safe_integers(&body, &uri);
+        }
+    }
+
+    /// C3: no response from any endpoint carries an unsafe integer, whatever
+    /// the attempt file holds.
+    #[tokio::test]
+    async fn c3_every_response_number_is_a_safe_integer() {
+        for (n, fixture) in [
+            (1_u64, Fixture::Normal),
+            (2, Fixture::AllSentinel),
+            (3, Fixture::HugeDeviceTime),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_fixture(tmp.path(), n, &fixture);
+            sweep_all_endpoints(tmp.path(), n).await;
+        }
+    }
+
+    async fn attempts_body(tmp: &Path, solution_number: u64) -> Value {
+        let uri = format!("/api/v1/mining/attempts?solution_number={solution_number}");
+        get_body(tmp, &uri).await
     }
 
     /// C1: every row holds the no-solution sentinel; the raw best is served.
