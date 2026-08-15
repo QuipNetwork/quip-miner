@@ -265,28 +265,30 @@ fn load_attempts_envelope(
 /// Map one v0.3 [`crate::attempt::AttemptRecord`] JSON object onto the v0.2
 /// attempt wire shape the indexer parser reads.
 fn attempt_from_record(rec: &Map<String, Value>, iter: usize, solution_number: u64) -> Value {
-    let best_energy_milli = i64_field(rec, "best_energy_milli").unwrap_or(0);
+    let best_energy_milli = wire_energy_milli(rec, solution_number);
     let result_kind = result_kind_of(rec);
     let miner_id = string_field(rec, "miner_id").unwrap_or_default();
     let ts_ns = ts_ns_of(rec);
     // Map device access time onto the QPU field the indexer sums. CPU/GPU
     // miners also record this; the indexer treats the sum as QPU compute.
     let qpu_access_time_us = match u64_field(rec, "device_access_time_us") {
-        Some(us) if us > 0 => Value::from(us),
+        Some(us) if us > 0 => safe_u64("qpu_access_time_us", solution_number, us),
         _ => Value::Null,
     };
     // AttemptRecord has no backend type; empty string is the indexer default.
     json!({
         "type": "attempt",
-        "ts_ns": ts_ns,
+        "ts_ns": wire_u128(ts_ns),
         "miner_id": miner_id,
         "miner_type": "",
         "solution_number": solution_number,
         "iter": iter,
         "best_energy_milli": best_energy_milli,
         "result_kind": result_kind,
-        "num_valid": u64_field(rec, "n_valid"),
-        "diversity_milli": u64_field(rec, "diversity_milli"),
+        "num_valid": rec.get("n_valid").and_then(Value::as_u64)
+            .map_or(Value::Null, |n| safe_u64("num_valid", solution_number, n)),
+        "diversity_milli": rec.get("diversity_milli").and_then(Value::as_u64)
+            .map_or(Value::Null, |n| safe_u64("diversity_milli", solution_number, n)),
         "qpu_access_time_us": qpu_access_time_us,
         "job_id": string_field(rec, "job_id"),
         "accepted": bool_field(rec, "accepted"),
@@ -322,10 +324,15 @@ fn submission_from_records(records: &[Map<String, Value>], solution_number: u64)
         .unwrap_or(&empty);
 
     let miner_id = string_field(chosen, "miner_id").unwrap_or_else(|| "unknown".into());
-    let energy_milli = i64_field(chosen, "best_energy_milli").unwrap_or(0);
-    let diversity_milli = u64_field(chosen, "diversity_milli").unwrap_or(0);
-    let num_valid = u64_field(chosen, "n_valid");
-    let ts_ns = ts_ns_of(chosen);
+    let energy_milli = wire_energy_milli(chosen, solution_number);
+    let diversity_milli = safe_u64(
+        "diversity_milli",
+        solution_number,
+        u64_field(chosen, "diversity_milli").unwrap_or(0),
+    );
+    let num_valid = u64_field(chosen, "n_valid")
+        .map_or(Value::Null, |n| safe_u64("num_valid", solution_number, n));
+    let ts_ns = wire_u128(ts_ns_of(chosen));
 
     let any_submitted = records
         .iter()
@@ -407,22 +414,31 @@ fn u64_field(rec: &Map<String, Value>, key: &str) -> Option<u64> {
     })
 }
 
+/// Resolve the energy a record puts on the wire.
+///
+/// Order: the gate-passing best when it is not the sentinel, then the raw best
+/// when it is not the sentinel, then `0`. Legacy rows written before
+/// `raw_best_energy_milli` existed fall to `0` here, which is why the guard in
+/// [`safe_i64`] is a backstop and not the fix.
+fn wire_energy_milli(rec: &Map<String, Value>, solution_number: u64) -> Value {
+    let resolved = match i64_field(rec, "best_energy_milli") {
+        Some(best) if best != i64::MAX => best,
+        _ => match i64_field(rec, "raw_best_energy_milli") {
+            Some(raw) if raw != i64::MAX => raw,
+            _ => 0,
+        },
+    };
+    safe_i64("best_energy_milli", solution_number, resolved)
+}
+
 // ---------------------------------------------------------------------------
 // Safe-integer guard (rule N1)
 // ---------------------------------------------------------------------------
 
 /// Largest integer an IEEE-754 double holds exactly (`Number.MAX_SAFE_INTEGER`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Will be called by Task 2 response mappers")
-)]
 const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 /// Smallest integer an IEEE-754 double holds exactly.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Will be called by Task 2 response mappers")
-)]
 const JS_MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
 
 /// Serialize `v` as a JSON number, or `0` when it falls outside the range a
@@ -433,10 +449,6 @@ const JS_MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
 /// different integer and the insert fails, which stalls the indexer checkpoint.
 /// Clamping to `0` keeps the walk moving; the warning names the field so the
 /// real source is still findable.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Will be called by Task 2 response mappers")
-)]
 fn safe_i64(field: &str, solution_number: u64, v: i64) -> Value {
     if (JS_MIN_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&v) {
         return Value::from(v);
@@ -451,10 +463,6 @@ fn safe_i64(field: &str, solution_number: u64, v: i64) -> Value {
 }
 
 /// [`safe_i64`] for unsigned fields. Only the upper bound can be exceeded.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Will be called by Task 2 response mappers")
-)]
 #[expect(clippy::single_match_else, reason = "Brief specifies match structure")]
 fn safe_u64(field: &str, solution_number: u64, v: u64) -> Value {
     match i64::try_from(v) {
@@ -477,10 +485,6 @@ fn safe_u64(field: &str, solution_number: u64, v: u64) -> Value {
 /// safe range in normal operation, so clamping them to `0` would throw away real
 /// data. Rule N1 puts them on the wire as strings instead. The dashboard parser
 /// already coerces these fields with `String(...)`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Will be called by Task 2 response mappers")
-)]
 fn wire_u128(v: u128) -> Value {
     Value::String(v.to_string())
 }
@@ -528,6 +532,109 @@ mod tests {
 
     fn at<'a>(v: &'a Value, path: &str) -> &'a Value {
         v.pointer(path).unwrap_or(&Value::Null)
+    }
+
+    fn sentinel_line(raw_best_energy_milli: i64) -> String {
+        serde_json::json!({
+            "ts_ms": 1_700_000_000_000_u64,
+            "qblock_id": 42,
+            "generation": 1,
+            "miner_id": "cpu-0",
+            "job_id": "ab",
+            "is_pow": true,
+            "order_id": "",
+            "best_energy_milli": i64::MAX,
+            "raw_best_energy_milli": raw_best_energy_milli,
+            "diversity_milli": 0,
+            "n_valid": 0,
+            "accepted": false,
+            "submitted": false,
+            "device_access_time_us": 0,
+        })
+        .to_string()
+    }
+
+    fn legacy_sentinel_line() -> String {
+        serde_json::json!({
+            "ts_ms": 1_700_000_000_000_u64,
+            "qblock_id": 42,
+            "generation": 1,
+            "miner_id": "cpu-0",
+            "job_id": "ab",
+            "is_pow": true,
+            "order_id": "",
+            "best_energy_milli": i64::MAX,
+            "diversity_milli": 0,
+            "n_valid": 0,
+            "accepted": false,
+            "submitted": false,
+            "device_access_time_us": 0,
+        })
+        .to_string()
+    }
+
+    async fn attempts_body(tmp: &Path, solution_number: u64) -> Value {
+        let app = router(tmp.to_path_buf());
+        let uri = format!("/api/v1/mining/attempts?solution_number={solution_number}");
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    }
+
+    /// C1: every row holds the no-solution sentinel; the raw best is served.
+    #[tokio::test]
+    async fn c1_no_sentinel_reaches_the_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("42");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!("{}\n{}\n", sentinel_line(-500), sentinel_line(-500));
+        std::fs::write(dir.join("attempts.jsonl"), body).unwrap();
+
+        let v = attempts_body(tmp.path(), 42).await;
+        assert_eq!(at(&v, "/data/submission/energy_milli"), &json!(-500));
+        assert_eq!(at(&v, "/data/attempts/0/best_energy_milli"), &json!(-500));
+    }
+
+    /// C2: the legacy on-disk shape has no raw field. It must read as 0, not
+    /// as the sentinel, and the request must still return 200.
+    #[tokio::test]
+    async fn c2_legacy_rows_without_the_raw_field_read_as_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("42");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!("{}\n{}\n", legacy_sentinel_line(), legacy_sentinel_line());
+        std::fs::write(dir.join("attempts.jsonl"), body).unwrap();
+
+        let v = attempts_body(tmp.path(), 42).await;
+        assert_eq!(at(&v, "/data/submission/energy_milli"), &json!(0));
+        assert_eq!(at(&v, "/data/attempts/0/best_energy_milli"), &json!(0));
+    }
+
+    /// The raw field is a fallback, not an override: a row that cleared the
+    /// gate still serves its gate-passing best.
+    #[tokio::test]
+    async fn gate_passing_rows_keep_their_own_best_energy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("9");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attempts.jsonl"),
+            format!(
+                "{}\n",
+                attempt_line("cpu-0", -14_200, 250, 6, true, true, 0)
+            ),
+        )
+        .unwrap();
+
+        let v = attempts_body(tmp.path(), 9).await;
+        assert_eq!(at(&v, "/data/submission/energy_milli"), &json!(-14_200));
+        assert_eq!(
+            at(&v, "/data/attempts/0/best_energy_milli"),
+            &json!(-14_200)
+        );
     }
 
     #[tokio::test]

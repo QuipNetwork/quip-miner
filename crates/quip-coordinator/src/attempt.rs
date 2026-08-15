@@ -35,6 +35,12 @@ pub struct AttemptRecord {
     pub order_id: String,
     /// Best solution energy in milli-units.
     pub best_energy_milli: i64,
+    /// Minimum energy over every shape-valid row, ignoring the current gate.
+    ///
+    /// `best_energy_milli` holds the `i64::MAX` no-solution sentinel when no row
+    /// cleared the gate. This field holds the true best the miner found, so the
+    /// dashboard reader has a real number to serve in that case.
+    pub raw_best_energy_milli: i64,
     /// Pairwise diversity of the accepted set in milli-units.
     pub diversity_milli: u32,
     /// Count of gate-passing solutions in the result.
@@ -73,6 +79,7 @@ impl AttemptRecord {
             is_pow,
             order_id,
             best_energy_milli: v.best_energy_milli,
+            raw_best_energy_milli: v.raw_best_energy_milli,
             diversity_milli: v.diversity_milli,
             n_valid: v.n_valid,
             accepted: v.accepted,
