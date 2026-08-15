@@ -132,26 +132,71 @@ fn error_envelope(status: StatusCode, message: &str, code: &str) -> Response {
 // GET /api/v1/status
 // ---------------------------------------------------------------------------
 
-/// Indexer status probe. Identity and chain fields have no live source in the
-/// file-backed dashboard yet, so they return empty / zero values the client
-/// already tolerates (see report: Blocked / needs decision).
+/// Indexer status probe: chain identity, the coordinator's own view of the chain
+/// head, on-chain miner registration, the advertised miner roster, and the
+/// per-backend `modes` split.
+///
+/// Every field is live. An unkeyed coordinator serves empty strings, an empty
+/// roster, and `miner_info: null`, and still answers 200 — that is a valid state,
+/// not an error.
 async fn api_status(State(state): State<DashboardState>) -> Response {
-    let _ = &state;
+    let identity = state.metrics.identity();
+    let chain = state.metrics.chain();
+    let modes = state
+        .metrics
+        .mode_views()
+        .into_iter()
+        .map(|(backend, view)| {
+            (
+                backend,
+                json!({
+                    "controller": counters_json(&view.counters),
+                    "miners": miners_json(&view.miners),
+                }),
+            )
+        })
+        .collect::<Map<String, Value>>();
+
     success_envelope(&json!({
-        "ss58_address": "",
-        "account_id_hex": "",
-        "node_id": "",
-        "is_mining": false,
-        "uptime_seconds": 0,
+        "ss58_address": identity.ss58_address,
+        "account_id_hex": identity.account_id_hex,
+        "node_id": identity.node_id,
+        "is_mining": chain.is_mining,
+        "uptime_seconds": safe_u64("uptime_seconds", 0, state.metrics.uptime_seconds()),
         "chain": {
-            "head_hash": "",
-            "head_number": 0,
+            "head_hash": chain.head_hash,
+            "head_number": safe_u64("head_number", 0, chain.head_number),
         },
-        "miner_registered": false,
-        "miner_info": null,
-        "miners": [],
-        "modes": {},
+        "miner_registered": chain.miner_registered,
+        "miner_info": chain.miner_info.map_or(Value::Null, |i| miner_info_json(&i)),
+        "miners": miners_json(&state.metrics.miners()),
+        "modes": Value::Object(modes),
     }))
+}
+
+/// Serialize a miner roster for the `miners` array.
+fn miners_json(miners: &[crate::metrics::MinerEntry]) -> Value {
+    Value::Array(
+        miners
+            .iter()
+            .map(|m| json!({ "id": m.id, "type": m.miner_type }))
+            .collect(),
+    )
+}
+
+/// Serialize `QuantumPow.Miners[account]`.
+///
+/// The four balance and count fields are `u128` or `u64` and routinely exceed
+/// the safe integer range, so rule N1 puts them on the wire as decimal strings.
+/// `registered_at` is a block height and stays a guarded number.
+fn miner_info_json(info: &crate::chain::MinerInfo) -> Value {
+    json!({
+        "registered_at": safe_u64("registered_at", 0, info.registered_at),
+        "deposit": wire_u128(info.deposit),
+        "proofs_submitted": wire_u128(u128::from(info.proofs_submitted)),
+        "proofs_won": wire_u128(u128::from(info.proofs_won)),
+        "rewards_earned": wire_u128(info.rewards_earned),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -819,7 +864,144 @@ mod tests {
         assert!(at(&v, "/data/ss58_address").is_string());
         assert!(at(&v, "/data/chain").is_object());
         assert!(at(&v, "/data/miners").is_array());
+        assert!(at(&v, "/data/modes").is_object());
         assert!(at(&v, "/timestamp").is_number());
+    }
+
+    fn keyed_state(tmp: &Path) -> DashboardState {
+        let metrics = Arc::new(CoordinatorMetrics::new(&[(
+            "cpu-0".to_string(),
+            "cpu".to_string(),
+        )]));
+        metrics.set_identity(crate::metrics::Identity {
+            ss58_address: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into(),
+            account_id_hex: "0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d"
+                .into(),
+            node_id: "quip-miner-pow-CPU-1".into(),
+        });
+        metrics.set_chain(crate::metrics::ChainView {
+            head_hash: "0x00ff".into(),
+            head_number: 10_249,
+            is_mining: true,
+            miner_registered: true,
+            miner_info: Some(crate::chain::MinerInfo {
+                registered_at: 8_100,
+                deposit: 1_000_000_000_000,
+                proofs_submitted: 412,
+                proofs_won: 7,
+                rewards_earned: 70_000_000_000_000,
+            }),
+        });
+        DashboardState {
+            data_dir: tmp.to_path_buf(),
+            metrics,
+        }
+    }
+
+    async fn status_body(state: DashboardState) -> Value {
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    }
+
+    /// C5: a keyed coordinator with one registered CPU miner.
+    #[tokio::test]
+    async fn c5_status_reports_the_configured_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v = status_body(keyed_state(tmp.path())).await;
+
+        assert_eq!(
+            at(&v, "/data/ss58_address"),
+            &json!("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+        );
+        assert_eq!(at(&v, "/data/node_id"), &json!("quip-miner-pow-CPU-1"));
+        assert_eq!(at(&v, "/data/is_mining"), &json!(true));
+        assert_eq!(at(&v, "/data/miner_registered"), &json!(true));
+
+        let miners = at(&v, "/data/miners").as_array().unwrap();
+        assert_eq!(miners.len(), 1);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "asserted len() == 1 above; index 0 exists"
+        )]
+        {
+            assert_eq!(at(&miners[0], "/id"), &json!("cpu-0"));
+            assert!(at(&miners[0], "/type").as_str().unwrap().starts_with("CPU"));
+        }
+
+        assert!(at(&v, "/data/chain/head_number").as_u64().unwrap() > 0);
+        assert_eq!(at(&v, "/data/chain/head_hash"), &json!("0x00ff"));
+
+        assert!(at(&v, "/data/miner_info").is_object());
+        // u128 and u64 balances cross the wire as decimal strings, per rule N1.
+        for key in [
+            "deposit",
+            "proofs_submitted",
+            "proofs_won",
+            "rewards_earned",
+        ] {
+            assert!(
+                at(&v, &format!("/data/miner_info/{key}")).is_string(),
+                "miner_info.{key} must be a decimal string"
+            );
+        }
+        assert_eq!(at(&v, "/data/miner_info/deposit"), &json!("1000000000000"));
+        assert_eq!(at(&v, "/data/miner_info/proofs_submitted"), &json!("412"));
+        assert_eq!(at(&v, "/data/miner_info/registered_at"), &json!(8_100));
+    }
+
+    /// C6: an unkeyed coordinator is a valid state, not an error.
+    #[tokio::test]
+    async fn c6_status_with_no_identity_returns_200_and_empty_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = DashboardState {
+            data_dir: tmp.path().to_path_buf(),
+            metrics: Arc::new(CoordinatorMetrics::new(&[])),
+        };
+        let v = status_body(state).await;
+
+        assert_eq!(at(&v, "/success"), &json!(true));
+        assert_eq!(at(&v, "/data/ss58_address"), &json!(""));
+        assert_eq!(at(&v, "/data/miners"), &json!([]));
+        assert_eq!(at(&v, "/data/miner_info"), &Value::Null);
+        assert_eq!(at(&v, "/data/miner_registered"), &json!(false));
+        assert_eq!(at(&v, "/data/modes"), &json!({}));
+    }
+
+    /// The per-backend panel needs one `modes` entry per active backend group,
+    /// each with its own counters and roster.
+    #[tokio::test]
+    async fn status_modes_carry_one_entry_per_backend_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(CoordinatorMetrics::new(&[
+            ("cpu-0".to_string(), "cpu".to_string()),
+            ("cuda-0".to_string(), "cuda".to_string()),
+        ]));
+        metrics.record_contexts_dispatched("cuda-0", 3);
+        let state = DashboardState {
+            data_dir: tmp.path().to_path_buf(),
+            metrics,
+        };
+        let v = status_body(state).await;
+
+        assert_eq!(
+            at(&v, "/data/modes/cpu/controller/contexts_dispatched"),
+            &json!(0)
+        );
+        assert_eq!(
+            at(&v, "/data/modes/cuda/controller/contexts_dispatched"),
+            &json!(3)
+        );
+        assert_eq!(at(&v, "/data/modes/cuda/miners/0/id"), &json!("cuda-0"));
+        assert_eq!(at(&v, "/data/modes/cuda/miners/0/type"), &json!("GPU-CUDA"));
     }
 
     fn test_state(tmp: &Path) -> DashboardState {

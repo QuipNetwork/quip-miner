@@ -72,6 +72,9 @@ pub struct RuntimeParams {
     pub descriptor_filed: Arc<AtomicBool>,
     /// Set once `QuantumPow.Miners` is known to hold the signing account.
     pub miner_registered: Arc<AtomicBool>,
+    /// Chain identity advertised on `/api/v1/status`. Empty when the process
+    /// holds no usable signer key.
+    pub identity: crate::metrics::Identity,
 }
 
 /// Inputs to the feeder loop.
@@ -593,6 +596,29 @@ pub async fn feeder_loop<C>(
                 params.metrics.record_head_observed();
                 last_block_number = snap.block_number;
             }
+
+            // Refresh the dashboard's chain view. `miner_info` is a storage read,
+            // so it is refreshed on a round turnover only, not on every poll.
+            let refresh_miner_info = current_head != Some(snap.last_proof_block_hash);
+            let miner_info = if refresh_miner_info {
+                match chain.fetch_miner_info(params.miner_account).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "feeder: miner info read failed");
+                        params.metrics.chain().miner_info
+                    }
+                }
+            } else {
+                params.metrics.chain().miner_info
+            };
+            params.metrics.set_chain(crate::metrics::ChainView {
+                head_hash: format!("0x{}", crate::chain::extrinsic::hex_encode(&snap.head_hash)),
+                head_number: snap.block_number,
+                is_mining: true,
+                miner_registered: miner_info.is_some(),
+                miner_info,
+            });
+
             let head = snap.last_proof_block_hash;
             if current_head != Some(head) {
                 let next = match round {
@@ -960,6 +986,10 @@ pub async fn feeder_loop<C>(
                     }
                 }
             }
+        } else {
+            let mut view = params.metrics.chain();
+            view.is_mining = false;
+            params.metrics.set_chain(view);
         }
 
         tokio::select! {
@@ -1018,6 +1048,7 @@ where
             .map(|e| (e.miner_id.clone(), e.backend.clone()))
             .collect::<Vec<_>>(),
     ));
+    metrics.set_identity(params.identity.clone());
     state.lock().await.metrics = Arc::clone(&metrics);
 
     // Optional mining-attempt dashboard: a single writer thread records every

@@ -923,6 +923,7 @@ pub async fn serve_one_session_expecting(
     // Chain is unused for handshake-only; use a no-op fake with empty snapshot.
     let chain = Arc::new(crate::chain::FakeChain::new(
         crate::chain::MiningSnapshot {
+            head_hash: [0u8; 32],
             last_proof_block_hash: [0u8; 32],
             topology_hash: vec![0u8; 32],
             nodes: vec![],

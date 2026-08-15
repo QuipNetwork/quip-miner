@@ -51,6 +51,7 @@ fn mock_miner() -> String {
 /// only held by the service and never queried.
 fn trivial_snapshot() -> MiningSnapshot {
     MiningSnapshot {
+        head_hash: [0u8; 32],
         last_proof_block_hash: [0u8; 32],
         topology_hash: vec![0u8; 32],
         nodes: vec![],
@@ -103,6 +104,7 @@ async fn runtime_serves_supervises_and_shuts_down_clean() {
         descriptor: quip_coordinator::config::DescriptorParams::default(),
         descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        identity: quip_coordinator::metrics::Identity::default(),
     };
     let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
 
@@ -155,6 +157,7 @@ fn ising_snapshot() -> MiningSnapshot {
     let topology_hash =
         quip_coordinator::topology::topology_hash_sets(&nodes, &edges, &h, &j, &spin).to_vec();
     MiningSnapshot {
+        head_hash: [0u8; 32],
         last_proof_block_hash: [7u8; 32],
         topology_hash,
         nodes,

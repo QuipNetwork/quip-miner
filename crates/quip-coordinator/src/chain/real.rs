@@ -779,6 +779,7 @@ impl ChainClient for RealChainClient {
         let block_number = parse_block_number(&header)?;
 
         let snap = MiningSnapshot {
+            head_hash: block_hash,
             last_proof_block_hash: scale.last_proof_block_hash.0,
             topology_hash: scale.topology_hash.0.to_vec(),
             nodes: scale.nodes,

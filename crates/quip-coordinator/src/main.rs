@@ -21,6 +21,7 @@ use quip_coordinator::supervisor::BackoffPolicy;
 use quip_coordinator::topology::Topology;
 use quip_proto::v1::{Configure, Job};
 use quip_protocol::session::ExitCode;
+use sp_core::crypto::Ss58Codec;
 use std::path::PathBuf;
 use std::process::ExitCode as StdExitCode;
 use std::sync::atomic::AtomicBool;
@@ -341,7 +342,10 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
     let MinerKeys {
         identity: miner_identity,
         account: miner_account,
+        ss58: miner_ss58,
     } = miner_keys_from_key(&cfg.signer_key);
+
+    let identity = identity_from_keys(miner_ss58, miner_account, cfg.node_id.as_deref());
 
     let funding = quip_coordinator::funding::FundingParams {
         faucet_url: cfg.faucet_url.clone(),
@@ -387,6 +391,7 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
         descriptor,
         descriptor_filed,
         miner_registered,
+        identity,
     };
     tracing::info!(
         miners = cfg.launch.len(),
@@ -447,14 +452,20 @@ struct MinerKeys {
     identity: [u8; 32],
     /// Signing `AccountId32`: pays fees, holds the balance, keys the maps.
     account: [u8; 32],
+    /// SS58 form of `account`, or `None` when no usable signer key loaded.
+    ss58: Option<String>,
 }
 
 fn miner_keys_from_key(signer_key: &str) -> MinerKeys {
     match load_hybrid_pair(signer_key) {
-        Ok(pair) => MinerKeys {
-            identity: miner_identity_bytes(&pair),
-            account: signer_account_bytes(&pair),
-        },
+        Ok(pair) => {
+            let account = signer_account_bytes(&pair);
+            MinerKeys {
+                identity: miner_identity_bytes(&pair),
+                account,
+                ss58: Some(sp_core::crypto::AccountId32::from(account).to_ss58check()),
+            }
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -463,9 +474,33 @@ fn miner_keys_from_key(signer_key: &str) -> MinerKeys {
             MinerKeys {
                 identity: [0u8; 32],
                 account: [0u8; 32],
+                ss58: None,
             }
         }
     }
+}
+
+/// Build the dashboard identity from the loaded signer keys.
+///
+/// An unkeyed coordinator advertises no identity at all. The dashboard reads
+/// an empty `ss58_address` as an absent identity and skips its whole identity
+/// block, which is the right answer for a process that cannot sign.
+fn identity_from_keys(
+    ss58: Option<String>,
+    account: [u8; 32],
+    node_id: Option<&str>,
+) -> quip_coordinator::metrics::Identity {
+    ss58.map_or_else(
+        quip_coordinator::metrics::Identity::default,
+        |ss58_address| quip_coordinator::metrics::Identity {
+            ss58_address,
+            account_id_hex: format!("0x{}", hex_encode(&account)),
+            node_id: node_id.map_or_else(
+                || quip_coordinator::readiness::node_id_from_account(&account),
+                str::to_string,
+            ),
+        },
+    )
 }
 
 /// Same readiness walk the feeder re-runs on every later round.

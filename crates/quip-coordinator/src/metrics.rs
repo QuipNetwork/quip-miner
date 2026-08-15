@@ -108,6 +108,9 @@ pub struct ChainView {
     pub is_mining: bool,
     /// `QuantumPow.Miners` holds the signing account.
     pub miner_registered: bool,
+    /// `QuantumPow.Miners[account]`, or `None` when the account is not
+    /// registered.
+    pub miner_info: Option<crate::chain::MinerInfo>,
 }
 
 /// Per-backend counters and roster, plus the process-global counters.
@@ -422,6 +425,7 @@ mod tests {
             head_number: 10_249,
             is_mining: true,
             miner_registered: true,
+            miner_info: None,
         });
         assert_eq!(m.chain().head_number, 10_249);
         assert!(m.chain().is_mining);
