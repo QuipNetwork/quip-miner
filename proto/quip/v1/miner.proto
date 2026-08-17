@@ -1,0 +1,178 @@
+syntax = "proto3";
+package quip.v1;
+
+service MinerService {
+  rpc Session(stream MinerMsg) returns (stream CoordMsg);
+}
+
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  ISING_SAMPLE = 1;
+  GATE_CIRCUIT = 2; // reserved
+}
+
+enum RejectReason {
+  REJECT_REASON_UNSPECIFIED = 0;
+  UNSUPPORTED_KIND = 1;
+  TOO_LARGE = 2;
+  EXPIRED = 3;
+  OVERLOADED = 4;
+  SHUTTING_DOWN = 5;
+  MALFORMED = 6;
+  TOPOLOGY_MISMATCH = 7;
+  TOPOLOGY_MISSING = 8;
+}
+
+message MinerMsg {
+  oneof msg {
+    Hello      hello       = 1;
+    Ready      ready       = 2;
+    JobRequest job_request = 3;
+    Result     result      = 4;
+    Reject     reject      = 5;
+    Status     status      = 6;
+    Fatal      fatal       = 7;
+  }
+}
+
+message CoordMsg {
+  oneof msg {
+    Welcome   welcome   = 1;
+    Configure configure = 2;
+    Topology  topology  = 3;
+    Job       job       = 4;
+    Cancel    cancel    = 5;
+    Ping      ping      = 6;
+    Shutdown  shutdown  = 7;
+    SetTarget set_target = 8;
+  }
+}
+
+message Hello {
+  string   miner_id             = 1;
+  string   session_token        = 2;
+  uint32   protocol_version     = 3; // this spec: 1
+  string   backend              = 4; // cpu | cuda | metal | dwave-qpu
+  string   algorithm            = 5; // sa | gibbs | quantum-anneal
+  repeated JobKind supported_kinds = 6;
+  uint32   max_nodes            = 7;
+  uint32   max_edges            = 8;
+  optional bytes native_topology_hash = 9;
+  repeated string features      = 10;
+}
+
+message Welcome { uint32 protocol_version = 1; }
+
+message Configure {
+  uint32 queue_depth    = 1;
+  uint32 idle_timeout_s = 2;
+  uint32 heartbeat_s    = 3;
+  uint32 reconnect_window_s = 4;
+  string backend_toml   = 5; // opaque per-backend config, passed through verbatim
+}
+
+message Ready {}
+
+message Topology {
+  bytes  hash  = 1;
+  repeated uint32 nodes = 2;
+  EdgeList edges = 3;
+  repeated int32 allowed_h_milli = 4; // for the miner's adapt difficulty band
+}
+
+// Difficulty target, pushed by the coordinator after Topology and re-sent
+// whenever difficulty changes. The miner adapts its sampling budget from
+// max_energy_milli; num_reads/num_sweeps/anneal_time_us are optional explicit
+// overrides (0 = unset -> adapt).
+message SetTarget {
+  int64  max_energy_milli    = 1; // acceptance ceiling AND adapt target
+  uint32 min_solutions       = 2;
+  uint32 min_diversity_milli = 3;
+  uint32 num_reads      = 4; // 0 = unset
+  uint32 num_sweeps     = 5; // 0 = unset
+  uint32 anneal_time_us = 6; // 0 = unset
+}
+
+message EdgeList {
+  repeated uint32 u = 1;
+  repeated uint32 v = 2;
+}
+
+message QualityGates {
+  int64  min_energy_milli   = 1;
+  uint32 min_diversity_milli = 2;
+  uint32 min_solutions      = 3;
+}
+
+message IsingProblem {
+  oneof graph {
+    bytes    topology_hash = 1;
+    EdgeList edges         = 2;
+  }
+  bytes  h_milli_le32 = 3;
+  bytes  j_milli_le32 = 4;
+  uint32 num_reads      = 5; // per-job override; 0 = unset -> SetTarget/adapt
+  uint32 num_sweeps     = 7; // per-job override; 0 = unset
+  uint32 anneal_time_us = 8; // per-job override; 0 = unset
+  reserved 6; // was `gates`; difficulty gates moved to SetTarget
+}
+
+message Provenance {
+  bool   is_pow   = 1;
+  bytes  order_id = 2; // mempool reward attribution; empty for PoW
+}
+
+message Job {
+  bytes   job_id      = 1;
+  JobKind kind        = 2;
+  uint64  generation  = 3; // PoW cancellation scope; 0 for mempool
+  uint64  deadline_ms = 4;
+  IsingProblem ising  = 5;
+  Provenance provenance = 6;
+}
+
+message JobRequest { uint32 credits = 1; }
+
+message Cancel { uint64 max_generation = 1; }
+
+message Ping {}
+
+message Shutdown { uint32 grace_ms = 1; }
+
+message Solution {
+  bytes spins_bytes = 1; // one byte/spin: 0x01=+1, 0xFF=-1
+  int64 energy_milli = 2;
+}
+
+message SamplerMeta {
+  uint32 reads = 1;
+  uint32 sweeps = 2;
+  uint64 device_access_time_us = 3;
+  uint64 qpu_access_us = 4;
+  map<string, string> extra = 5;
+}
+
+message Result {
+  bytes    job_id    = 1;
+  repeated Solution solutions = 2;
+  SamplerMeta meta   = 3;
+}
+
+message Reject {
+  bytes        job_id = 1;
+  RejectReason reason = 2;
+}
+
+message Status {
+  string miner_id     = 1;
+  double utilization  = 2;
+  uint64 jobs_done    = 3;
+  uint64 abandoned_generation = 4; // cancelled in-flight work reported here, not in Result
+  map<string, string> sampler_stats = 5;
+}
+
+message Fatal {
+  uint32 exit_code = 1; // 64/69/70/77
+  string reason    = 2;
+  bool   restart_required = 3;
+}

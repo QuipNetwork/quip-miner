@@ -1,0 +1,16 @@
+[package]
+name = "quip-protocol-py"
+version = "0.3.0"
+edition = "2021"
+description = "PyO3 bindings exposing quip-protocol scoring/wire primitives to Python"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+quip-protocol = { path = "../quip-protocol" }
+pyo3 = { version = "0.29", features = ["abi3-py311", "extension-module"] }
+
+[lints]
+workspace = true

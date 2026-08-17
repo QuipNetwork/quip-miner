@@ -41,8 +41,6 @@ mining_rate_*.json
 
 # Build outputs
 **/dist/
-build/pyinstaller/
-pyinstaller/boot_network_node_stamped.py
 akash/web/localhost.pem
 node_modules
 # Dependencies (installed by bun/npm - developer only)
@@ -72,8 +70,6 @@ localhost.pem
 
 # Profiling flamegraph outputs
 flamegraphs/
-# Benchmark outputs
-benchmarks/
 
 # TLS private keys (certbot output in Docker data volume)
 data/certs/private/
@@ -83,3 +79,22 @@ telemetry/
 
 # Downloaded + validated PoW win archives (tools/download_and_validate_wins.py)
 qpu_results_wins/
+
+# Local implementation plans (never committed)
+.plans/
+
+# Rust build output
+target/
+
+# Python bytecode cache (nested packages)
+python/**/__pycache__/
+
+# Beads / Dolt files (added by bd init)
+.beads/
+.beads.gate.lock
+.dolt/
+*.db
+python/quip_proto/*.so
+
+# Benchmark output
+bench-out/

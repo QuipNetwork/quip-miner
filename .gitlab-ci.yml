@@ -7,39 +7,189 @@ stages:
   - release
 
 variables:
-  CPU_IMAGE: quip-miner-cpu
-  CUDA_IMAGE: quip-miner-cuda
+  # Generic package registry name for the macOS bundle. Only the release jobs
+  # below use it; the image jobs address the container registry directly.
+  PKG: quip-miner
+
+# NOTE (v0.3 cutover): the v0.2 image/binary jobs were removed (they built the
+# deleted Python monolith). The v0.3 images below live under a SEPARATE
+# namespace (v0.3/) so they never touch the v0.2 :latest/:v0.2 tags that
+# quip-node-manager tracks — the full cutover of those tags is deferred. Images
+# bundle the released miner binaries + a from-source coordinator; the
+# coordinator's production runtime is still being wired (quip-6ha/4kn/agm).
 
 # ---------------------------------------------------------------------------
 # Tests (branches only — main/tags skip straight to build)
 # ---------------------------------------------------------------------------
 
-test:
+# The v0.2 Python `test:` job (pytest tests/) was removed in the v0.3 cutover —
+# the Python miner stack it exercised is gone. v0.3 coverage is `rust:` (the
+# workspace) and `conformance:` (the quip_proto SDK).
+
+rust:
   stage: test
-  image: python:3.12-slim
+  image: rust:1.97.1
   tags: [linux, amd64]
-  # Backstop only — must exceed (pip install + the inner 300s pytest
-  # timeout) so the SIGABRT dump below fires first instead of a silent
-  # job-level SIGTERM.
-  timeout: 15m
   before_script:
-    - pip install -U pip setuptools wheel
-    - pip install -e ".[dev]"
+    - apt-get update && apt-get install -y protobuf-compiler
   script:
-    # Fast guard: the unified streaming stack has no inline path. Fail early
-    # if the deleted _sample/_sample_batch/STREAMING_PUMP/DRIVER_OWNS_FEEDER
-    # symbols reappear (also covered by pytest, but cheaper as a standalone).
-    - python tools/lint_no_inline_sampling.py
-    # Wrap pytest so a hang (e.g. a lingering non-daemon thread blocking
-    # interpreter shutdown) produces a full all-thread stack dump rather
-    # than a silent timeout. The suite is ~100s locally but 3-4x slower on
-    # this shared runner — it's dominated by mp.Process(spawn) tests that
-    # re-import the full dwave/scipy stack per child — so the budget is 300s
-    # to leave headroom above the real run while still catching a genuine
-    # post-summary shutdown hang. SIGABRT triggers faulthandler's all-thread
-    # dump; the 30s --kill-after guarantees the job still exits if the dump
-    # itself stalls.
-    - timeout --signal=ABRT --kill-after=30 300 python -X faulthandler -m pytest tests/ -v
+    - cargo fmt --all --check
+    - cargo clippy --workspace --exclude quip-coordinator --exclude quip-protocol-py --all-targets -- -D warnings
+    - cargo test --workspace --exclude quip-coordinator --exclude quip-protocol-py
+  cache:
+    key: cargo-$CI_COMMIT_REF_SLUG
+    paths: [target/, .cargo/]
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+# The `rust:` job above excludes quip-coordinator from the workspace jobs; it
+# runs here instead. This job runs the full package, including its integration
+# targets — which spawn `quip-mock-miner`, a workspace member each test builds
+# itself, not a fetched miner binary — and the nine dashboard REST conformance
+# tests.
+coordinator:
+  stage: test
+  image: rust:1.97.1
+  tags: [linux, amd64]
+  before_script:
+    - apt-get update && apt-get install -y protobuf-compiler
+  script:
+    - cargo clippy -p quip-coordinator --all-targets -- -D warnings
+    - cargo test -p quip-coordinator
+  cache:
+    key: cargo-coordinator-$CI_COMMIT_REF_SLUG
+    paths: [target/, .cargo/]
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+conformance:
+  stage: test
+  image: python:3.11
+  tags: [linux, amd64]
+  before_script:
+    # quip-proto's build script (prost/tonic) needs protoc; python:3.11 has none.
+    - apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
+    # maturin develop requires an active virtualenv; the base image has none.
+    - python -m venv .venv
+    - . .venv/bin/activate
+    # Pin grpcio-tools so the proto-stub drift guard is deterministic: the
+    # checked-in python/quip/v1/*_pb2.py were generated with 1.82.1 (protoc
+    # gencode 7.35.0). A newer grpcio-tools stamps a different gencode version
+    # and trips the diff. Bump this pin and regenerate the stubs together.
+    - pip install maturin "grpcio-tools==1.82.1"
+    # quip_proto's scoring/wire are a PyO3 extension; build it from the root
+    # maturin project before tests import it, installing quip_proto + the dev
+    # extras (pytest, numpy, blake3) into the venv. python:3.11 has no Rust
+    # toolchain, so install one first.
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    - . "$HOME/.cargo/env"
+    - maturin develop -E dev
+  script:
+    # Golden vectors are frozen and validated through quip_proto (test_pyo3_parity);
+    # the Python regeneration drift guard was retired with the v0.2 shared/ stack.
+    # Proto↔stub drift guard: regenerate Python *_pb2 stubs from the normative
+    # .proto and fail if the checked-in copies are stale (mirrors golden drift).
+    - |
+      set -e
+      TMP=$(mktemp -d)
+      python -m grpc_tools.protoc \
+        -I proto \
+        --python_out="$TMP" \
+        --grpc_python_out="$TMP" \
+        proto/quip/v1/miner.proto
+      diff -u python/quip/v1/miner_pb2.py "$TMP/quip/v1/miner_pb2.py"
+      diff -u python/quip/v1/miner_pb2_grpc.py "$TMP/quip/v1/miner_pb2_grpc.py"
+    - python -m pytest conformance/ -v
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+# fetch-miners.sh is the single source of truth for pulling released miner
+# binaries — the container images (Dockerfile.quip-miner*) and the native/host
+# install both call it. This job lints it and dry-runs each MINER_SET, asserting
+# the right assets are selected. DRY_RUN skips downloads, so it needs no cut
+# releases and no GPU.
+verify-fetch-miners:
+  stage: test
+  image: alpine:3.20
+  tags: [linux, amd64]
+  before_script:
+    # curl: the script resolves each miner's newest release from the API, and
+    # it does so on a DRY_RUN too, because the asset URL it prints carries the
+    # tag. Alpine ships busybox wget, not curl.
+    - apk add --no-cache bash shellcheck curl
+  script:
+    - shellcheck crates/quip-coordinator/tools/fetch-miners.sh
+    - |
+      set -eu
+      S=crates/quip-coordinator/tools/fetch-miners.sh
+      echo "--- MINER_SET=cpu ---"
+      out=$(DRY_RUN=1 MINER_SET=cpu bash "$S")
+      echo "$out"
+      echo "$out" | grep -q 'quip-cpu-sa'
+      echo "$out" | grep -q 'quip-cpu-gibbs'
+      if echo "$out" | grep -q 'quip-cuda'; then echo "ERROR: cpu set pulled cuda"; exit 1; fi
+      echo "--- MINER_SET=cpu-cuda ---"
+      out=$(DRY_RUN=1 MINER_SET=cpu-cuda bash "$S")
+      echo "$out"
+      echo "$out" | grep -q 'quip-cpu-sa'
+      echo "$out" | grep -q 'quip-cuda-sa'
+      echo "--- clean-name (saved as quip-cpu-sa, not -amd64) ---"
+      echo "$out" | grep -qE '\-> [^ ]+/quip-cpu-sa '
+      # Darwin is the native/host install the macOS bundle ships. It is the
+      # only platform that fetches dwave as a binary; everywhere else the
+      # images install it from git, so a pip line here means a regression.
+      echo "--- TARGETOS=darwin (native macOS) ---"
+      out=$(DRY_RUN=1 TARGETOS=darwin TARGETARCH=arm64 MINER_SET=auto bash "$S")
+      echo "$out"
+      echo "$out" | grep -q 'quip-metal-sa-darwin-arm64'
+      echo "$out" | grep -q 'quip-cpu-sa-darwin-arm64'
+      echo "$out" | grep -q 'quip-dwave-qa-darwin-arm64'
+      if echo "$out" | grep -q 'pip install'; then
+        echo "ERROR: darwin must fetch the dwave binary, not print a pip line"; exit 1
+      fi
+      if echo "$out" | grep -q 'quip-cuda'; then echo "ERROR: darwin pulled cuda"; exit 1; fi
+      # Every pin must name a release that exists. The images build from these,
+      # and a missing tag fails only at image-build time otherwise: v0.3.0-rc4
+      # derived the miner tags from the coordinator's tag and asked four repos
+      # for a release none of them had cut.
+      echo "--- pins resolve to real releases ---"
+      for m in cpu cuda metal dwave; do
+        tag=$(bash "$S" --print-tag "$m")
+        url="https://gitlab.com/api/v4/projects/quip.network%2Fquip-miner-${m}/releases/${tag}"
+        if wget -q -O /dev/null "$url"; then
+          echo "ok   quip-miner-${m} ${tag}"
+        else
+          echo "ERROR: quip-miner-${m} has no release ${tag}" >&2
+          exit 1
+        fi
+      done
+      if bash "$S" --print-tag nonsense 2>/dev/null; then
+        echo "ERROR: --print-tag accepted an unknown miner"; exit 1
+      fi
+      # The script needs bash: `set -o pipefail` is not POSIX, and Debian's
+      # /bin/sh is dash, which rejects it. v0.3.0-rc5 called it through `sh` and
+      # every image build died with "Illegal option -o pipefail" after the Rust
+      # build had already run. Catch that here instead.
+      echo "--- Dockerfiles call the script with bash ---"
+      bad=$(grep -n 'fetch-miners\.sh' docker/Dockerfile.* | grep -v bash | grep -v COPY | grep -v '#' || true)
+      if [ -n "$bad" ]; then
+        echo "$bad"
+        echo "ERROR: fetch-miners.sh must be invoked with bash, not sh" >&2
+        exit 1
+      fi
+      echo "ok   every invocation uses bash"
   rules:
     - if: $CI_COMMIT_TAG
       when: never
@@ -48,240 +198,267 @@ test:
     - if: $CI_COMMIT_BRANCH
 
 # ---------------------------------------------------------------------------
-# Version-tag gate (tags only — fail fast if tag ≠ pyproject.toml version)
+# v0.3 container images (separate v0.3/ namespace; see the stages note).
+# Bundle: from-source quip-coordinator + released CPU/CUDA miner binaries +
+# D-Wave Python miner. Built the org-standard way (see quip-protocol-rs's
+# quip-network-node): kaniko, one job per native architecture, stitched by
+# manifest-tool. Build-only on branches (--no-push, manual), build + push on tags.
 # ---------------------------------------------------------------------------
-
-check-version:
-  stage: test
-  image: python:3.12-slim
-  tags: [linux, amd64]
-  rules:
-    - if: $CI_COMMIT_TAG
-  script:
-    - |
-      PKG_VERSION=$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
-      TAG_VERSION="${CI_COMMIT_TAG#v}"
-      # Git tags use SemVer hyphenated pre-releases (0.2.1-rc17); pyproject uses
-      # PEP 440 (0.2.1rc17). Normalize the tag to PEP 440 before comparing so the
-      # numeric parts + rc number must still match. See docs/VERSIONING.md.
-      TAG_VERSION_NORM=$(echo "$TAG_VERSION" | sed -E 's/-(rc|alpha|beta)/\1/')
-      if [ "$PKG_VERSION" != "$TAG_VERSION_NORM" ]; then
-        echo "ERROR: tag $CI_COMMIT_TAG (PEP440 ${TAG_VERSION_NORM}) != pyproject.toml version ${PKG_VERSION}"
-        exit 1
-      fi
-      echo "OK: tag $CI_COMMIT_TAG matches pyproject.toml version $PKG_VERSION"
-
-# ---------------------------------------------------------------------------
-# Docker image builds (Kaniko — no daemon required)
-# ---------------------------------------------------------------------------
-
-# Shared trigger rules for image jobs. Image pushes happen ONLY on git tags —
-# branch merges (main/v0.2) run tests but never push images.
+# The `docker` tag is load-bearing: it pins these to *container* executors that
+# honour `image:` and can run kaniko. amd64 -> the Linux Docker boxes
+# (finney/lovelace/watch); arm64 -> the arm64 docker-executor on an Apple-Silicon
+# Mac (tesla-docker). The bare arch tags alone would hit the macOS *shell*
+# runners, which ignore `image:` and can't run kaniko.
 #
-# MUTABLE_TAGS is resolved at script time by the resolve-tags job (git ancestry
-# cannot be tested in rules:if). Space-separated; each entry is an extra
-# registry tag beyond the unconditional :$CI_COMMIT_SHA:
-#   pre-release (vX.Y.Z-rcN or vX.Y.ZrcN)  -> :$CI_COMMIT_TAG only
-#   stable vX.Y.Z reachable from origin/main -> :latest :vX.Y :$CI_COMMIT_TAG
-#   stable vX.Y.Z NOT on main              -> :$CI_COMMIT_TAG only
-#   any other tag                          -> :$CI_COMMIT_TAG only
-.shared_image_rules:
-  rules:
-    # Pre-release — SemVer hyphenated (vX.Y.Z-rcN). Preferred form; see
-    # docs/VERSIONING.md. Does not move :latest or :vX.Y.
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+-(rc|alpha|beta)[0-9]*$/
-    # Legacy pre-release — PEP 440 no-hyphen (vX.Y.ZrcN). Still builds.
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(rc|alpha|beta)[0-9]*$/
-    # Stable release tag (vX.Y.Z). Mutable tags decided by resolve-tags.
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
-    # Any other tag: build and pin :$CI_COMMIT_TAG only (no :latest).
-    - if: $CI_COMMIT_TAG
-
-# Runtime ancestry gate: only stable tags reachable from origin/main publish
-# :latest and :vX.Y. Exports MUTABLE_TAGS via dotenv for manifest/cuda jobs.
-resolve-tags:
-  stage: build
-  needs: []
-  rules: !reference [.shared_image_rules, rules]
-  image:
-    name: alpine/git:latest
-    entrypoint: [""]
-  tags: [linux, amd64]
-  variables:
-    GIT_DEPTH: "0"
-  script:
-    - git fetch origin main
-    - |
-      MUTABLE_TAGS="$CI_COMMIT_TAG"
-      if printf '%s' "$CI_COMMIT_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-         && git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main; then
-        MINOR=$(printf '%s' "$CI_COMMIT_TAG" | sed -E 's/^(v[0-9]+\.[0-9]+).*/\1/')
-        MUTABLE_TAGS="latest $MINOR $CI_COMMIT_TAG"
-      fi
-      echo "MUTABLE_TAGS=$MUTABLE_TAGS" > tags.env
-      echo "resolved MUTABLE_TAGS=$MUTABLE_TAGS"
-  artifacts:
-    reports:
-      dotenv: tags.env
-
-.docker_build:
+# amd64 /lib workaround: the amd64 boxes are NVIDIA GPU hosts whose runtime
+# bind-mounts host firmware into /lib, so kaniko can't rewrite /lib into the
+# base image's merged-usr symlink (EBUSY). Ignore /lib entirely, then re-shim
+# the multilib triplet dir so each RUN still resolves its ELF interpreter (the
+# shim dangles until kaniko unpacks the rootfs; it never reaches the image).
+# NOT applied on arm64: no firmware mount, and the aarch64 ELF interpreter lives
+# directly in /lib, so ignoring /lib would break every RUN.
+.kaniko-image:
   stage: build
   image:
     name: gcr.io/kaniko-project/executor:v1.23.2-debug
     entrypoint: [""]
+  timeout: 90m
   before_script:
-    # The cuda runners' NVIDIA container runtime bind-mounts host GPU driver
-    # firmware into every job container at /lib/firmware/nvidia/. kaniko's
-    # rootfs extraction cannot replace /lib with the usr-merge symlink while
-    # those mounts are busy, so the executor runs with --ignore-path=/lib,
-    # which skips that replacement and preserves /lib as a plain directory.
-    # The ELF interpreter resolves through /lib/x86_64-linux-gnu (via the
-    # /lib64 → /usr/lib64 → /lib/x86_64-linux-gnu symlink chain), so RUN
-    # commands need this shim. It dangles until kaniko unpacks the rootfs,
-    # and never reaches the image: /lib is excluded from snapshots and the
-    # final image's /lib symlink comes from the base layers.
-    - mkdir -p /lib && ln -sfn /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
+    - if [ -n "$KANIKO_LIB_IGNORE" ]; then mkdir -p /lib && ln -sfn /usr/lib/$TRIPLET /lib/$TRIPLET; fi
     - mkdir -p /kaniko/.docker
-    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\"}}}" > /kaniko/.docker/config.json
-  rules: !reference [.shared_image_rules, rules]
+    - |
+      printf '{"auths":{"%s":{"auth":"%s"}}}\n' \
+        "$CI_REGISTRY" \
+        "$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')" \
+        > /kaniko/.docker/config.json
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
 
-# CPU image — built per-arch then stitched into a multi-arch manifest.
-# amd64 stays on a linux/amd64 runner via Kaniko (daemonless).
-# arm64 runs on the macOS arm64 shell runner via docker buildx — we
-# don't have a dedicated linux/arm64 runner today, and the mac runner
-# builds natively (no QEMU) so it's fast and isolates us from the
-# linux-arm64 pool being empty. Swap back to a Kaniko-on-linux-arm64
-# job when a real runner comes online.
-
-build-cpu-amd64:
-  extends: .docker_build
-  tags: [linux, amd64]
+# quip-miner: one native kaniko build per arch, each pushing an arch-suffixed
+# tag; the manifest job stitches them. Branch = --no-push (validate).
+image-quip-miner-amd64:
+  extends: .kaniko-image
+  tags: [docker, amd64]
+  variables:
+    TRIPLET: x86_64-linux-gnu
+    KANIKO_LIB_IGNORE: "--ignore-path=/lib"
   script:
-    # --ignore-path=/lib: paired with the /lib/x86_64-linux-gnu shim in the
-    # .docker_build before_script — see the comment there.
-    - /kaniko/executor
-        --context $CI_PROJECT_DIR
-        --dockerfile docker/Dockerfile.cpu
-        --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
-        --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-amd64
-        --ignore-path=/lib
+    - |
+      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
+      REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+      DEST="--destination $IMAGE:$REF-amd64"; [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR" \
+        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner" \
+        --build-arg "TARGETARCH=amd64" \
+        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
+        $KANIKO_LIB_IGNORE \
+        $DEST
 
-build-cpu-arm64:
-  stage: build
-  tags: [macos, arm64]
-  rules: !reference [.shared_image_rules, rules]
-  before_script:
-    # Isolated buildx builder per project. Create-if-missing is
-    # idempotent across job retries. docker-container driver is
-    # required for --push to push in one invocation.
-    - docker buildx inspect quip-ci >/dev/null 2>&1 || docker buildx create --name quip-ci --driver docker-container --bootstrap
-    - docker buildx use quip-ci
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+image-quip-miner-arm64:
+  extends: .kaniko-image
+  tags: [docker, arm64]
+  # The arm64 runner is a docker-executor on an Apple-Silicon Mac; a cold
+  # coordinator + D-Wave venv compile can run long, and kaniko's default
+  # compressed-caching OOMs that VM while snapshotting — disable it.
+  timeout: 180m
+  variables:
+    KANIKO_EXTRA: "--compressed-caching=false"
   script:
-    - >
-      docker buildx build
-      --platform linux/arm64
-      --push
-      -t "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-arm64"
-      -f docker/Dockerfile.cpu
-      --build-arg "QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA"
-      .
-  after_script:
-    - docker logout "$CI_REGISTRY" || true
+    - |
+      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
+      REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+      DEST="--destination $IMAGE:$REF-arm64"; [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR" \
+        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner" \
+        --build-arg "TARGETARCH=arm64" \
+        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
+        $KANIKO_EXTRA \
+        $DEST
 
-manifest-cpu:
+# Stitch the per-arch images into the consumer-facing multi-arch tag (+ :latest).
+# Tags only (needs the per-arch images pushed). manifest-tool substitutes ARCH.
+image-quip-miner-manifest:
   stage: build
   image:
-    name: mplatform/manifest-tool:alpine-v2.2.1
+    name: mplatform/manifest-tool:alpine
     entrypoint: [""]
-  tags: [linux, amd64]
-  needs:
-    - resolve-tags
-    - build-cpu-amd64
-    - build-cpu-arm64
-  rules: !reference [.shared_image_rules, rules]
-  script:
-    # Immutable SHA target, then one mutable target per MUTABLE_TAGS entry.
-    - |
-      for target in "$CI_COMMIT_SHA" $MUTABLE_TAGS; do
-        manifest-tool \
-          --username "$CI_REGISTRY_USER" \
-          --password "$CI_REGISTRY_PASSWORD" \
-          push from-args \
-          --platforms linux/amd64,linux/arm64 \
-          --template "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-ARCH" \
-          --target "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$target"
-      done
-
-build-cuda:
-  extends: .docker_build
-  tags: [linux, amd64]
-  needs:
-    - resolve-tags
-  script:
-    # Immutable SHA destination, then one --destination per MUTABLE_TAGS entry.
-    - |
-      DESTINATIONS="--destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA"
-      for tag in $MUTABLE_TAGS; do
-        DESTINATIONS="$DESTINATIONS --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$tag"
-      done
-      # --ignore-path=/lib: paired with the /lib/x86_64-linux-gnu shim in the
-      # .docker_build before_script — see the comment there.
-      /kaniko/executor \
-        --context $CI_PROJECT_DIR \
-        --dockerfile docker/Dockerfile.cuda \
-        --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA \
-        $DESTINATIONS \
-        --ignore-path=/lib
-
-# ---------------------------------------------------------------------------
-# PyInstaller native binaries
-# ---------------------------------------------------------------------------
-
-.pyinstaller_build:
-  stage: build
-  variables:
-    PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-  script:
-    - bash pyinstaller/build.sh
-  artifacts:
-    paths:
-      - dist/quip-miner-*
-    expire_in: 30 days
+  tags: [docker, amd64]
+  needs: [image-quip-miner-amd64, image-quip-miner-arm64]
   rules:
-    - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_TAG
+  script:
+    - |
+      IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"; REF="$CI_COMMIT_TAG"
+      manifest-tool \
+        --username "$CI_REGISTRY_USER" --password "$CI_REGISTRY_PASSWORD" \
+        push from-args \
+        --platforms linux/amd64,linux/arm64 \
+        --template "$IMAGE:$REF-ARCH" \
+        --target "$IMAGE:$REF" \
+        --tags "latest"
 
-package-macos-arm64:
-  extends: .pyinstaller_build
+# quip-miner-cuda: amd64-only (nvidia/cuda base), single kaniko job on finney.
+image-quip-miner-cuda:
+  extends: .kaniko-image
+  tags: [docker, amd64]
+  variables:
+    TRIPLET: x86_64-linux-gnu
+    KANIKO_LIB_IGNORE: "--ignore-path=/lib"
+  script:
+    - |
+      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda"
+      REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+      DEST="--destination $IMAGE:$REF"
+      [ -n "$CI_COMMIT_TAG" ] && DEST="$DEST --destination $IMAGE:latest"
+      [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR" \
+        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner-cuda" \
+        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
+        $KANIKO_LIB_IGNORE \
+        $DEST
+
+# ---------------------------------------------------------------------------
+# macOS native release (tags only)
+#
+# Docker cannot reach the Apple Silicon GPU, so Metal mining needs native
+# binaries. These jobs publish one tarball holding the coordinator plus every
+# darwin-arm64 miner, which quip-node-manager installs in Native mode.
+# ---------------------------------------------------------------------------
+
+# The group's Apple Silicon runners are shell executors, so `image:` does not
+# apply and the toolchain is installed per job. `--no-modify-path` keeps
+# rustup-init from appending `source $CARGO_HOME/env` to the runner's shell
+# profile: CARGO_HOME lives in the build directory, so that line breaks every
+# later login shell once the job is cleaned up.
+build-coordinator-darwin-arm64:
+  stage: build
   tags: [macos, arm64]
+  rules:
+    - if: $CI_COMMIT_TAG
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
   before_script:
-    - rm -rf .venv-arm64
-    - /opt/homebrew/bin/python3.13 -m venv .venv-arm64
-    - source .venv-arm64/bin/activate
-    - pip install -U pip setuptools wheel
-    - pip install pyinstaller
-    - pip install -e ".[metal]"
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
+    - source "$CARGO_HOME/env"
+    # The shell executor runs non-interactively and sources no login profile,
+    # so Homebrew's bin directory is not guaranteed to be on PATH. v0.3.0-rc7
+    # failed here with "brew: command not found" and took the whole binary
+    # release with it. Put brew on PATH from its known prefix, then install
+    # protobuf only when protoc is still missing.
+    - |
+      for prefix in /opt/homebrew /usr/local; do
+        if [ -x "$prefix/bin/brew" ]; then
+          eval "$("$prefix/bin/brew" shellenv)"
+          break
+        fi
+      done
+      if ! command -v protoc >/dev/null 2>&1; then
+        if ! command -v brew >/dev/null 2>&1; then
+          echo "protoc is missing and no brew was found under /opt/homebrew or /usr/local" >&2
+          echo "install protobuf on this runner, or put brew on the runner PATH" >&2
+          exit 1
+        fi
+        brew install protobuf
+      fi
+      protoc --version
+  script:
+    - cargo build --release -p quip-coordinator
+    - mkdir -p dist
+    - cp target/release/quip-coordinator dist/quip-coordinator-darwin-arm64
+    # The compiled-in version must match the tag. v0.3.0-rc3 shipped a binary
+    # reporting 0.3.0, which sorts as newer than every rc tag, so quip-node-
+    # manager saw the install as ahead of the release and stopped offering
+    # updates. Fail the release rather than publish that skew again.
+    - built=$(./dist/quip-coordinator-darwin-arm64 --version | awk '{print $2}')
+    - |
+      if [ "$built" != "${CI_COMMIT_TAG#v}" ]; then
+        echo "version skew: binary reports '$built', tag is '${CI_COMMIT_TAG#v}'" >&2
+        echo "bump version in crates/quip-coordinator/Cargo.toml to match" >&2
+        exit 1
+      fi
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
 
-# ---------------------------------------------------------------------------
-# Release (tags only)
-# ---------------------------------------------------------------------------
+# One macOS artifact: the coordinator plus every darwin-arm64 miner binary,
+# each stored under the bare name the config's `binary` key names. The
+# coordinator spawns miners with a PATH lookup, so an installer either puts
+# this directory on PATH or writes absolute paths into the config; quip-node-
+# manager does the latter. Miner versions resolve to each repo's own latest
+# release at bundle time; this tarball then pins them, and MANIFEST records
+# which release each binary came from.
+bundle-darwin-arm64:
+  stage: build
+  image: curlimages/curl:latest
+  tags: [linux, amd64]
+  rules:
+    - if: $CI_COMMIT_TAG
+  needs: [build-coordinator-darwin-arm64]
+  before_script: []
+  script:
+    - |
+      set -eu
+      API="https://gitlab.com/api/v4"
+      STAGE=bundle/quip-miner-darwin-arm64
+      mkdir -p "$STAGE"
+      cp dist/quip-coordinator-darwin-arm64 "$STAGE/quip-coordinator"
 
+      # repo:binary pairs pulled as <binary>-darwin-arm64. Each repo resolves
+      # to its own latest release, so dwave being ahead of the others is fine.
+      MINERS="quip-miner-cpu:quip-cpu-sa quip-miner-cpu:quip-cpu-gibbs quip-miner-metal:quip-metal-sa quip-miner-metal:quip-metal-gibbs quip-miner-dwave:quip-dwave-qa"
+
+      for pair in $MINERS; do
+        repo="${pair%%:*}"
+        name="${pair##*:}"
+        proj="quip.network%2F${repo}"
+        tag=$(curl --fail --silent --show-error \
+          "${API}/projects/${proj}/releases?per_page=1" \
+          | sed -n 's/.*"tag_name":"\([^"]*\)".*/\1/p' | head -n 1)
+        if [ -z "$tag" ]; then
+          echo "no release found for ${repo}" >&2
+          exit 1
+        fi
+        echo "bundling ${repo} ${tag} ${name}-darwin-arm64"
+        curl --fail --location --silent --show-error \
+          --output "${STAGE}/${name}" \
+          "${API}/projects/${proj}/packages/generic/${repo}/${tag}/${name}-darwin-arm64"
+        chmod +x "${STAGE}/${name}"
+        echo "${repo} ${tag}" >> "${STAGE}/MANIFEST"
+      done
+
+      # One line per repo, not per binary.
+      sort -u "${STAGE}/MANIFEST" -o "${STAGE}/MANIFEST"
+      echo "quip-miner ${CI_COMMIT_TAG}" >> "${STAGE}/MANIFEST"
+      tar -czf quip-miner-darwin-arm64.tar.gz -C bundle quip-miner-darwin-arm64
+      ls -l quip-miner-darwin-arm64.tar.gz
+      cat "${STAGE}/MANIFEST"
+    - |
+      curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --upload-file quip-miner-darwin-arm64.tar.gz \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}/quip-miner-darwin-arm64.tar.gz"
+  artifacts:
+    paths: [quip-miner-darwin-arm64.tar.gz]
+    expire_in: 1 week
+
+# quip-miner tags previously produced container images and nothing else, so no
+# Release object existed for v0.3.0-rc1 or -rc2. quip-node-manager resolves the
+# newest version from Releases, so this job is required, not cosmetic.
 release-binaries:
   stage: release
-  image: registry.gitlab.com/gitlab-org/cli:latest
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
   tags: [linux, amd64]
-  needs:
-    - package-macos-arm64
   rules:
     - if: $CI_COMMIT_TAG
+  needs: [bundle-darwin-arm64]
+  before_script: []
   script:
-    - echo "Creating release $CI_COMMIT_TAG"
-  release:
-    tag_name: $CI_COMMIT_TAG
-    description: "Release $CI_COMMIT_TAG"
-    assets:
-      links:
-        - name: quip-miner-macos-arm64
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-miner-macos-arm64?job=package-macos-arm64"
-          filepath: /quip-miner-macos-arm64
+    - |
+      base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
+      release-cli create --name "quip-miner ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
+        --assets-link "{\"name\":\"quip-miner-darwin-arm64.tar.gz\",\"url\":\"${base}/quip-miner-darwin-arm64.tar.gz\"}"

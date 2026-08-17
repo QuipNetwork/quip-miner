@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# quip-protocol-py is a PyO3 cdylib built by maturin (needs a Python interpreter
+# to link/run). It stays a workspace member so it shares [workspace.dependencies],
+# but is left out of default-members so a bare `cargo build`/`cargo test` skips it.
+# quip-miner-core is the shared sampler crate the standalone miner repos git-dep;
+# it lives here as the source of truth (miners: quip.network/quip-miner-{cpu,cuda,metal}).
+default-members = [
+    "crates/quip-proto",
+    "crates/quip-protocol",
+    "crates/quip-miner-core",
+    "crates/quip-miner-exec",
+    "crates/quip-coordinator",
+    "crates/quip-mock-coordinator",
+    "crates/quip-mock-miner",
+]
+
+[workspace.lints.rust]
+missing-docs          = "warn"
+nonstandard-style     = "warn"
+redundant-lifetimes   = "warn"
+rust-2018-idioms      = "deny"
+unreachable-pub       = "warn"
+unsafe-code           = "deny"
+unused-extern-crates  = "warn"
+unused-imports        = "warn"
+unused-must-use       = "warn"
+unused-qualifications = "warn"
+unused-results        = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention
+unwrap-used           = "deny"
+expect-used           = "warn"
+panic                 = "deny"
+panic-in-result-fn    = "deny"
+unimplemented         = "deny"
+indexing-slicing      = "warn"
+# No cheating
+allow-attributes      = "deny"
+# Code hygiene
+dbg-macro             = "warn"
+todo                  = "deny"
+print-stdout          = "deny"
+print-stderr          = "deny"
+redundant-clone       = "warn"
+uninlined-format-args = "warn"
+manual-string-new     = "warn"
+use-self              = "warn"
+# Safety
+await-holding-lock    = "deny"
+large-futures         = "deny"
+exit                  = "deny"
+mem-forget            = "deny"
+# Pedantic relaxations (too noisy)
+module-name-repetitions = "allow"
+similar-names           = "allow"
+
+[workspace.lints.rustdoc]
+all = "warn"
+
+[workspace.dependencies]
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
+tonic-build = "0.12"

@@ -1,89 +1,32 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
 
+# The v0.2 Python miner stack was removed in the v0.3 cutover: the miners live in
+# their own repos (quip.network/quip-miner-*) and the coordinator + chain
+# integration are Rust (crates/). This is the v0.3 SDK: PyO3 consensus primitives
+# (crates/quip-protocol-py -> quip_proto._core) plus the generated gRPC stubs
+# (python/quip/v1). The Rust is the source of truth; Python cannot drift from it.
 [project]
-name = "quip-protocol"
-version = "0.2.1"
-description = "Quantum mining stack (Substrate-integrated successor to the legacy quip-protocol P2P node)"
+name = "quip_proto"
+version = "0.3.0"
+description = "quip.network v0.3 SDK: PyO3 consensus primitives + generated gRPC stubs"
 readme = "README.md"
-requires-python = ">=3.10"
-# Base dependencies required for all modes
-dependencies = [
-    "dwave-ocean-sdk>=9.0.0,<10",
-    "numpy>=1.24.0",
-    "python-dotenv>=1.0.0",
-    "aiohttp>=3.9.0",
-    "click>=8.1.7",
-    "blake3>=1.0.5",
-    "substrate-interface>=1.7.4",
-    "scalecodec>=1.2",
-    # Phase 7: hybrid sr25519+ML-DSA-44 signing. `dilithium-py` is pure
-    # Python (deterministic seed-based keygen for ML-DSA-44). The legacy
-    # `oqs-python` binding to liboqs is faster but doesn't expose seeded
-    # keygen and isn't on PyPI under a stable name — keep dilithium-py as
-    # the canonical path until ML-DSA signing rate becomes a bottleneck.
-    "dilithium-py>=1.0",
-    # tomllib joined stdlib in 3.11 — fall back to the upstream package on 3.10.
-    "tomli>=2.0.1; python_version < '3.11'",
-]
+requires-python = ">=3.11"
+dependencies = ["grpcio>=1.82.1", "protobuf>=7.35.1,<8"]
 
 [project.optional-dependencies]
-# CPU mode - lightweight, no GPU dependencies
-cpu = []
+dev = ["pytest>=8.0,<9", "pytest-asyncio>=0.23.0", "numpy>=1.24", "blake3>=1.0.5"]
 
-# Performance optimizations for networking (optional)
-fast = [
-    "pyzmq>=25.0.0",
-    "uvloop>=0.19.0; sys_platform != 'win32'",
-]
-
-# CUDA mode - NVIDIA GPU support (matches PyTorch CUDA 12)
-cuda = [
-    "cupy-cuda12x>=13.0.0",
-    "nvidia-ml-py>=12.0.0",
-]
-
-# Metal mode - Apple Silicon GPU support
-metal = [
-    "pyobjc-framework-Metal",
-    "pyobjc-framework-MetalPerformanceShaders",
-]
-
-# Full installation with all GPU backends + visualization
-full = [
-    "torch>=2.0.0",
-    "torchvision>=0.15.0",
-    "torchaudio>=2.0.0",
-    "cupy-cuda12x>=13.0.0; sys_platform == 'linux' or sys_platform == 'win32'",
-    "nvidia-ml-py>=12.0.0; sys_platform == 'linux' or sys_platform == 'win32'",
-    "pyobjc-framework-Metal; sys_platform == 'darwin'",
-    "pyobjc-framework-MetalPerformanceShaders; sys_platform == 'darwin'",
-    "matplotlib>=3.6.0",
-    "pandas>=2.0.0",
-    "seaborn>=0.12.0",
-    "acme>=2.0.0",
-    "josepy>=1.13.0",
-]
-
-dev = [
-    "pytest>=8.0,<9",
-    "pytest-asyncio>=0.23.0",
-]
-
-[project.scripts]
-quip-miner = "quip_cli:miner_main"
-
-[tool.setuptools]
-py-modules = ["quip_cli"]
-
-[tool.setuptools.packages.find]
-include = ["shared*", "substrate*", "dwave_topologies*", "CPU*", "GPU*", "QPU*"]
-
-[tool.setuptools.package-data]
-dwave_topologies = ["topologies/*.json.gz", "embeddings/*.json.gz"]
-GPU = ["*.cu", "*.metal"]
-"*" = ["genesis_block.json"]
+[tool.maturin]
+manifest-path = "crates/quip-protocol-py/Cargo.toml"
+python-source = "python"
+module-name = "quip_proto._core"
+features = ["pyo3/extension-module"]
+# maturin auto-bundles the package matching module-name (quip_proto). The
+# generated gRPC stubs live in the sibling `quip` package (python/quip), which
+# quip_proto/__init__.py imports; include it so the wheel is self-contained.
+include = [{ path = "quip/**/*.py", format = "wheel" }]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

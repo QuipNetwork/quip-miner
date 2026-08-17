@@ -1,0 +1,102 @@
+# quip-miner-cuda (v0.3) — coordinator + CPU + D-Wave + CUDA miners (amd64).
+# Same builder as the CPU image; runtime is an NVIDIA CUDA base so the CUDA
+# miner's NVRTC/driver calls resolve (cudarc dynamic-loads libcuda at runtime;
+# run with `--gpus all`). CPU + CUDA miner binaries are downloaded from their
+# releases; the coordinator is built from source; D-Wave is a Python venv.
+
+# --- builder: quip-coordinator (Rust only; Python venv is built on the runtime
+# base so the interpreter path matches — venvs are not relocatable across distros) ---
+FROM python:3.12-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        protobuf-compiler build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
+COPY proto/ proto/
+RUN cargo build --release -p quip-coordinator
+
+# --- runtime (NVIDIA CUDA + Python) ---
+# Create the D-Wave venv here (same base as runtime) so /opt/venv/bin/python
+# resolves to this image's /usr/bin/python3, not the bookworm builder's path.
+#
+# The CUDA major here must match the cudarc `cuda-12090` feature the miner is
+# built with: the miner dlopens `libnvrtc.so.12`. 12.9 is a deployment
+# decision — NVRTC 12.9 targets sm_50..sm_121, the widest range available
+# (see quip-miner-cuda's Cargo.toml). `-base` (not `-runtime`) is enough:
+# cudarc dynamic-loads only libcuda (injected by the NVIDIA container
+# runtime) and libnvrtc (installed below); -runtime's cudart/cuBLAS/NCCL
+# would never be opened.
+FROM nvidia/cuda:12.9.1-base-ubuntu24.04
+
+LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
+LABEL description="quip-miner-cuda v0.3 — coordinator + CPU + D-Wave + CUDA"
+
+ARG QUIP_DOCKER_IMAGE=""
+ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE} \
+    DEBIAN_FRONTEND=noninteractive \
+    PATH="/opt/venv/bin:/usr/local/bin:${PATH}" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+
+# cuda-nvrtc-12-9 gives the CUDA miner libnvrtc.so.12. The miner compiles its
+# kernels with NVRTC at startup, and the NVIDIA container runtime injects only
+# driver libraries (libcuda, libnvidia-ml, libnvidia-ptxjitcompiler), never
+# toolkit ones — so without this the miner panics on first GPU use.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tini gosu curl ca-certificates python3 python3-venv python3-pip \
+        cuda-nvrtc-12-9 \
+    && rm -rf /var/lib/apt/lists/*
+# The nvrtc package ships no ld.so.conf.d entry (that comes with the full
+# toolkit), so prove the loader reaches it via LD_LIBRARY_PATH. Same dlopen
+# path the miner takes: a base-image bump that loses nvrtc fails here, not
+# as a runtime panic.
+RUN python3 -c "import ctypes; ctypes.CDLL('libnvrtc.so.12')"
+# ubuntu:24.04 (the nvidia/cuda base) ships a default ubuntu:ubuntu at 1000:1000;
+# drop it so quip can own UID/GID 1000, consistent with the non-CUDA image.
+RUN userdel --remove ubuntu 2>/dev/null || true; \
+    groupdel ubuntu 2>/dev/null || true; \
+    groupadd --system --gid 1000 quip \
+    && useradd --system --uid 1000 --gid 1000 --home /home/quip \
+       --create-home --shell /usr/sbin/nologin quip
+
+COPY --from=builder /src/target/release/quip-coordinator /usr/local/bin/quip-coordinator
+
+# Copied before the venv RUN below, which reads the dwave pin out of it.
+COPY crates/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
+
+# Venv on the runtime interpreter (ubuntu24.04 /usr/bin/python3), not bookworm.
+#
+# The install needs a build toolchain the runtime base does not carry: `git`
+# because the miner comes from a `git+https://` URL, and cargo/cc/protoc because
+# `quip_proto` has no wheel yet, so pip builds it through maturin. Everything
+# build-only is installed, used and removed inside this single RUN so none of it
+# reaches the published image — a later `rm` would not shrink an earlier layer.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential protobuf-compiler \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+       | sh -s -- -y --profile minimal --no-modify-path \
+    && python3 -m venv /opt/venv \
+    && DWAVE_TAG="$(bash /usr/local/bin/fetch-miners.sh --print-tag dwave)" \
+    && PATH="/root/.cargo/bin:${PATH}" /opt/venv/bin/pip install --no-cache-dir \
+       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${DWAVE_TAG}" \
+    && apt-get purge -y git build-essential protobuf-compiler \
+    && apt-get autoremove -y --purge \
+    && rm -rf /root/.cargo /root/.rustup /root/.cache /var/lib/apt/lists/*
+
+# Released CPU + CUDA miner binaries (amd64 only for this image), via the shared
+# fetch-miners.sh — single source of truth. MINER_SET=cpu-cuda requires the cuda
+# assets (fails the build if missing), unlike the optional cuda in `auto` mode.
+RUN TARGETARCH=amd64 MINER_SET=cpu-cuda \
+    bash /usr/local/bin/fetch-miners.sh /usr/local/bin
+
+WORKDIR /app
+COPY docker/config.toml /app/config.toml
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+VOLUME ["/data"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

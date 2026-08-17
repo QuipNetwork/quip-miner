@@ -1,0 +1,85 @@
+[package]
+name = "quip-coordinator"
+version = "0.3.0"
+edition = "2021"
+
+[[bin]]
+name = "quip-coordinator"
+path = "src/main.rs"
+
+[lib]
+name = "quip_coordinator"
+path = "src/lib.rs"
+
+[dependencies]
+rayon = "1.10"
+bytemuck = "1"
+quip-proto = { path = "../quip-proto" }
+quip-protocol = { path = "../quip-protocol" }
+quantum-validation = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", branch = "main", version = ">=0.2.2" }
+quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", branch = "main", version = ">=0.2.2" }
+parity-scale-codec = { version = "3.7.5", default-features = false, features = ["derive", "std"] }
+sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", branch = "v0.2", default-features = false, features = ["std"] }
+blake2 = "0.10"
+twox-hash = "1.6"
+jsonrpsee = { version = "0.24", features = [
+    "http-client",
+    "ws-client",
+    "client-ws-transport-tls",
+    "macros",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Faucet auto-funding is a plain HTTPS POST with a JSON body. jsonrpsee only
+# speaks JSON-RPC and hyper has no TLS layer wired here, so there is no existing
+# client to reuse. rustls-tls keeps OpenSSL out of the slim runtime image and
+# reuses the rustls already in Cargo.lock.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "process",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+    "fs",
+] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
+toml = "0.8"
+blake3 = "1"
+getrandom = "0.2"
+async-trait = "0.1"
+# Stream type for RPC subscriptions. The transport trait returns a boxed
+# stream so it stays object safe across native and WebAssembly builds.
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+quantum-validation = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", branch = "main", version = ">=0.2.2" }
+quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", branch = "main", version = ">=0.2.2" }
+quip-protocol = { path = "../quip-protocol" }
+quip-proto = { path = "../quip-proto" }
+sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", branch = "v0.2", default-features = false, features = ["std"] }
+parity-scale-codec = { version = "3.7.5", default-features = false, features = ["derive", "std"] }
+jsonrpsee = { version = "0.24", features = ["ws-client", "client-ws-transport-tls", "macros"] }
+blake2 = "0.10"
+twox-hash = "1.6"
+rand = "0.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

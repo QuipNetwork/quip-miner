@@ -1,0 +1,51 @@
+# Coordinator config: miner registry + launch plan.
+#
+# Each backend section becomes a spawned miner. `binary` selects the executable
+# (and thus the algorithm variant: the `-sa` default vs the `-gibbs` chromatic
+# variant); omit it to use the default. Binaries are fetched per-host by
+# tools/fetch-miners.sh from the standalone miner repos and expected on PATH or
+# by absolute path here. Unknown keys pass through to the miner as backend_toml.
+
+[miner]
+validators = ["ws://127.0.0.1:9944"]
+signer_key = "//Alice"
+# Host a peer uses to reach this node from outside the host. Required.
+# An empty string is not a host.
+public_host = "203.0.113.10"
+# Port a peer uses to reach this node from outside the host. Required.
+# This is the public front door, not the validator peer port and not
+# the dashboard port. Zero is not a valid port.
+public_port = 20050
+
+# Consecutive failed submissions of one proof, inside one quantum block, before
+# the coordinator stops retrying it and reports loudly. Submit outcome comes
+# from chain state, which reports that a proof did not land but not why, so this
+# bound is what turns a permanently rejected proof into a visible stop rather
+# than an endless retry.
+max_submit_attempts = 5
+
+# CPU miner. Default binary: quip-cpu-sa. Use the chromatic Gibbs variant:
+[cpu]
+binary = "quip-cpu-sa"        # or "quip-cpu-gibbs"
+queue_depth = 3
+idle_timeout_s = 300
+# Core budget for the sampler. Absent, the miner uses host parallelism.
+# A larger value is clamped to the host. Zero or a negative value is
+# refused at handshake. For SA this is the stream worker count. For
+# Gibbs the miner divides it by --gibbs-workers so the product stays
+# at or below this budget.
+# num_cpus = 6
+
+# One CUDA miner per device (amd64 only). Default binary: quip-cuda-sa.
+[cuda.0]
+device_index = 0
+binary = "quip-cuda-sa"       # or "quip-cuda-gibbs"
+
+# Apple Silicon Metal miner. Default binary: quip-metal-sa.
+# [metal]
+# binary = "quip-metal-sa"    # or "quip-metal-gibbs"
+
+# D-Wave QPU miner (pip package, entry point quip-dwave-qa). No sa/gibbs split.
+[dwave]
+binary = "quip-dwave-qa"
+daily_budget = "30s"

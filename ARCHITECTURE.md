@@ -1,507 +1,189 @@
-# QUIP Protocol Architecture
+# Architecture
 
-This document describes the runtime architecture of `quip-network-node` as
-of v0.2 (post Plans 1–4 and the mempool-priority cutover). It covers the
-four pillars the system runs on:
+This repository is the v0.3 mining stack for the
+[quip-protocol-rs](https://gitlab.com/quip.network/quip-protocol-rs) chain. It
+holds two things: a coordinator that follows the chain, stages Ising problems,
+and submits proofs; and a shared Rust harness that miner binaries build on. The
+miners themselves live in their own repositories. Consensus rules live in the
+chain pallet. This document maps how the pieces fit and names the seams that
+keep them apart.
 
-1. **The scheduler stack** (one `WorkScheduler` over all handles: PoW as
-   idle filler, mempool jobs as priority)
-2. **The miner layer** (CPU / CUDA / Metal / QPU)
-3. **The validator connection pool** (hot-active swap, per-URL child process)
-4. **The chain event manager** (adaptive polling, watchdog; shared by the
-   PoW controller and the mempool producer)
+For task-level detail, read the three guides this document ties together:
+`COORDINATOR.md` (the coordinator internals), `MINER.md` (the harness), and
+`NEWMINER.md` (adding a backend). `docs/VERSIONING.md` covers release tags.
 
-Everything below describes code that exists in this tree (v0.2, post
-mempool-priority cutover). Items that exist but are vestigial are
-flagged in §9 Cleanup candidates.
+## Crate layout
 
----
+The workspace is a strict dependency DAG under `crates/`. Lower crates never
+import higher ones.
 
-## 1. Process topology
+| Crate | Role | Depends on |
+|-------|------|-----------|
+| `quip-proto` | Generated protocol types and gRPC service (from `proto/`) | — |
+| `quip-protocol` | Consensus primitives: `wire`, `session`, `scoring`, `derive`, `chacha8` | `quip-proto` |
+| `quip-miner-core` | Shared miner harness: `Sampler` trait, session client, adaptive params | `quip-proto`, `quip-protocol` |
+| `quip-miner-exec` | Generic external-solver miner: JSON model + exec over the session protocol | `quip-miner-core`, `quip-proto` |
+| `quip-coordinator` | The `quip-coordinator` binary: chain access, feeder, router, supervisor | `quip-proto`, `quip-protocol` |
+| `quip-protocol-py` | PyO3 extension exposing consensus primitives to Python (`quip_proto._core`) | `quip-protocol` |
+| `quip-mock-coordinator` | Scripted coordinator test double (package `ln`) | `quip-proto`, `quip-protocol` |
+| `quip-mock-miner` | Miner test double | `quip-proto`, `quip-protocol` |
 
-A running miner node is one controller process plus its children:
+`quip-coordinator` doesn't depend on `quip-miner-core`. The two sides share
+nothing but the wire protocol (`quip-proto`) and the codec and session
+primitives (`quip-protocol`). This is the central decision of the v0.3 design.
+A miner is any process that speaks the protocol. Miners ship from separate
+repositories, and the D-Wave miner ships from Python over the PyO3 build.
 
-```
-┌─ controller process (asyncio) ─────────────────────────────────┐
-│   quip_cli._run_concurrent_miner()                             │
-│     ├─ SubstrateMinerController   (the PoW brain)              │
-│     ├─ WorkScheduler              (owns ALL miner handles)     │
-│     ├─ MempoolStack               (only when the per-section   │
-│     │                              mempool key resolves on)    │
-│     ├─ ValidatorPool                                           │
-│     │     └─ one ValidatorHandle  (active URL only)            │
-│     └─ ChainEventManager          (shared: PoW + mempool)      │
-└────────────────────────────────────────────────────────────────┘
-        │ mp.Process per miner backend         │ mp.Process per active URL
-        ▼                                       ▼
-┌─ MinerHandle child (×N) ─────┐      ┌─ validator_main child ──┐
-│   miner_worker_main()        │      │  SubstrateClient(url)   │
-│   owns one BaseMiner + one   │      │  asyncio loop           │
-│   stream-driver subprocess   │      │  serves req_q → resp_q  │
-│   (sampling; see             │      └─────────────────────────┘
-│   docs/miner-architecture.md)│
-│   QPU adds a D-Wave submitter│
-│   child (QPU/dwave_submitter)│
-└──────────────────────────────┘
-        │ resp queue (one WorkScheduler drainer per handle)
-        ▼
-                  controller main loop
+## The five seams
 
-┌─ telemetry sibling (default-on) ─────────────┐
-│  substrate/telemetry_process.telemetry_main   │
-│  aiohttp app, full /api/v1 surface            │
-│  reads ${runtime_dir}/<kind> stats snapshot   │
-└───────────────────────────────────────────────┘
-```
+The architecture rests on five boundaries. The source references below back
+each one.
 
-Cancellation, errors, and lifecycle:
+### 1. One blockchain touchpoint
 
-- Every miner child registers a SIGTERM handler for hardware cleanup.
-- Controller-side long-lived tasks (event manager, fire timer, stats
-  snapshot writer) are wrapped in
-  `supervise(coro, name, on_failure=...)`. An unhandled exception
-  triggers controller shutdown — silent task death is the original
-  bug class this design eliminates.
-- WorkScheduler tasks (per-handle drainers, job pump) fail loud on
-  their own: a crashed drainer or a dead worker escalates to scheduler
-  shutdown plus `on_fatal` → pow controller shutdown.
-- MempoolStack loops (feed / submit / claim) are containment-wrapped:
-  a crash **parks** the mempool side (producer, feed loop, job queue)
-  and pow mining continues — mempool failure never takes pow down.
-- The validator child is killed and respawned on connection-class
-  errors (hot-active swap, §4).
+Every chain interaction sits in `crates/quip-coordinator/src/chain/` behind the
+`ChainClient` trait (`chain/mod.rs:43`). The trait has three methods:
+`fetch_mining_snapshot`, `fetch_mempool_orders`, and `submit_proof`. Two types
+provide it: `RealChainClient` over subxt and JSON-RPC (`chain/real.rs:103`)
+and `FakeChain` for tests (`chain/fake.rs:44`). `subxt` appears in one source
+file, `chain/real.rs`. The module owns everything downstream of the seam:
+extrinsic building, SCALE types, proof encoding, snapshot decoding, mempool
+decoding, and submission. Nothing outside `chain/` talks to the node.
 
----
+### 2. Feeder and per-miner dispatch
 
-## 2. The scheduler stack
+Job staging runs through three files that form one control path. `producer/`
+builds jobs: `pow.rs` derives the proof-of-work job from the chain snapshot,
+`mempool.rs` converts fetched `JobOrder`s into wire `Job`s. `runtime::feeder_loop`
+(`runtime.rs:100`) follows the chain head, bumps a generation on each new
+`last_proof_block_hash`, and stages jobs per miner using an adaptive window read
+off the router's drain rate (`runtime.rs:150`). `router.rs` holds the
+capability-indexed staged queues and the dispatch credits. The target design
+named a single module here; the code splits it into producer, feeder,
+and router. The split is deliberate: the router is a reusable queue primitive,
+and the feeder is the policy on top of it.
 
-### 2.1 PoW brain: `SubstrateMinerController` (`substrate/miner_controller.py`)
+### 3. Spawn, kill, and the protocol kill line
 
-Entry: `run()` → `_main_loop()`. Requires an attached `WorkScheduler`
-(`attach_scheduler`, two-phase init) — the scheduler owns every handle's
-drainer and all dispatch operations; the controller keeps the pow brain
-(submit_proof, receipt classification, anticipatory fire,
-verify-recorded, decay schedules, closed-work-keys).
+`supervise_miner` (`supervisor.rs:219`) starts each miner: it spawns the binary
+with a fresh per-spawn session token and applies the exit-code restart policy
+(`restart_policy`, `supervisor.rs:25`). Clean exits respawn on demand,
+operator and environment errors (64, 69, 77) never respawn, and crashes back off
+by `2^consecutive` within a failure budget. `shutdown_all` (`supervisor.rs:176`)
+ends the run: it sends an in-band `Shutdown`, waits the grace period, then kills
+any survivor. The protocol kill line is the `Shutdown` and `Cancel` control
+messages. The coordinator emits them (`session.rs:391` `send_cancel`,
+`session.rs:896` `shutdown_msg`); the harness honors them and drains in flight
+work (`quip-miner-core/src/session.rs:241` for `Shutdown`, `:233` for `Cancel`).
 
-**Wait set** (`_main_loop`, ~`miner_controller.py:857`):
-- `_result_queue.get()` — pow `WorkResult`s, queue-put by the
-  scheduler's `on_pow_result` callback (`enqueue_pow_result`)
-- `_shutdown_event.wait()` — graceful shutdown
+### 4. The generic miner harness
 
-Long-lived supervised tasks:
+`quip-miner-core` is the standard interface every miner builds on. A backend
+supplies a `Sampler` (the `sample` method is required; streaming, throttling,
+and config hooks have defaults). The crate's `run` entry point handles the
+`--capabilities` and `--check` handshakes and drives `run_session`, the gRPC
+client loop. The crate is library-only, with no binary of its own.
 
-| Task | Source | Purpose |
-|---|---|---|
-| `ChainEventManager.run()` | `miner_controller.py:756` | Poll snapshot, fire `new_head` to `on_new_head` + `head_subscribers` |
-| Fire-timer loop | `miner_controller.py:764` | Anticipatory decay-target fire authority |
-| Stats snapshot writer | `miner_controller.py:674` | Write the per-kind stats snapshot every 1s |
-| Telemetry sibling (`mp.Process`) | `miner_controller.py:800` | Default-on; skipped when `QUIP_TELEMETRY_EXTERNAL=1` |
+The CPU, CUDA, and Metal miners are native binaries in their own repositories
+that call `run`. The D-Wave miner is Python, built on the PyO3 primitives in
+`quip-protocol-py`. For a backend that's a standalone executable rather than a
+Rust `Sampler`, `quip-miner-exec` is the plug-in point: it serializes each job
+to a JSON model, execs a configured external solver (by file or stdin), and
+parses the solver's JSON solutions back over the same session protocol. One part
+of the target design still differs from the source:
 
-**`on_new_head(ctx)`** (`miner_controller.py:910`) — the event-driven
-work dispatcher. Guards in order:
+- The random and file job sources (the driver for benchmarking without a chain)
+  live coordinator-side under `drive/` (`drive/random_source.rs`,
+  `drive/list_source.rs`, `drive/harness.rs`), reached through the `drive`
+  subcommand. They generate jobs, so the coordinator is their natural home, and
+  the miner stays a pure solver.
 
-1. `None` snapshot → bump `stats.none_snapshots_seen`, return
-2. Chain `DefaultTopology` changed → set `rebind_requested`, shut down
-   gracefully (the CLI rebuilds the stack against the new topology)
-3. Threshold changed → `handle.set_live_threshold_milli(...)` on each handle
-4. Zero seed with `_highest_handled_block > 0` → drop (transient)
-5. Work key in `_closed_work_keys` → return (already won)
-6. Same key with any handle busy → return (same-key skip)
-7. Attach the round-constant decay schedule, resolve the chain-global
-   solution number, then `scheduler.dispatch_pow(ctx, ...)` — the
-   scheduler's atomic preempt (cancel → mandatory done sentinel →
-   dispatch), excluding handles owned by an active mempool job
+### 5. Miners are isolated solvers
 
-**`_handle_result(envelope)`** (`miner_controller.py:1272`):
+`quip-miner-core` carries no chain or consensus logic. Its references to the
+chain are doc comments about energy and deadline semantics (`job.rs:31`,
+`job.rs:247`, `ising.rs:39`, `csr.rs:6`). From `quip-protocol` it imports the
+wire codec (`encode_spins`, `decode_i32_le`) and the session handshake
+(`build_hello`, `ExitCode`, `SessionConfig`), nothing else. A miner can't reach
+the node, directly or transitively. It receives an Ising problem, samples it,
+and returns spins with energies.
 
-- Duplicate-drop if work key already closed (sibling won)
-- Stale-drop if envelope's work key ≠ current
-- Encode proof → `submit_proof()` (sign on the parent `build_client`,
-  submit through the swap-aware `pool_client`, §7)
-- Classify receipt: `ok` (verify recorded on-chain, mark closed,
-  `scheduler.cancel_pow_siblings(...)`) / `stale` (drop) / `fatal`
-  (shutdown)
+## Job lifecycle
 
-### 2.2 `WorkScheduler` (`substrate/work_scheduler.py`)
+A proof-of-work job flows through the system in one pass:
 
-ONE scheduler owns ALL of the process's miner handles: one drainer task
-per handle (a handle's resp queue admits exactly one consumer), the
-preempt lock, and all dispatch bookkeeping. Every handle mines PoW
-continuously; mempool jobs are the priority source. It has no chain
-dependencies — every collaborator is a duck-typed handle or callback.
+1. `feeder_loop` calls `ChainClient::fetch_mining_snapshot` and reads the
+   difficulty target, topology, and the last proof block hash.
+2. On a new block hash, the feeder bumps the generation and cancels the prior
+   one, so miners stop working on stale problems.
+3. `producer::derive_pow_job` builds the job from the snapshot. Mempool orders
+   take a parallel path through `job_order_to_job` and carry `generation = 0`,
+   since a chain reorg doesn't cancel a user-submitted order.
+4. The feeder stages jobs on each miner's queue up to the adaptive depth. The
+   router dispatches them and tracks a dispatch-to-completion credit.
+5. The miner samples and streams results back over the session.
+6. `validate.rs` scores the returned set. A solution is energy-valid when its
+   milli-energy is strictly below the gate floor. The coordinator accepts the
+   set when `n_valid >= min_solutions` and `diversity_milli >= min_diversity_milli`
+   (`validate.rs:143`).
+7. On an accepted set, `chain/submit.rs` encodes and submits the
+   `QuantumPow.submit_proof` extrinsic through `ChainClient`.
 
-The core protocol is the atomic preemption in `preempt_and_dispatch`:
+Jobs carry a `job_id`, a `generation`, an optional `deadline_ms`, the Ising
+problem (edge list or CSR, plus little-endian `h` and `j` fields), and a
+`provenance` marking proof-of-work versus mempool with the source `order_id`.
+The identifiers that matter are `job_id`, the mempool `order_id`, and the
+`generation` counter that gates cancellation.
 
-```
-cancel() → MANDATORY await of the victim's work_item_done sentinel → dispatch
-```
+## Parameters and where they live
 
-`MinerHandle.cancel()` only sets the shared stop_event and the NEXT
-`mine_work_item()` clears it, so dispatching before the worker acks
-*wipes the cancel* (priority inversion: the old item keeps mining and
-the new one queues behind it). There is no timeout-then-dispatch-anyway;
-a handle that never acks is a dead worker, which drainer death
-detection escalates (unblocking any pending sentinel wait).
+The harness owns the adaptive-parameter mechanism; the layer that knows the
+concrete values supplies them.
 
-Dispatch policy:
+`quip-miner-core/src/adapt.rs` holds the ground-state-energy model that turns a
+difficulty target into `num_reads` and `num_sweeps`. Its constants are
+`C_EASY = 0.7`, `C_HARD = 0.75`, `ALPHA = 0.88`, and a default field set
+`DEFAULT_H = [-1, 0, 1]`. `conformance/golden_adapt.json` pins cross-language
+parity.
 
-- A mempool job fans out to ALL eligible handles — idle ones
-  immediately, busy non-QPU ones via the preemption protocol. First
-  `mine_result` wins; siblings are cancelled; terminal accounting
-  compares done handles against the fanned set only.
-- QPU handles are **never preempted by jobs** (idle-only job dispatch):
-  the split D-Wave submitter has no ctl_q, so a preemption would strand
-  already-paid samples. Pow work-key-change broadcasts do preempt busy
-  QPU handles — their in-flight pow work is dead either way.
-- A job whose every fanned dispatch terminates result-less (e.g. the
-  QPU budget gate aborted it) is requeued once, then dropped.
-- Pow is the idle filler: when a handle frees and no job wants it, the
-  `provide_pow_context` callback (the pow controller) supplies the
-  current context, or `None` to leave the handle idle.
+Per-backend bounds are an `AdaptBounds` struct, not a fixed table in this
+repository. Each miner binary constructs its own. The CPU simulated-annealing
+reference used in the conformance test is `min_sweeps 64`, `max_sweeps 4096`,
+`min_reads 64`, `max_reads 512`, with read factors `4/8/0` (`adapt.rs:157`). The
+CUDA, Metal, and D-Wave bounds live in their own repositories.
 
-The controller's only handle operations are `dispatch_pow` (work-key
-change broadcast), `fill_idle` (verify-fail re-dispatch; never cancels),
-and `cancel_pow_siblings` (the submission-storm fix). Result consumers
-(`on_pow_result` / `on_job_result`) run inline on the delivering
-drainer task and must queue-put only — never RPC.
+Genesis and consensus defaults live in the chain pallet, not here. The
+coordinator reads them from the mining snapshot. The devnet acceptance test
+exercises the defaults it expects to receive: `min_solutions = 5` and
+`min_diversity = 0.200` (`n = 5`, `n_milli = 200` in
+`tests/devnet_submit.rs`). For the difficulty energy target, the per-topology
+energy ranges, and the mempool section-election rules, read the pallet in
+quip-protocol-rs. This repository consumes those values across the `ChainClient`
+seam and doesn't define them.
 
-### 2.3 Mempool: `MempoolStack` (`substrate/mempool_stack.py`)
+## Testing and the doubles
 
-Thin composition of producer + submitter over the scheduler:
+Two crates exist only to test the protocol from each side.
+`quip-mock-coordinator` (package `ln`) is a scripted coordinator that can drive
+a real miner binary and inject malformed handshakes, such as the bad-welcome
+path (`driver.rs:114`), which the conformance suite depends on.
+`quip-mock-miner` is the mirror double for exercising the coordinator. Keeping
+both independent of the production serve loop is what lets them script failures
+the real path would never produce.
 
-- **`MempoolJobProducer`** (`substrate/mempool_producer.py`) —
-  subscribed to the pow controller's ONE `ChainEventManager` via
-  `head_subscribers`; polls `System.Events` per block and filters
-  `JobProposed` orders through: exact topology-hash eligibility, the
-  pallet's Bid OR-semantics (account OR solver_type), a 2-block
-  deadline margin, and `[miner] mempool_min_reward` (0 = accept all).
-- **Feed loop** — turns accepted order ids into `MempoolJobContext`s
-  and calls `scheduler.submit_job(...)` with a dispatch-time
-  revalidation callback (order re-fetch + `OPENED` check).
-- **`MempoolSubmitter`** (`substrate/mempool_submitter.py`) —
-  `submit_solution` carries a small tip (`tip_plancks` = 2e9 =
-  0.002 UNIT) so it outranks the same account's tip-0 pow traffic in
-  the txpool; retries txpool nonce races with block-spanning backoff;
-  caps each watch at 90s. The claim loop claims proactively once a
-  submitted order passes its COMPUTED expiry — the pallet expires
-  lazily (no `on_initialize` sweep), so an event-only claim loop would
-  wait forever on a quiet mempool.
-- **Park semantics** — a mempool-fatal receipt (`SolverNotRegistered`
-  / `BadSignature` / `BadProof` / anything unrecognized) classifies as
-  `SubmitOutcome.MEMPOOL_DISABLE` and parks the whole mempool side
-  (producer, feed loop, job queue) while pow mining continues.
-  `MempoolStack.run()` returns only on shutdown — under the CLI's
-  FIRST_COMPLETED orchestration an early return would tear pow down.
+The `drive` subcommand runs the coordinator against synthetic problems with no
+chain, using `FakeChain` and the `drive/` job sources. It's the fast offline
+path for load and behavior testing.
 
-Mempool participation is config-only and per-miner: `mempool` is set
-inside each backend section (`[cpu] mempool = false`,
-`[gpu]`/`[metal]`/`[modal]`, qpu vendor sections like `[dwave]`);
-defaults cpu/gpu ON, qpu OFF — paid samples are opt-in. A `[miner]`
-`mempool` key is rejected at load; `[miner] mempool_min_reward` stays
-global. There is no mempool-only operation mode and no CLI flag for
-the work source (the supervisor's `--mode cpu|gpu|qpu` selects miner
-*types*, not what they mine). On a multi-backend config the mempool
-owner is config-derived (`shared/miner_config.py:mempool_owner_group`:
-explicit `true` outranks default-on, then canonical cpu,gpu,qpu order)
-because one substrate account can register only ONE solver type on
-chain; every non-owner child resolves mempool off from the same TOML —
-no env var, so supervised, direct-subcommand, and `--mode` runs agree,
-and the supervisor merely echoes the election. Guard D+
-(`substrate/solver_registration.py:ensure_solver_registered`)
-auto-registers the solver at startup: query-first (idempotent),
-race-tolerant, and it retypes a stale registration to the configured
-kind (config is the source of truth; the on-chain solver stats counters
-reset, accepted because they are write-only bookkeeping). Guard
-failure is non-fatal: mempool is disabled for the run and pow proceeds.
+## Build and run
 
-### 2.4 CLI orchestration (`quip_cli.py:_run_concurrent_miner`)
+The Rust workspace builds from the repository root, excluding the PyO3 crate
+from the default set:
 
-Sequence:
-
-1. Announce + load keystore (Guard A), connect a direct setup client,
-   run guards C/D/D+/E (funded / registered / solver-registered /
-   descriptor). Guard D+ can only flip mempool off for the run.
-2. Bind-and-run loop: fetch the chain's `DefaultTopology`,
-   `_prepare_core` builds one `MinerCore` (no handle split — the
-   scheduler serves both work sources, so 1-handle nodes are fully
-   supported), `_build_scheduler_stack` builds the pow controller, ONE
-   `WorkScheduler` over ALL handles, and the optional `MempoolStack`
-   (when the per-section mempool key resolves on), then attaches the
-   scheduler to both.
-3. `_orchestrate_controllers`: `scheduler.start()` first (drainers must
-   be live before the first dispatch), SIGINT/SIGTERM → `shutdown()` on
-   all three, `asyncio.wait(..., FIRST_COMPLETED)` over the pow
-   controller (+ mempool stack), a 15s grace drain, then
-   `scheduler.stop()`.
-4. On `rebind_requested` (chain topology changed) the loop rebuilds the
-   whole stack without a process restart; otherwise the pow
-   controller's exit code becomes the process's.
-
----
-
-## 3. Miner layer
-
-### 3.1 Class hierarchy
-
-```
-BaseMiner                          shared/base_miner.py
-├── SimulatedAnnealingMiner        CPU/sa_miner.py
-├── GPUMiner                       GPU/gpu_miner.py
-│   └── CudaMiner                  GPU/cuda_miner.py
-├── MetalMiner                     GPU/metal_miner.py
-├── ModalMiner                     GPU/modal_miner.py
-└── DWaveMiner                     QPU/dwave_miner.py
+```bash
+cargo build --workspace --exclude quip-protocol-py
+cargo test  --workspace --exclude quip-protocol-py
 ```
 
-There is no inline sampling path: every backend exposes a
-`build_persistent_context(...)` factory that runs in a **stream-driver
-subprocess** (feeder + sampler), writing samplesets into a
-shared-memory ring the worker consumes. The full producer→ring→consumer
-design is in `docs/miner-architecture.md`. The base class supplies a
-default `_adapt_mining_params(...)` (forwarding to `adapt_parameters`
-with subclass-declared calibration bounds; only CUDA and D-Wave
-override it) plus optional hooks (`_pre_mine_setup`,
-`_post_mine_cleanup`, ...); the QPU implementation uses
-`_pre_mine_setup` to gate the daily budget, and its `USES_SUBMITTER_SPLIT`
-isolates the D-Wave SDK into a separate submitter process.
-
-The protocol-neutral entry is `BaseMiner.mine_work_item(context,
-stop_event)` (`base_miner.py:699`). It accepts either work-source
-flavor (`SubstrateMiningContext` or `MempoolJobContext`) and loops until
-the stop event fires, sourcing one `(nonce, salt, sampleset)` per
-iteration off the stream-driver's descriptor queue and evaluating it.
-
-PoW uses **ratchet mode** (`_run_substrate_ratchet`: bounded top-K
-stash, decay-aware submit gate; reads `live_threshold_milli` from a
-shared `mp.Value` each iteration). Mempool uses **strict mode**
-(`_run_mempool_eval`: energy gate always applied).
-
-### 3.2 `MinerHandle` (`shared/miner_worker.py:368`)
-
-The parent's view of one miner child. IPC primitives:
-
-- `req: mp.Queue` — parent → worker (RPC-style ops)
-- `resp: mp.Queue` — worker → parent (results + sentinels; drained by
-  the WorkScheduler, one drainer per handle)
-- `stop_event: mp.Event` — worker polls each iteration
-- `live_max_energy_milli: mp.Value('q')` — shared i64 ratchet threshold
-
-Operations:
-
-| Method | Effect |
-|---|---|
-| `mine_work_item(ctx, solution_number=...) → dispatch_id` | Clear stop_event, enqueue `{op: "mine_work_item", context, dispatch_id, solution_number}`, return id |
-| `cancel()` | Set stop_event directly (worker observes within one iteration; the NEXT `mine_work_item()` clears it — hence the scheduler's mandatory sentinel wait) |
-| `set_live_threshold_milli(milli)` | Atomic write to shared `mp.Value` |
-| `get_stats()` | Request/reply via queues |
-
-The worker (`miner_worker_main`) is a simple op dispatcher
-(`miner_worker.py:163`). Mining results land on `resp_q` as either
-`{"op": "mine_result", "dispatch_id", "result"}` or
-`{"op": "work_item_done", "dispatch_id"}` (sentinel for cancelled or
-result-less dispatches).
-
-### 3.3 Dispatch correlation
-
-The **scheduler** stores
-`_dispatch_contexts[(handle_id, dispatch_id)] → context`
-(retention-pruned per handle). Its drainer pairs each response with the
-originating context using `dispatch_id`, so late results from cancelled
-dispatches are dropped, and `dispatch_context()` lets the pow
-controller pair non-terminal worker messages (previews) with the exact
-context they were produced against.
-
----
-
-## 4. Validator pool
-
-### 4.1 `ValidatorPool` (`substrate/pool.py`)
-
-Owns one **active** `ValidatorHandle` at a time. Routes every RPC
-through it. On a connection-class error
-(`ConnectionError`, `TimeoutError`, …) the active handle is killed and
-the next URL is spawned.
-
-Retry policy:
-
-- **Idempotent ops** (`get_*`, `query_*`, `get_mining_snapshot`,
-  `get_events_at`) — auto-retry on the new handle up to
-  `max_swap_retries` (default 3).
-- **Non-idempotent ops** (notably `submit_signed_extrinsic`) — raise
-  `ValidatorSwapped`. Caller has domain knowledge and decides.
-
-`force_swap()` is the watchdog escape hatch — used by the event
-manager when the chain looks frozen on the current validator.
-
-### 4.2 `ValidatorHandle` (`substrate/validator_handle.py`)
-
-Parent-side proxy. Spawns one `mp.Process(target=validator_main)`,
-maintains `_inflight[request_id] → asyncio.Future`, and runs a
-`_drain_responses` task that pulls from `resp_q` and resolves futures.
-
-Picklability is checked proactively (`ForkingPickler.dumps()`) before
-queueing requests/responses, because `mp.Queue` serializes in a
-background thread where exceptions are lost.
-
-### 4.3 `validator_main` (`substrate/validator_handle.py:99`)
-
-The child process entry point. Owns one `SubstrateClient(url)`,
-creates a persistent asyncio loop, and serves RPC ops with a
-per-call timeout (`rpc_call_timeout_s`, default 10s).
-
-### 4.4 `PoolClient` (`substrate/pool_client.py`)
-
-A SubstrateClient-shaped shim that routes each method through
-`pool.send(op_name, kwargs_dict)`: read ops (idempotent, auto-retried
-across swaps) plus `submit_signed_extrinsic` — the one non-idempotent
-write, which surfaces `ValidatorSwapped` to the caller. Signing stays
-in the calling process (`SubstrateClient.build_signed_extrinsic`); key
-material never crosses IPC (§7).
-
-### 4.5 `SubstrateUrlFailover` (`substrate/url_failover.py`)
-
-Round-robin URL rotation with all-down exponential backoff
-(1s → 2s → 4s → … → 60s). `confirm_success()` resets on the next
-successful call.
-
----
-
-## 5. Chain event manager
-
-`ChainEventManager` (`substrate/event_manager.py`) replaced the
-substrate-interface WS subscription that was the root cause of the
-original 90+ minute silent-stall bug.
-
-Two concurrent loops:
-
-- **`_poll_loop`** — every `settled_poll_pct × blocktime_s` (default
-  5.1s) in steady state, or `catch_up_poll_pct × blocktime_s` (0.6s)
-  when overdue. Calls `pool.send(snapshot_op, snapshot_args)`,
-  computes `state_key(snapshot)`, fires a `new_head` event only on
-  key change (source-side dedup).
-- **`_dispatch_loop`** — pulls from internal `event_q`, invokes
-  subscriber callbacks (sync or async), per-callback try/except so a
-  bad subscriber can't kill the loop.
-
-Watchdog (in `_poll_loop`):
-
-- `stale_blocktime_multiplier × blocktime_s` (default 6s) → log warning
-- `dead_blocktime_multiplier × blocktime_s` (default 18s) → call
-  `pool.force_swap()` wrapped in `asyncio.wait_for(...)` so a hung
-  pool can't permanently disarm the watchdog.
-
-There is ONE event manager per process, owned by the pow controller.
-Its `state_key` includes `block_hash`, so it fires on every block —
-which the mempool producer needs (each block may carry mempool events)
-and the pow path absorbs cheaply via its same-key short-circuits. The
-producer's per-block `System.Events` poll rides the same manager as a
-`head_subscribers` entry; the pre-T7 mempool controller's separate
-`subscribe_new_heads()` WS loop is gone.
-
----
-
-## 6. Supervision
-
-`supervise(coro, name, on_failure)` in `shared/asyncio_supervise.py`:
-
-```python
-async def supervise(coro, name, on_failure):
-    try:
-        await coro
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("supervised task %s crashed", name)
-        await maybe_await(on_failure())
-        raise
-```
-
-Every long-lived task wires `on_failure=self._shutdown_event.set` so a
-crash is loud and the controller exits, instead of going silent.
-**This is the load-bearing guarantee against the original bug class.**
-
----
-
-## 7. Submission path
-
-Signing happens in the controller process: a parent-side
-`SubstrateClient` (the `build_client`, connected in
-`SubstrateMinerController.run()`) composes and signs each extrinsic via
-`build_signed_extrinsic`, and the signed bytes go out through the
-swap-aware `PoolClient.submit_signed_extrinsic`. Key material never
-crosses the mp.Queue IPC boundary; a mid-flight validator swap raises
-`ValidatorSwapped` and the retry wrapper (`submit_with_retry`)
-re-composes from scratch, which also reads a fresh nonce.
-
-The flow for PoW:
-
-```
-_handle_result(envelope)
-  → encode_quantum_proof(...)
-  → submit_proof(...)
-       → build_client.build_signed_extrinsic("QuantumPow", "submit_proof", ...)
-       → pool_client.submit_signed_extrinsic(extrinsic_hex, ...)
-  → receipt classification
-       → ok      → mark work key closed, cancel pow siblings, verify recorded
-       → stale   → drop
-       → fatal   → raise → controller shutdown
-```
-
-Mempool submission (`MempoolSubmitter.submit_solution` /
-`claim_reward`) uses the same compose-in-parent + submit-via-pool
-shape, adding a txpool tip and block-spanning nonce-race retries
-(§2.3). Its fatal receipts park mempool instead of shutting the
-controller down.
-
----
-
-## 8. Telemetry
-
-One telemetry surface: the sibling process
-`substrate/telemetry_process.py` (`telemetry_main`), spawned by the
-controller by default. The in-process `TelemetryApiServer` is deleted.
-Under the config-driven supervisor the controller skips the sibling
-spawn (`QUIP_TELEMETRY_EXTERNAL=1`) and a single `quip-miner telemetry`
-aggregator child owns the port instead, reading every backend's
-snapshot.
-
-The sibling reads the per-kind stats snapshot the controller's
-`StatsSnapshotWriter` writes to `${runtime_dir}` every 1s and serves
-the full `/api/v1/*` surface (`status`, `system`, `miner/survey`,
-`stats`, `block/latest`, `block/{n}`, `block/{n}/header`, `solve`,
-`mining/attempts`, `mining/solutions`, `/health`). There is no live IPC
-between miner and telemetry — the snapshot file is the channel, so a
-slow telemetry handler can't starve the controller's event loop (the
-original bug class once more).
-
----
-
-## 9. Cleanup candidates
-
-The Plans 1–4 cleanup list is done: the pre-T7 mempool controller and
-its `subscribe_new_heads()` WS loop were replaced by the producer riding
-the shared `ChainEventManager`, the in-process `TelemetryApiServer` and
-the `pool.get(role)` slot client are deleted (submission now signs in
-the parent and ships bytes through the pool, §7), and
-`SubstrateClient`'s own multi-URL failover machinery is gone.
-
-### Suspected dead / needs verification
-
-- `_last_pushed_threshold_milli` initialized to `0` causes the first
-  head to always trigger a threshold push. Probably intentional, but
-  worth confirming. (`substrate/miner_controller.py:513`)
-
-### Test suites covering this document
-
-- `tests/test_work_scheduler.py` — preemption protocol, job fan-out,
-  first-result-wins, requeue-once, pow idle filler.
-- `tests/test_mempool_producer.py` / `tests/test_mempool_submitter.py`
-  — discovery guards; receipt classification, tip, claim loop.
-- `tests/test_concurrent_mode.py` — scheduler-stack wiring (one
-  scheduler over all handles, shared event manager, park semantics).
-- `tests/test_mempool_priority_integration.py` — live dev-chain
-  integration; the dev-chain start procedure and the manual QPU /
-  multi-backend smoke procedures are in its module docstring, and the
-  failure-isolation park test is opt-in via `QUIP_T9_PARK=1`.
-- `tests/test_miner_controller_on_new_head.py` /
-  `tests/test_substrate_miner_controller.py` — the pow brain.
+The Python SDK builds with maturin (`maturin develop -E dev`), and the parity
+suite runs with `pytest conformance/`. See `AGENTS.md` for the full command set.

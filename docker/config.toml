@@ -1,0 +1,80 @@
+# quip-coordinator config for the v0.3 container image.
+#
+# Copied to /data/config.toml on first run; after that /data/config.toml is the
+# source of truth (edit + restart). The coordinator connects to a chain via
+# [miner].validators, then supervises the miner processes declared below —
+# each backend section maps to a downloaded binary (see the image's
+# /usr/local/bin). `binary` selects the sa vs chromatic-gibbs variant.
+
+[miner]
+# Ordered chain endpoints; live-rotated on disconnect.
+validators = ["ws://quip-validator:9944", "ws://127.0.0.1:9944"]
+# Faucet for auto-funding the miner account at startup. A miner that cannot pay
+# transaction fees mines normally and then fails every submit, so the
+# coordinator tops the account up here and refuses to start if it cannot.
+# Defaults to the public testnet faucet, which is correct for Quip Testnet and
+# wrong for mainnet — set it to your own faucet, or to "" to disable, when you
+# fund the account yourself. Empty means no auto-funding.
+faucet_url = "https://faucet.testnet.quip.network"
+
+# Balance floor in plancks (2 UNIT). Below this the coordinator asks the faucet.
+# min_balance_plancks = 2000000000000
+# Amount requested per faucet attempt, in plancks (10 UNIT).
+# faucet_top_up_plancks = 10000000000000
+# How long to keep retrying the faucet before giving up, in seconds.
+# funding_timeout_s = 600
+
+# Consecutive failed submissions of one proof, inside one quantum block, before
+# the coordinator stops retrying it and reports loudly. Submit outcome comes
+# from chain state, which reports that a proof did not land but not why, so this
+# bound is what turns a permanently rejected proof into a visible stop rather
+# than an endless retry.
+# max_submit_attempts = 5
+
+# Hybrid sr25519 + ML-DSA-44 signer. The entrypoint generates a keystore at
+# exactly this path on first run when the file is missing, so a bare
+# `docker run` produces a miner whose proofs verify. Mount your own keystore
+# over /data/keystore.json to bring an existing key. BACK IT UP — the chain
+# key lives here.
+signer_key = "/data/keystore.json"
+
+# Host a peer uses to reach this node from outside the host. Required.
+# An empty string is not a host. Set this to the address peers can reach.
+public_host = "203.0.113.10"
+# Port a peer uses to reach this node from outside the host. Required.
+# This is the public front door, not the validator peer port (9944) and
+# not the dashboard port (9090). Zero is not a valid port.
+public_port = 20050
+
+# CPU miner (bundled: quip-cpu-sa, quip-cpu-gibbs).
+[cpu]
+binary = "quip-cpu-sa"   # or "quip-cpu-gibbs"
+
+# D-Wave QPU miner (bundled Python entry point quip-dwave-qa). Needs a Leap
+# token (DWAVE_API_TOKEN) for real hardware; omit the section to disable.
+# Connection credentials (token/solver/region) come from D-Wave's own config
+# (dwave.conf + env), not here.
+#
+# Keys below tune the QPU-access-time budget the miner spends. The pool accrues
+# at daily_budget/86400 per wall-second; the miner idles until it reaches
+# min_block_budget, then bursts until the pool drains. Durations accept
+# s/m/h/d/w suffixes or a plain number of seconds. num_reads/anneal_time come
+# from the chain difficulty target (SetTarget), not this section.
+# [dwave]
+# binary = "quip-dwave-qa"
+# daily_budget = "30s"      # QPU access time granted per day
+# min_block_budget = "90s"  # start threshold; default min(90s, daily_budget)
+# budget_cap = "5m"         # max pool size; default uncapped
+
+# Mining-attempt dashboard and indexer REST surface. Records every solved
+# model as JSONL under data_dir/<qblock_id>/attempts.jsonl and serves:
+#   GET /healthz, GET /qblocks, GET /<qblock_id>/attempts.jsonl
+#   GET /api/v1/status, GET /api/v1/stats, GET /api/v1/mining/attempts
+# Listen on 0.0.0.0:20100 so host.docker.internal:20100 matches the Caddy
+# reverse_proxy for /api/v1/* (see
+# quip-node-manager/vendor/nodes.quip.network/caddy/Caddyfile — the miner's
+# rest_port default). Use the mounted /data volume so history survives
+# restarts. Omit the section to disable.
+[dashboard]
+listen = "0.0.0.0:20100"
+data_dir = "/data/attempts"

@@ -37,10 +37,6 @@ docs/
 *.md
 !README.md
 
-# Development tools (exclude most, but keep compare_mining_rates.py)
-tools/*
-!tools/compare_mining_rates.py
-benchmarks/
 reference/
 
 # Local development files

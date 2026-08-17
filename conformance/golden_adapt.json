@@ -1,0 +1,475 @@
+{
+  "energy_to_difficulty": [
+    {
+      "target_milli": -100000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 0.0,
+      "gse_c75": -15093.567744928338
+    },
+    {
+      "target_milli": -10000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 0.0,
+      "gse_c75": -15093.567744928338
+    },
+    {
+      "target_milli": -14000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 0.0,
+      "gse_c75": -15093.567744928338
+    },
+    {
+      "target_milli": -14700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 0.5237062475907593,
+      "gse_c75": -15093.567744928338
+    },
+    {
+      "target_milli": -15200000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -15093.567744928338
+    },
+    {
+      "target_milli": -15700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -15093.567744928338
+    },
+    {
+      "target_milli": -20000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -15093.567744928338
+    },
+    {
+      "target_milli": -100000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        1000
+      ],
+      "difficulty": 0.0,
+      "gse_c75": -15329.983562790196
+    },
+    {
+      "target_milli": -10000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        1000
+      ],
+      "difficulty": 0.0,
+      "gse_c75": -15329.983562790196
+    },
+    {
+      "target_milli": -14000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        1000
+      ],
+      "difficulty": 0.0,
+      "gse_c75": -15329.983562790196
+    },
+    {
+      "target_milli": -14700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        1000
+      ],
+      "difficulty": 0.4379366770818908,
+      "gse_c75": -15329.983562790196
+    },
+    {
+      "target_milli": -15200000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        1000
+      ],
+      "difficulty": 0.7779811260262375,
+      "gse_c75": -15329.983562790196
+    },
+    {
+      "target_milli": -15700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -15329.983562790196
+    },
+    {
+      "target_milli": -20000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -15329.983562790196
+    },
+    {
+      "target_milli": -100000,
+      "num_nodes": 1000,
+      "num_edges": 3000,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 0.0,
+      "gse_c75": -2016.7465548914831
+    },
+    {
+      "target_milli": -10000000,
+      "num_nodes": 1000,
+      "num_edges": 3000,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -2016.7465548914831
+    },
+    {
+      "target_milli": -14000000,
+      "num_nodes": 1000,
+      "num_edges": 3000,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -2016.7465548914831
+    },
+    {
+      "target_milli": -14700000,
+      "num_nodes": 1000,
+      "num_edges": 3000,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -2016.7465548914831
+    },
+    {
+      "target_milli": -15200000,
+      "num_nodes": 1000,
+      "num_edges": 3000,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -2016.7465548914831
+    },
+    {
+      "target_milli": -15700000,
+      "num_nodes": 1000,
+      "num_edges": 3000,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -2016.7465548914831
+    },
+    {
+      "target_milli": -20000000,
+      "num_nodes": 1000,
+      "num_edges": 3000,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -2016.7465548914831
+    },
+    {
+      "target_milli": -100000,
+      "num_nodes": 8,
+      "num_edges": 8,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -10.974297244015219
+    },
+    {
+      "target_milli": -10000000,
+      "num_nodes": 8,
+      "num_edges": 8,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -10.974297244015219
+    },
+    {
+      "target_milli": -14000000,
+      "num_nodes": 8,
+      "num_edges": 8,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -10.974297244015219
+    },
+    {
+      "target_milli": -14700000,
+      "num_nodes": 8,
+      "num_edges": 8,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -10.974297244015219
+    },
+    {
+      "target_milli": -15200000,
+      "num_nodes": 8,
+      "num_edges": 8,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -10.974297244015219
+    },
+    {
+      "target_milli": -15700000,
+      "num_nodes": 8,
+      "num_edges": 8,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -10.974297244015219
+    },
+    {
+      "target_milli": -20000000,
+      "num_nodes": 8,
+      "num_edges": 8,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "difficulty": 1.0,
+      "gse_c75": -10.974297244015219
+    }
+  ],
+  "adapt_params_cpu_sa": [
+    {
+      "target_milli": -10000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 1,
+      "bounds": "cpu_sa",
+      "num_reads": 64,
+      "num_sweeps": 64
+    },
+    {
+      "target_milli": -10000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 5,
+      "bounds": "cpu_sa",
+      "num_reads": 64,
+      "num_sweeps": 64
+    },
+    {
+      "target_milli": -14000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 1,
+      "bounds": "cpu_sa",
+      "num_reads": 64,
+      "num_sweeps": 64
+    },
+    {
+      "target_milli": -14000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 5,
+      "bounds": "cpu_sa",
+      "num_reads": 64,
+      "num_sweeps": 64
+    },
+    {
+      "target_milli": -14700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 1,
+      "bounds": "cpu_sa",
+      "num_reads": 268,
+      "num_sweeps": 2145
+    },
+    {
+      "target_milli": -14700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 5,
+      "bounds": "cpu_sa",
+      "num_reads": 268,
+      "num_sweeps": 2145
+    },
+    {
+      "target_milli": -15200000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 1,
+      "bounds": "cpu_sa",
+      "num_reads": 512,
+      "num_sweeps": 4096
+    },
+    {
+      "target_milli": -15200000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 5,
+      "bounds": "cpu_sa",
+      "num_reads": 512,
+      "num_sweeps": 4096
+    },
+    {
+      "target_milli": -15700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 1,
+      "bounds": "cpu_sa",
+      "num_reads": 512,
+      "num_sweeps": 4096
+    },
+    {
+      "target_milli": -15700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 5,
+      "bounds": "cpu_sa",
+      "num_reads": 512,
+      "num_sweeps": 4096
+    }
+  ]
+}

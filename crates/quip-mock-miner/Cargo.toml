@@ -1,0 +1,18 @@
+[package]
+name = "quip-mock-miner"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+quip-proto = { path = "../quip-proto" }
+quip-protocol = { path = "../quip-protocol" }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+clap = { version = "4", features = ["derive"] }
+
+[lints]
+workspace = true

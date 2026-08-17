@@ -1,0 +1,27 @@
+[package]
+name = "quip-miner-exec"
+version = "0.3.0"
+edition = "2021"
+description = "Generic external-solver miner: exec a standalone solver over the quip session protocol"
+
+[lib]
+name = "quip_miner_exec"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quip-miner-exec"
+path = "src/main.rs"
+
+[dependencies]
+quip-miner-core = { path = "../quip-miner-core" }
+quip-proto = { path = "../quip-proto" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shlex = "1"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true
