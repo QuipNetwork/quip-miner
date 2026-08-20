@@ -2,26 +2,30 @@
 # Multi-arch (linux/amd64, linux/arm64) via buildx; TARGETARCH selects the
 # released CPU binaries. The coordinator is built from source; the CPU miner
 # binaries are downloaded from their release; the D-Wave miner is a Python
-# package (its protocol wheel now ships from quip.network/quip-solver-core;
-# the pinned quip-miner-dwave tag decides where pip resolves it from).
+# package whose protocol dependency resolves as a prebuilt quip-solver-core
+# wheel from PyPI on both architectures (amd64 and aarch64 wheels since
+# quip-solver-core 0.0.1-rc1, pinned by quip-miner-dwave v0.3.2-rc1).
 
 # --- builder: D-Wave venv (Python) then quip-coordinator (Rust) ---
 # Python is independent of the Rust build. Keep it above cargo so a Rust
 # source or Cargo.toml change does not re-run the pip install.
 FROM python:3.12-bookworm AS builder
 
-# Match the previous unpinned apt set; pin churn would change the image base.
+# build-essential + rustup for the quip-coordinator cargo build below. The
+# D-Wave pip install needs neither (its protocol wheel comes from PyPI) and
+# protoc is gone with it. Unpinned; pin churn would change the image base.
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        protobuf-compiler build-essential curl ca-certificates \
+        build-essential curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# D-Wave miner into an isolated venv (pulls + builds quip_proto via maturin).
-# Only fetch-miners.sh is needed for the pin; the image and the macOS bundle
-# cannot drift to different dwave releases.
+# D-Wave miner into an isolated venv; its quip-solver-core dependency
+# resolves as a prebuilt wheel from PyPI on both architectures (no Rust, no
+# protoc). Only fetch-miners.sh is needed for the pin; the image and the
+# macOS bundle cannot drift to different dwave releases.
 COPY crates/quip-coordinator/tools/fetch-miners.sh /tmp/fetch-miners.sh
 RUN python -m venv /opt/venv \
     && DWAVE_TAG="$(bash /tmp/fetch-miners.sh --print-tag dwave)" \

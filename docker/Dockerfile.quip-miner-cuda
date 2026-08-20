@@ -8,8 +8,10 @@
 # base so the interpreter path matches — venvs are not relocatable across distros) ---
 FROM python:3.12-bookworm AS builder
 
+# Unpinned deliberately; pin churn would change the image base.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        protobuf-compiler build-essential curl ca-certificates \
+        build-essential curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -69,24 +71,21 @@ COPY crates/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.s
 
 # Venv on the runtime interpreter (ubuntu24.04 /usr/bin/python3), not bookworm.
 #
-# The install needs a build toolchain the runtime base does not carry: `git`
-# because the miner comes from a `git+https://` URL, and cargo/cc/protoc because
-# the pinned quip-miner-dwave tag still builds its protocol wheel from source
-# through maturin (the wheel now ships from quip.network/quip-solver-core; the
-# toolchain can go once the dwave pin depends on it from PyPI). Everything
-# build-only is installed, used and removed inside this single RUN so none of it
-# reaches the published image — a later `rm` would not shrink an earlier layer.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git build-essential protobuf-compiler \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-       | sh -s -- -y --profile minimal --no-modify-path \
+# `git` is the one build-only tool: the miner itself comes from a `git+https://`
+# URL. Its quip-solver-core dependency resolves as a prebuilt wheel from PyPI
+# (since quip-miner-dwave v0.3.1-rc2), so the cargo/cc/protoc toolchain the
+# maturin source build needed is gone. git is installed, used and removed
+# inside this single RUN so it never reaches the published image — a later
+# `rm` would not shrink an earlier layer.
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends git \
     && python3 -m venv /opt/venv \
     && DWAVE_TAG="$(bash /usr/local/bin/fetch-miners.sh --print-tag dwave)" \
-    && PATH="/root/.cargo/bin:${PATH}" /opt/venv/bin/pip install --no-cache-dir \
+    && /opt/venv/bin/pip install --no-cache-dir \
        "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${DWAVE_TAG}" \
-    && apt-get purge -y git build-essential protobuf-compiler \
+    && apt-get purge -y git \
     && apt-get autoremove -y --purge \
-    && rm -rf /root/.cargo /root/.rustup /root/.cache /var/lib/apt/lists/*
+    && rm -rf /root/.cache /var/lib/apt/lists/*
 
 # Released CPU + CUDA miner binaries (amd64 only for this image), via the shared
 # fetch-miners.sh — single source of truth. MINER_SET=cpu-cuda requires the cuda
