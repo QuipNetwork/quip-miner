@@ -12,10 +12,13 @@
 //!   substitution in `--solver-cmd`, or on stdin with `--solver-stdin`.
 //! - Output (stdout): a JSON array of `{spins, energy_milli}`, one per read.
 //!   `spins` is length `num_nodes` with values in `{-1, +1}`.
-//! - Exit 0 on success; nonzero, a timeout, or malformed output rejects the job.
+//! - Exit 0 on success. A timeout, a signal-terminated child, or a transient
+//!   host fault rejects the job as [`SampleError::DeviceBusy`]. A chosen
+//!   nonzero exit code, malformed output, or a missing/unexecutable solver is
+//!   a [`SampleError::DeviceFault`], which ends the session so the supervisor
+//!   restarts the miner.
 
-use quip_miner_core::{IsingGraph, SampleParams, Sampler, SamplerResult};
-use quip_proto::v1::RejectReason;
+use quip_solver_core::{IsingGraph, SampleError, SampleParams, Sampler, SamplerResult};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -101,14 +104,14 @@ impl Sampler for ExecSampler {
         &self,
         graph: &IsingGraph,
         params: &SampleParams,
-    ) -> Result<Vec<SamplerResult>, RejectReason> {
+    ) -> Result<Vec<SamplerResult>, SampleError> {
         let model = serde_json::to_vec(&ModelJson::new(graph, params))
-            .map_err(|_| RejectReason::Malformed)?;
+            .map_err(|e| SampleError::DeviceFault(format!("model serialize: {e}")))?;
 
         let stdout = if self.use_stdin {
             run_solver(&self.argv_template, Some(model), self.timeout)?
         } else {
-            let tmp = TempModel::write(&model).map_err(|_| RejectReason::Overloaded)?;
+            let tmp = TempModel::write(&model).map_err(|_| SampleError::DeviceBusy)?;
             let argv = render_argv(&self.argv_template, tmp.path());
             run_solver(&argv, None, self.timeout)?
         };
@@ -126,16 +129,19 @@ fn render_argv(template: &[String], path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Parse the solver's stdout into scored reads. Rejects (`Malformed`) on invalid
+/// Parse the solver's stdout into scored reads. A contract violation — invalid
 /// JSON, a spin count that doesn't match the topology, or a spin outside
-/// `{-1, +1}`.
-fn parse_solutions(stdout: &[u8], num_nodes: usize) -> Result<Vec<SamplerResult>, RejectReason> {
-    let solutions: Vec<SolutionJson> =
-        serde_json::from_slice(stdout).map_err(|_| RejectReason::Malformed)?;
+/// `{-1, +1}` — is a `DeviceFault` naming what the solver got wrong.
+fn parse_solutions(stdout: &[u8], num_nodes: usize) -> Result<Vec<SamplerResult>, SampleError> {
+    let solutions: Vec<SolutionJson> = serde_json::from_slice(stdout)
+        .map_err(|e| SampleError::DeviceFault(format!("solver output is not valid JSON: {e}")))?;
     let mut out = Vec::with_capacity(solutions.len());
     for s in solutions {
         if s.spins.len() != num_nodes || s.spins.iter().any(|&v| v != -1 && v != 1) {
-            return Err(RejectReason::Malformed);
+            return Err(SampleError::DeviceFault(format!(
+                "solver read has {} spins for {num_nodes} nodes, or a spin outside {{-1, +1}}",
+                s.spins.len()
+            )));
         }
         out.push(SamplerResult {
             spins: s.spins,
@@ -146,14 +152,19 @@ fn parse_solutions(stdout: &[u8], num_nodes: usize) -> Result<Vec<SamplerResult>
 }
 
 /// Spawn the solver, optionally feed `stdin_bytes`, drain stdout concurrently,
-/// and wait up to `timeout`. Timeout, spawn failure, or an I/O fault map to
-/// `Overloaded`; a nonzero exit maps to `Malformed`.
+/// and wait up to `timeout`. A timeout, an I/O fault, a transient spawn
+/// failure, or a signal-terminated child maps to `DeviceBusy` (reject this
+/// job, keep the session). A missing/unexecutable solver or a chosen nonzero
+/// exit code maps to `DeviceFault` (the session ends and the supervisor
+/// restarts).
 fn run_solver(
     argv: &[String],
     stdin_bytes: Option<Vec<u8>>,
     timeout: Duration,
-) -> Result<Vec<u8>, RejectReason> {
-    let (prog, args) = argv.split_first().ok_or(RejectReason::Malformed)?;
+) -> Result<Vec<u8>, SampleError> {
+    let (prog, args) = argv
+        .split_first()
+        .ok_or_else(|| SampleError::DeviceFault("solver command is empty".to_owned()))?;
     let mut cmd = Command::new(prog);
     let _ = cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::null());
     let _ = cmd.stdin(if stdin_bytes.is_some() {
@@ -162,7 +173,16 @@ fn run_solver(
         Stdio::null()
     });
 
-    let mut child = cmd.spawn().map_err(|_| RejectReason::Overloaded)?;
+    // A solver that can never start (missing or unexecutable binary) is a
+    // misconfiguration worth ending the session over. Any other spawn failure
+    // (EAGAIN from fork, fd exhaustion) is transient host pressure: reject
+    // this job as busy and keep the session alive.
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            SampleError::DeviceFault(format!("cannot spawn solver {prog:?}: {e}"))
+        }
+        _ => SampleError::DeviceBusy,
+    })?;
 
     // Feed stdin from a detached thread so a large model can't deadlock against
     // the solver filling its stdout pipe before it finishes reading stdin.
@@ -175,7 +195,7 @@ fn run_solver(
     }
 
     // Drain stdout concurrently for the same reason.
-    let mut out = child.stdout.take().ok_or(RejectReason::Overloaded)?;
+    let mut out = child.stdout.take().ok_or(SampleError::DeviceBusy)?;
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = out.read_to_end(&mut buf);
@@ -195,20 +215,31 @@ fn run_solver(
                     // `read_to_end` (and thus `sample`) until it exits. Detach
                     // the reader instead so the timeout stays responsive.
                     drop(reader);
-                    return Err(RejectReason::Overloaded);
+                    return Err(SampleError::DeviceBusy);
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => return Err(RejectReason::Overloaded),
+            Err(_) => return Err(SampleError::DeviceBusy),
         }
     };
 
     let stdout = reader.join().unwrap_or_default();
     if status.success() {
-        Ok(stdout)
-    } else {
-        Err(RejectReason::Malformed)
+        return Ok(stdout);
     }
+    // A signal-terminated child (for example an OOM kill under host memory
+    // pressure) is a transient host condition, not the solver's answer. Only
+    // an exit code the solver chose to return is the solver's fault.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal().is_some() {
+            return Err(SampleError::DeviceBusy);
+        }
+    }
+    Err(SampleError::DeviceFault(format!(
+        "solver exited with {status}"
+    )))
 }
 
 /// A model file that removes itself on drop. Named by pid + a process-local
@@ -282,21 +313,16 @@ mod tests {
 
     #[test]
     fn parse_solutions_rejects_bad_shapes() {
+        let device_fault = |r: Result<Vec<SamplerResult>, SampleError>| match r {
+            Err(SampleError::DeviceFault(detail)) => detail,
+            other => panic!("expected DeviceFault, got {other:?}"),
+        };
         // Wrong spin count for the topology.
-        assert_eq!(
-            parse_solutions(br#"[{"spins":[1],"energy_milli":0}]"#, 2),
-            Err(RejectReason::Malformed)
-        );
+        let _ = device_fault(parse_solutions(br#"[{"spins":[1],"energy_milli":0}]"#, 2));
         // Spin value outside {-1, +1}.
-        assert_eq!(
-            parse_solutions(br#"[{"spins":[1,0],"energy_milli":0}]"#, 2),
-            Err(RejectReason::Malformed)
-        );
+        let _ = device_fault(parse_solutions(br#"[{"spins":[1,0],"energy_milli":0}]"#, 2));
         // Not JSON at all.
-        assert_eq!(
-            parse_solutions(b"not json", 2),
-            Err(RejectReason::Malformed)
-        );
+        let _ = device_fault(parse_solutions(b"not json", 2));
     }
 
     #[test]

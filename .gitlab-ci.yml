@@ -22,20 +22,19 @@ variables:
 # Tests (branches only — main/tags skip straight to build)
 # ---------------------------------------------------------------------------
 
-# The v0.2 Python `test:` job (pytest tests/) was removed in the v0.3 cutover —
-# the Python miner stack it exercised is gone. v0.3 coverage is `rust:` (the
-# workspace) and `conformance:` (the quip_proto SDK).
+# The solver contract (proto, wire codec, harness, PyO3 wheel, conformance
+# suite) lives in quip.network/quip-solver-core and is tested by that repo's
+# CI; this workspace consumes it from crates.io. Coverage here is `rust:` (the
+# workspace) and `coordinator:`.
 
 rust:
   stage: test
   image: rust:1.97.1
   tags: [linux, amd64]
-  before_script:
-    - apt-get update && apt-get install -y protobuf-compiler
   script:
     - cargo fmt --all --check
-    - cargo clippy --workspace --exclude quip-coordinator --exclude quip-protocol-py --all-targets -- -D warnings
-    - cargo test --workspace --exclude quip-coordinator --exclude quip-protocol-py
+    - cargo clippy --workspace --exclude quip-coordinator --all-targets -- -D warnings
+    - cargo test --workspace --exclude quip-coordinator
   cache:
     key: cargo-$CI_COMMIT_REF_SLUG
     paths: [target/, .cargo/]
@@ -55,59 +54,12 @@ coordinator:
   stage: test
   image: rust:1.97.1
   tags: [linux, amd64]
-  before_script:
-    - apt-get update && apt-get install -y protobuf-compiler
   script:
     - cargo clippy -p quip-coordinator --all-targets -- -D warnings
     - cargo test -p quip-coordinator
   cache:
     key: cargo-coordinator-$CI_COMMIT_REF_SLUG
     paths: [target/, .cargo/]
-  rules:
-    - if: $CI_COMMIT_TAG
-      when: never
-    - if: $CI_COMMIT_BRANCH == "main"
-      when: never
-    - if: $CI_COMMIT_BRANCH
-
-conformance:
-  stage: test
-  image: python:3.11
-  tags: [linux, amd64]
-  before_script:
-    # quip-proto's build script (prost/tonic) needs protoc; python:3.11 has none.
-    - apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
-    # maturin develop requires an active virtualenv; the base image has none.
-    - python -m venv .venv
-    - . .venv/bin/activate
-    # Pin grpcio-tools so the proto-stub drift guard is deterministic: the
-    # checked-in python/quip/v1/*_pb2.py were generated with 1.82.1 (protoc
-    # gencode 7.35.0). A newer grpcio-tools stamps a different gencode version
-    # and trips the diff. Bump this pin and regenerate the stubs together.
-    - pip install maturin "grpcio-tools==1.82.1"
-    # quip_proto's scoring/wire are a PyO3 extension; build it from the root
-    # maturin project before tests import it, installing quip_proto + the dev
-    # extras (pytest, numpy, blake3) into the venv. python:3.11 has no Rust
-    # toolchain, so install one first.
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-    - . "$HOME/.cargo/env"
-    - maturin develop -E dev
-  script:
-    # Golden vectors are frozen and validated through quip_proto (test_pyo3_parity);
-    # the Python regeneration drift guard was retired with the v0.2 shared/ stack.
-    # Proto↔stub drift guard: regenerate Python *_pb2 stubs from the normative
-    # .proto and fail if the checked-in copies are stale (mirrors golden drift).
-    - |
-      set -e
-      TMP=$(mktemp -d)
-      python -m grpc_tools.protoc \
-        -I proto \
-        --python_out="$TMP" \
-        --grpc_python_out="$TMP" \
-        proto/quip/v1/miner.proto
-      diff -u python/quip/v1/miner_pb2.py "$TMP/quip/v1/miner_pb2.py"
-      diff -u python/quip/v1/miner_pb2_grpc.py "$TMP/quip/v1/miner_pb2_grpc.py"
-    - python -m pytest conformance/ -v
   rules:
     - if: $CI_COMMIT_TAG
       when: never

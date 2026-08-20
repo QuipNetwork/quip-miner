@@ -427,7 +427,7 @@ async fn handle_message(
         // miner sends JobRequest: quip-mock-miner only requests after
         // completing a job. This makes the pool exceed the miner's stated depth
         // by `queue_depth` — harmless now that neither side couples reads to
-        // writes, but see the note in MINER_PROTOCOL.md about making the miner
+        // writes, but see the note in quip-solver-core's SPEC.md about making the miner
         // the sole credit source once every backend sends an initial request.
         Some(miner_msg::Msg::Ready(_)) => grants.send(seed_credits).await.is_ok(),
         // Hand the grant to the dispatcher task rather than dispatching here:

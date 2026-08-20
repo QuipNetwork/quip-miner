@@ -1474,8 +1474,8 @@ mod tests {
         }
 
         let rendered = format!("{}\n", serde_json::to_string_pretty(&golden).unwrap());
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../conformance/dashboard_rest_golden.json");
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dashboard_rest_golden.json");
 
         if std::env::var("UPDATE_DASHBOARD_GOLDEN").is_ok() {
             std::fs::write(&path, &rendered).unwrap();
@@ -1491,7 +1491,8 @@ mod tests {
         assert_eq!(
             committed, rendered,
             "the dashboard REST wire shape changed. Re-run with \
-             UPDATE_DASHBOARD_GOLDEN=1, commit conformance/dashboard_rest_golden.json, \
+             UPDATE_DASHBOARD_GOLDEN=1, commit \
+             crates/quip-coordinator/fixtures/dashboard_rest_golden.json, \
              and tell the dashboard team before merging."
         );
     }

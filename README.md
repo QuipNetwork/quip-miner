@@ -10,22 +10,23 @@ submits a `QuantumPow.submit_proof` extrinsic. The miners run simulated
 annealing and Gibbs sampling on CPU, CUDA, and Metal, and quantum annealing on
 D-Wave hardware.
 
-This is a Rust workspace. The coordinator and the chain integration are Rust; a
-small PyO3 extension exposes the consensus primitives to Python; the miner
-binaries ship from their own repositories.
+This is a Rust workspace. The coordinator and the chain integration are Rust.
+The solver contract — the wire protocol, the consensus primitives, and the
+shared solver harness — lives in
+[quip-solver-core](https://gitlab.com/quip.network/quip-solver-core) and is
+consumed from crates.io. The miner binaries ship from their own repositories.
 
 ## Repository layout
 
 - `crates/` — the Cargo workspace: `quip-coordinator` (the binary),
-  `quip-miner-core` (the shared miner harness), `quip-protocol` (consensus
-  primitives), `quip-protocol-py` (the PyO3 extension), `quip-proto` (generated
-  protocol types), and two test doubles.
-- `python/` — the `quip_proto` SDK (PyO3 core + generated gRPC stubs).
-- `proto/` — the normative `.proto` IDL.
-- `conformance/` — the PyO3 parity test suite.
+  `quip-miner-exec` (a miner that shells out to an external solver), and
+  `quip-mock-miner` (the miner test double).
 - `docker/` — image builds and the example coordinator config.
 
 The miner binaries live in `quip.network/quip-miner-{cpu,cuda,metal,dwave}`.
+The `quip-proto`, `quip-protocol`, and `quip-solver-core` dependencies come
+from crates.io at v0.0.0; their source of truth is
+`quip.network/quip-solver-core`.
 
 ## CUDA card support
 
@@ -44,11 +45,13 @@ the driver's forward-compatible PTX JIT.
 - `AGENTS.md` — build, test, and run commands; repository conventions.
 - `COORDINATOR.md` — how the coordinator works (chain access, feeder, routing,
   supervision, session protocol).
-- `MINER.md` — the `quip-miner-core` harness and its helper modules.
-- `MINER_PROTOCOL.md` — the coordinator↔miner wire contract: message API,
-  handshake, credits, cancel, liveness, and exit codes.
-- `NEWMINER.md` — how to add a new miner.
+- `NEWMINER.md` — how to add a new miner and wire it into the coordinator.
 - `docs/VERSIONING.md` — the release-tag standard.
+
+The solver contract — the wire protocol, the `Sampler` trait, handshake,
+credits, cancel, and exit codes — is specified in the
+[quip-solver-core](https://gitlab.com/quip.network/quip-solver-core)
+repository (`SPEC.md`).
 
 ## Build and run
 
@@ -56,22 +59,13 @@ The workspace builds from the repository root (toolchain pinned in
 `rust-toolchain.toml`):
 
 ```bash
-cargo build --workspace --exclude quip-protocol-py
+cargo build --workspace
 ```
 
 Run the coordinator against a config that lists the miners and the validators:
 
 ```bash
 quip-coordinator --config ./docker/config.toml
-```
-
-The Python SDK builds with maturin:
-
-```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install maturin
-maturin develop -E dev
-pytest conformance/
 ```
 
 See `AGENTS.md` for the full command set and `COORDINATOR.md` for the run model.
@@ -81,7 +75,7 @@ See `AGENTS.md` for the full command set and `COORDINATOR.md` for the run model.
 The workspace tests run offline by default:
 
 ```bash
-cargo test --workspace --exclude quip-protocol-py
+cargo test --workspace
 ```
 
 ### Live devnet integration tests
@@ -126,8 +120,9 @@ chain. v0.3 splits it apart:
   node over subxt.
 - Each miner is a standalone binary in its own repository, supervised by the
   coordinator over a local socket. The Python miner stack is gone.
-- The only remaining Python is the `quip_proto` SDK, a PyO3 wrapper over the
-  Rust consensus primitives plus the generated gRPC stubs.
+- The solver contract — proto, consensus primitives, harness, and the Python
+  wheel — moved to `quip.network/quip-solver-core`. This repository holds no
+  Python.
 
 ## License
 
