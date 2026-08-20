@@ -6,9 +6,9 @@
 use clap::Parser;
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{
-    coord_msg, ising_problem, miner_msg, CoordMsg, Fatal, IsingProblem, Job, JobKind, JobRequest,
-    MinerMsg, Ready, Reject, RejectReason, Result as JobResult, SamplerMeta, Solution, Status,
-    Topology,
+    coord_msg, ising_problem, miner_msg, Capabilities, CoordMsg, Fatal, IsingProblem, Job, JobKind,
+    JobRequest, MinerMsg, Ready, Reject, RejectReason, Result as JobResult, SamplerMeta, Solution,
+    Status, Topology,
 };
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::session::{
@@ -134,7 +134,7 @@ fn decode_milli_f64(bytes: &[u8]) -> Result<Vec<f64>, quip_protocol::wire::WireE
         .collect())
 }
 
-/// Session-cached topology (mirrors quip-miner-core): resolves `TopologyHash`
+/// Session-cached topology (mirrors quip-solver-core): resolves `TopologyHash`
 /// jobs to dense edges, mapping native (possibly sparse) node ids to positions.
 struct SessionTopo {
     hash: Vec<u8>,
@@ -241,7 +241,7 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
     let n = h.len();
 
     // MALFORMED: an edge endpoint indexes past the node count (mirrors
-    // quip-miner-core::parse_ising, which rejects out-of-bounds inline edges
+    // quip-solver-core::parse_ising, which rejects out-of-bounds inline edges
     // instead of silently skipping them during scoring).
     if edges.iter().any(|&(u, v)| u >= n || v >= n) {
         return reject_and_replace(job_id, RejectReason::Malformed);
@@ -282,6 +282,7 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
         "mock",
         "sa",
         &[JobKind::IsingSample],
+        &[],
         BackendCaps {
             max_nodes: 0,
             max_edges: 0,
@@ -363,6 +364,22 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
                 tx.send(status_msg(miner_id))
                     .await
                     .map_err(|_| ExitCode::InternalFatal)?;
+            }
+            // Answer with the same permissive envelope --capabilities prints.
+            Some(coord_msg::Msg::GetCapabilities(_)) => {
+                tx.send(miner(miner_msg::Msg::Capabilities(Capabilities {
+                    backend: "mock".into(),
+                    algorithm: "sa".into(),
+                    supported_kinds: vec![JobKind::IsingSample as i32],
+                    max_nodes: 100_000,
+                    max_edges: 1_000_000,
+                    features: vec![],
+                    protocol_version: 1,
+                    stream_width: 1,
+                    native_topology_hash: None,
+                })))
+                .await
+                .map_err(|_| ExitCode::InternalFatal)?;
             }
             Some(coord_msg::Msg::Shutdown(s)) => {
                 grace_ms = if s.grace_ms == 0 {

@@ -17,7 +17,6 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
-COPY proto/ proto/
 RUN cargo build --release -p quip-coordinator
 
 # --- runtime (NVIDIA CUDA + Python) ---
@@ -72,7 +71,9 @@ COPY crates/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.s
 #
 # The install needs a build toolchain the runtime base does not carry: `git`
 # because the miner comes from a `git+https://` URL, and cargo/cc/protoc because
-# `quip_proto` has no wheel yet, so pip builds it through maturin. Everything
+# the pinned quip-miner-dwave tag still builds its protocol wheel from source
+# through maturin (the wheel now ships from quip.network/quip-solver-core; the
+# toolchain can go once the dwave pin depends on it from PyPI). Everything
 # build-only is installed, used and removed inside this single RUN so none of it
 # reaches the published image — a later `rm` would not shrink an earlier layer.
 RUN apt-get update && apt-get install -y --no-install-recommends \

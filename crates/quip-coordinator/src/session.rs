@@ -835,6 +835,19 @@ async fn run_session<C: ChainClient>(
             Some(miner_msg::Msg::Hello(_)) => {
                 tracing::warn!(miner = %miner_id, "miner sent Hello mid-session; ignoring");
             }
+            // A miner may send Capabilities unprompted when what it supports
+            // changes mid-session (e.g. a degraded device lowering max_nodes).
+            // This coordinator does not route on capabilities yet, so record it
+            // in the log and move on.
+            Some(miner_msg::Msg::Capabilities(caps)) => {
+                tracing::debug!(
+                    miner = %miner_id,
+                    backend = %caps.backend,
+                    max_nodes = caps.max_nodes,
+                    stream_width = caps.stream_width,
+                    "miner advertised capabilities; ignored (no capability routing)"
+                );
+            }
             // An empty `msg` is a message this build cannot name: either a
             // field number the miner uses and this coordinator does not, or the
             // reverse. Version skew between the two arrives here and nowhere

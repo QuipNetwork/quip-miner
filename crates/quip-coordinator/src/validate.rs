@@ -9,7 +9,7 @@
 //! a debug golden check.
 
 use quantum_validation::{calculate_diversity, select_diverse, MilliValue};
-use quip_proto::v1::{ising_problem, IsingProblem, QualityGates, Solution};
+use quip_proto::v1::{ising_problem, IsingProblem, Solution};
 use quip_protocol::wire::decode_i32_le;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -20,6 +20,20 @@ use std::collections::{HashMap, HashSet};
 /// extrinsic dispatches. The coordinator therefore submits only the
 /// diverse-selected subset, and the pallet re-selects within it.
 pub const MAX_PROOF_SOLUTIONS: usize = 32;
+
+/// The difficulty gates a result set must clear, derived from the session's
+/// [`SetTarget`](quip_proto::v1::SetTarget) by [`gates_from_target`]. A local
+/// value type: the wire carries the gates only inside `SetTarget` (the old
+/// standalone `QualityGates` proto message is gone from the contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QualityGates {
+    /// Exclusive energy ceiling a row must beat (the chain's `max_energy_milli`).
+    pub min_energy_milli: i64,
+    /// Minimum diversity (milli) over the diverse-selected subset.
+    pub min_diversity_milli: u32,
+    /// Minimum count of unique energy-valid solutions.
+    pub min_solutions: u32,
+}
 
 /// Outcome of coordinator-side result revalidation for miner gating.
 #[derive(Debug, Clone, PartialEq)]

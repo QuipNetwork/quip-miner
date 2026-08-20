@@ -2,15 +2,18 @@
 
 This repository is the v0.3 mining stack for the
 [quip-protocol-rs](https://gitlab.com/quip.network/quip-protocol-rs) chain. It
-holds two things: a coordinator that follows the chain, stages Ising problems,
-and submits proofs; and a shared Rust harness that miner binaries build on. The
-miners themselves live in their own repositories. Consensus rules live in the
-chain pallet. This document maps how the pieces fit and names the seams that
-keep them apart.
+holds the coordinator: it follows the chain, stages Ising problems, and
+submits proofs. The solver contract — the wire protocol, the consensus
+primitives, and the shared solver harness — lives in
+[quip-solver-core](https://gitlab.com/quip.network/quip-solver-core) and is
+consumed from crates.io. The miners themselves live in their own repositories.
+Consensus rules live in the chain pallet. This document maps how the pieces
+fit and names the seams that keep them apart.
 
-For task-level detail, read the three guides this document ties together:
-`COORDINATOR.md` (the coordinator internals), `MINER.md` (the harness), and
-`NEWMINER.md` (adding a backend). `docs/VERSIONING.md` covers release tags.
+For task-level detail, read the two guides this document ties together:
+`COORDINATOR.md` (the coordinator internals) and `NEWMINER.md` (adding a
+backend). The solver side is specified in quip-solver-core's `SPEC.md`.
+`docs/VERSIONING.md` covers release tags.
 
 ## Crate layout
 
@@ -19,20 +22,22 @@ import higher ones.
 
 | Crate | Role | Depends on |
 |-------|------|-----------|
-| `quip-proto` | Generated protocol types and gRPC service (from `proto/`) | — |
-| `quip-protocol` | Consensus primitives: `wire`, `session`, `scoring`, `derive`, `chacha8` | `quip-proto` |
-| `quip-miner-core` | Shared miner harness: `Sampler` trait, session client, adaptive params | `quip-proto`, `quip-protocol` |
-| `quip-miner-exec` | Generic external-solver miner: JSON model + exec over the session protocol | `quip-miner-core`, `quip-proto` |
+| `quip-miner-exec` | Generic external-solver miner: JSON model + exec over the session protocol | `quip-solver-core` |
 | `quip-coordinator` | The `quip-coordinator` binary: chain access, feeder, router, supervisor | `quip-proto`, `quip-protocol` |
-| `quip-protocol-py` | PyO3 extension exposing consensus primitives to Python (`quip_proto._core`) | `quip-protocol` |
-| `quip-mock-coordinator` | Scripted coordinator test double (package `ln`) | `quip-proto`, `quip-protocol` |
 | `quip-mock-miner` | Miner test double | `quip-proto`, `quip-protocol` |
 
-`quip-coordinator` doesn't depend on `quip-miner-core`. The two sides share
+Three dependencies come from crates.io at v0.0.0, published from the
+quip-solver-core repository: `quip-proto` (generated protocol types and gRPC
+service), `quip-protocol` (consensus primitives: `wire`, `session`, `scoring`,
+`derive`, `chacha8`), and `quip-solver-core` (the `Sampler` trait, session
+client, and adaptive params — it re-exports the other two).
+
+`quip-coordinator` does not depend on `quip-solver-core`. The two sides share
 nothing but the wire protocol (`quip-proto`) and the codec and session
 primitives (`quip-protocol`). This is the central decision of the v0.3 design.
 A miner is any process that speaks the protocol. Miners ship from separate
-repositories, and the D-Wave miner ships from Python over the PyO3 build.
+repositories, and the D-Wave miner ships from Python over the
+`quip-solver-core` PyPI wheel.
 
 ## The five seams
 
@@ -73,20 +78,22 @@ by `2^consecutive` within a failure budget. `shutdown_all` (`supervisor.rs:176`)
 ends the run: it sends an in-band `Shutdown`, waits the grace period, then kills
 any survivor. The protocol kill line is the `Shutdown` and `Cancel` control
 messages. The coordinator emits them (`session.rs:391` `send_cancel`,
-`session.rs:896` `shutdown_msg`); the harness honors them and drains in flight
-work (`quip-miner-core/src/session.rs:241` for `Shutdown`, `:233` for `Cancel`).
+`session.rs:896` `shutdown_msg`); the `quip-solver-core` harness honors them
+and drains in-flight work (its session loop and `SPEC.md` section 5 cover the
+cancel semantics).
 
 ### 4. The generic miner harness
 
-`quip-miner-core` is the standard interface every miner builds on. A backend
-supplies a `Sampler` (the `sample` method is required; streaming, throttling,
-and config hooks have defaults). The crate's `run` entry point handles the
-`--capabilities` and `--check` handshakes and drives `run_session`, the gRPC
-client loop. The crate is library-only, with no binary of its own.
+`quip-solver-core` (crates.io, from the quip-solver-core repository) is the
+standard interface every miner builds on. A backend supplies a `Sampler` (the
+`sample` method is required; streaming, throttling, and config hooks have
+defaults). The crate's `run` entry point handles the `--capabilities`,
+`--check`, and `--solve` modes and drives the gRPC session loop. The crate is
+library-only, with no binary of its own.
 
 The CPU, CUDA, and Metal miners are native binaries in their own repositories
-that call `run`. The D-Wave miner is Python, built on the PyO3 primitives in
-`quip-protocol-py`. For a backend that's a standalone executable rather than a
+that call `run`. The D-Wave miner is Python, built on the `quip-solver-core`
+PyPI wheel. For a backend that is a standalone executable rather than a
 Rust `Sampler`, `quip-miner-exec` is the plug-in point: it serializes each job
 to a JSON model, execs a configured external solver (by file or stdin), and
 parses the solver's JSON solutions back over the same session protocol. One part
@@ -100,13 +107,12 @@ of the target design still differs from the source:
 
 ### 5. Miners are isolated solvers
 
-`quip-miner-core` carries no chain or consensus logic. Its references to the
-chain are doc comments about energy and deadline semantics (`job.rs:31`,
-`job.rs:247`, `ising.rs:39`, `csr.rs:6`). From `quip-protocol` it imports the
-wire codec (`encode_spins`, `decode_i32_le`) and the session handshake
-(`build_hello`, `ExitCode`, `SessionConfig`), nothing else. A miner can't reach
-the node, directly or transitively. It receives an Ising problem, samples it,
-and returns spins with energies.
+`quip-solver-core` carries no chain or consensus logic. From `quip-protocol`
+it imports the wire codec and the session handshake, nothing else. A miner
+cannot reach the node, directly or transitively. It receives an Ising problem,
+samples it, and returns spins with energies. This isolation is why the
+contract could move to its own repository: the solver side depends on the
+chain through nothing but the wire.
 
 ## Job lifecycle
 
@@ -140,16 +146,13 @@ The identifiers that matter are `job_id`, the mempool `order_id`, and the
 The harness owns the adaptive-parameter mechanism; the layer that knows the
 concrete values supplies them.
 
-`quip-miner-core/src/adapt.rs` holds the ground-state-energy model that turns a
-difficulty target into `num_reads` and `num_sweeps`. Its constants are
-`C_EASY = 0.7`, `C_HARD = 0.75`, `ALPHA = 0.88`, and a default field set
-`DEFAULT_H = [-1, 0, 1]`. `conformance/golden_adapt.json` pins cross-language
-parity.
+`quip-solver-core`'s `adapt` module holds the ground-state-energy model that
+turns a difficulty target into `num_reads` and `num_sweeps`. The
+`quip-solver-conformance` crate's adapt vectors pin cross-language parity.
 
 Per-backend bounds are an `AdaptBounds` struct, not a fixed table in this
-repository. Each miner binary constructs its own. The CPU simulated-annealing
-reference used in the conformance test is `min_sweeps 64`, `max_sweeps 4096`,
-`min_reads 64`, `max_reads 512`, with read factors `4/8/0` (`adapt.rs:157`). The
+repository. Each miner binary constructs its own; `quip-miner-exec` uses
+conservative CPU-SA-like bounds (`crates/quip-miner-exec/src/main.rs`). The
 CUDA, Metal, and D-Wave bounds live in their own repositories.
 
 Genesis and consensus defaults live in the chain pallet, not here. The
@@ -163,13 +166,13 @@ seam and doesn't define them.
 
 ## Testing and the doubles
 
-Two crates exist only to test the protocol from each side.
-`quip-mock-coordinator` (package `ln`) is a scripted coordinator that can drive
-a real miner binary and inject malformed handshakes, such as the bad-welcome
-path (`driver.rs:114`), which the conformance suite depends on.
-`quip-mock-miner` is the mirror double for exercising the coordinator. Keeping
-both independent of the production serve loop is what lets them script failures
-the real path would never produce.
+Each side of the protocol has a test double. The coordinator side is
+`quip-solver-conformance` (in the quip-solver-core repository): a scripted
+coordinator, driven by the `quip-solver-drive` binary, that can drive a real
+miner binary and inject malformed handshakes. The miner side is this
+workspace's `quip-mock-miner`, the double the coordinator's integration tests
+spawn. Keeping both independent of the production serve loop is what lets
+them script failures the real path would never produce.
 
 The `drive` subcommand runs the coordinator against synthetic problems with no
 chain, using `FakeChain` and the `drive/` job sources. It's the fast offline
@@ -177,13 +180,11 @@ path for load and behavior testing.
 
 ## Build and run
 
-The Rust workspace builds from the repository root, excluding the PyO3 crate
-from the default set:
+The Rust workspace builds from the repository root:
 
 ```bash
-cargo build --workspace --exclude quip-protocol-py
-cargo test  --workspace --exclude quip-protocol-py
+cargo build --workspace
+cargo test  --workspace
 ```
 
-The Python SDK builds with maturin (`maturin develop -E dev`), and the parity
-suite runs with `pytest conformance/`. See `AGENTS.md` for the full command set.
+See `AGENTS.md` for the full command set.

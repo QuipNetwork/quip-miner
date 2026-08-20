@@ -2,7 +2,8 @@
 # Multi-arch (linux/amd64, linux/arm64) via buildx; TARGETARCH selects the
 # released CPU binaries. The coordinator is built from source; the CPU miner
 # binaries are downloaded from their release; the D-Wave miner is a Python
-# package (builds quip_proto from source until it is on PyPI).
+# package (its protocol wheel now ships from quip.network/quip-solver-core;
+# the pinned quip-miner-dwave tag decides where pip resolves it from).
 
 # --- builder: D-Wave venv (Python) then quip-coordinator (Rust) ---
 # Python is independent of the Rust build. Keep it above cargo so a Rust
@@ -33,31 +34,16 @@ WORKDIR /src
 # stub sources, then copy real sources and rebuild the binary. A source-only
 # change reuses the compiled external crates in target/.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY crates/quip-proto/Cargo.toml crates/quip-proto/
-COPY crates/quip-protocol/Cargo.toml crates/quip-protocol/
-COPY crates/quip-protocol-py/Cargo.toml crates/quip-protocol-py/
-COPY crates/quip-miner-core/Cargo.toml crates/quip-miner-core/
 COPY crates/quip-miner-exec/Cargo.toml crates/quip-miner-exec/
 COPY crates/quip-coordinator/Cargo.toml crates/quip-coordinator/
-COPY crates/quip-mock-coordinator/Cargo.toml crates/quip-mock-coordinator/
 COPY crates/quip-mock-miner/Cargo.toml crates/quip-mock-miner/
-# quip-proto build script and the .proto files it compiles.
-COPY crates/quip-proto/build.rs crates/quip-proto/build.rs
-COPY proto/ proto/
 RUN set -eux; \
-    for crate in quip-proto quip-protocol quip-protocol-py quip-miner-core; do \
-      mkdir -p "crates/${crate}/src"; \
-      printf 'pub fn _docker_dep_stub() {}\n' > "crates/${crate}/src/lib.rs"; \
-    done; \
     mkdir -p crates/quip-miner-exec/src; \
     printf 'pub fn _docker_dep_stub() {}\n' > crates/quip-miner-exec/src/lib.rs; \
     printf 'fn main() {}\n' > crates/quip-miner-exec/src/main.rs; \
     mkdir -p crates/quip-coordinator/src; \
     printf 'pub fn _docker_dep_stub() {}\n' > crates/quip-coordinator/src/lib.rs; \
     printf 'fn main() {}\n' > crates/quip-coordinator/src/main.rs; \
-    mkdir -p crates/quip-mock-coordinator/src; \
-    printf 'pub fn _docker_dep_stub() {}\n' > crates/quip-mock-coordinator/src/lib.rs; \
-    printf 'fn main() {}\n' > crates/quip-mock-coordinator/src/main.rs; \
     mkdir -p crates/quip-mock-miner/src; \
     printf 'fn main() {}\n' > crates/quip-mock-miner/src/main.rs; \
     cargo build --release -p quip-coordinator

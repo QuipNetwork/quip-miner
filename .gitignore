@@ -22,7 +22,6 @@ ENV/
 *.log
 *.csv
 results/
-quip_protocol.egg-info/
 .quip/
 
 # AI assistant config (project instructions live in AGENTS.md)
@@ -86,15 +85,11 @@ qpu_results_wins/
 # Rust build output
 target/
 
-# Python bytecode cache (nested packages)
-python/**/__pycache__/
-
 # Beads / Dolt files (added by bd init)
 .beads/
 .beads.gate.lock
 .dolt/
 *.db
-python/quip_proto/*.so
 
 # Benchmark output
 bench-out/

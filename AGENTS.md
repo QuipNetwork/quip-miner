@@ -2,27 +2,21 @@
 
 Cross-tool instructions for AI coding assistants (Claude Code, Codex, Cursor, Gemini CLI).
 
-QuIP v0.3 is a Rust workspace. The coordinator owns chain access and work routing; it spawns and supervises the miner subprocesses that do the sampling. The miner binaries ship from their own repos. A small PyO3 extension exposes the consensus primitives to Python.
+QuIP v0.3 is a Rust workspace. The coordinator owns chain access and work routing. It spawns and supervises the miner subprocesses that do the sampling. The miner binaries ship from their own repos. The solver contract (wire protocol, consensus primitives, solver harness) lives in `quip.network/quip-solver-core` and is consumed from crates.io at v0.0.0.
 
-For deeper detail, see the companion guides: `COORDINATOR.md` covers how the coordinator works, `MINER.md` covers the shared miner harness, and `NEWMINER.md` covers adding a new miner.
+For deeper detail, see the companion guides: `COORDINATOR.md` covers how the coordinator works, and `NEWMINER.md` covers adding a new miner. The solver contract itself is specified in the quip-solver-core repo (`SPEC.md`).
 
 ## Repository layout
 
 - `crates/` — the Cargo workspace (root manifest: `Cargo.toml`):
-  - `quip-proto` — protobuf/gRPC types generated from `proto/` (prost/tonic).
-  - `quip-protocol` — consensus primitives: scoring, wire codec, ChaCha8 draw, session types. The source of truth for the math.
-  - `quip-protocol-py` — PyO3 `cdylib` exposing `quip-protocol` as `quip_proto._core`. Built by maturin, not the default cargo build.
-  - `quip-miner-core` — shared miner harness: the gRPC session loop and the `Sampler` trait each backend supplies.
   - `quip-coordinator` — the coordinator binary: chain access, routing, miner supervision.
-  - `quip-mock-coordinator`, `quip-mock-miner` — test doubles.
-- `python/` — the `quip_proto` SDK (maturin `python-source`): the `_core` re-export shim plus the generated `quip.v1` gRPC stubs.
-- `proto/` — the normative `.proto` IDL.
-- `conformance/` — pytest suite pinning the PyO3 SDK to golden vectors.
+  - `quip-miner-exec` — a miner that shells out to a generic external solver.
+  - `quip-mock-miner` — the miner test double the coordinator tests spawn.
 - `docker/` — image builds (`Dockerfile.quip-miner`, `Dockerfile.quip-miner-cuda`) and `config.toml`.
 - `dwave_topologies/` — D-Wave embedding data.
 - `docs/VERSIONING.md` — the release-tag standard.
 
-The miner binaries live in their own repos: `quip.network/quip-miner-{cpu,cuda,metal,dwave}`.
+The miner binaries live in their own repos: `quip.network/quip-miner-{cpu,cuda,metal,dwave}`. The `quip-proto` (wire types), `quip-protocol` (consensus math), and `quip-solver-core` (`Sampler` trait + session loop) crates come from crates.io; their source repo is `quip.network/quip-solver-core`, which also publishes the `quip-solver-core` Python wheel the D-Wave miner uses.
 
 ## CUDA card support requirement
 
@@ -41,27 +35,17 @@ reviewed change to `SUPPORTED_ARCHS` in `quip-miner-cuda`
 The workspace builds from the repo root. The toolchain is pinned to 1.97.1 (`rust-toolchain.toml`).
 
 ```bash
-# Build every crate except the PyO3 cdylib (maturin builds that one).
-cargo build --workspace --exclude quip-protocol-py
+cargo build --workspace
 
-# Test (mirrors CI; the CI test job also excludes quip-coordinator).
-cargo test --workspace --exclude quip-coordinator --exclude quip-protocol-py
+# Test (mirrors CI; the CI test job excludes quip-coordinator, which has its own job).
+cargo test --workspace --exclude quip-coordinator
+cargo test -p quip-coordinator
 
 # Lint and format.
-cargo clippy --workspace --exclude quip-coordinator --exclude quip-protocol-py --all-targets -- -D warnings
+cargo clippy --workspace --exclude quip-coordinator --all-targets -- -D warnings
+cargo clippy -p quip-coordinator --all-targets -- -D warnings
 cargo fmt --all --check
 ```
-
-The Python SDK and its conformance suite need maturin:
-
-```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install maturin
-maturin develop -E dev     # builds quip_proto._core, installs quip_proto + dev extras
-pytest conformance/        # 19 tests
-```
-
-The PyO3 crate is a workspace member held out of `default-members`, so a bare `cargo build`/`cargo test` skips it. Build it with maturin, or target it directly with `cargo build -p quip-protocol-py`.
 
 ## Running the coordinator
 
@@ -104,11 +88,9 @@ The config registers miners and their launch plan. Each backend section (`[cpu]`
 such as `//Alice`. It also accepts any substrate secret URI, including a BIP39
 mnemonic phrase. `.env` holds credentials such as `DWAVE_API_KEY` — **never read or display its contents.**
 
-## The PyO3 SDK
+## The Python wheel
 
-`quip_proto` is the only Python surface. It re-exports the Rust consensus primitives (`scoring`, `wire`, `ExitCode`) from `quip_proto._core` and the generated gRPC stubs from `quip.v1`. The Rust in `quip-protocol` is the source of truth; the Python can't drift from it. The D-Wave miner repo depends on this wheel.
-
-Regenerate the `quip.v1` stubs from `proto/` with the pinned `grpcio-tools==1.82.1`; CI diffs the result against the checked-in copies, so a version bump and a stub regen go together.
+This repo holds no Python. The `quip-solver-core` PyPI wheel (consensus primitives + generated gRPC stubs) ships from `quip.network/quip-solver-core`, and the D-Wave miner repo depends on it. Report wheel or stub issues there.
 
 ## Conventions
 

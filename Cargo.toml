@@ -1,20 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-# quip-protocol-py is a PyO3 cdylib built by maturin (needs a Python interpreter
-# to link/run). It stays a workspace member so it shares [workspace.dependencies],
-# but is left out of default-members so a bare `cargo build`/`cargo test` skips it.
-# quip-miner-core is the shared sampler crate the standalone miner repos git-dep;
-# it lives here as the source of truth (miners: quip.network/quip-miner-{cpu,cuda,metal}).
-default-members = [
-    "crates/quip-proto",
-    "crates/quip-protocol",
-    "crates/quip-miner-core",
-    "crates/quip-miner-exec",
-    "crates/quip-coordinator",
-    "crates/quip-mock-coordinator",
-    "crates/quip-mock-miner",
-]
+# The solver contract (quip-proto, quip-protocol, quip-solver-core, the PyO3
+# wheel, and the conformance suite) lives in quip.network/quip-solver-core and
+# is consumed from crates.io. This workspace keeps only the coordinator side.
 
 [workspace.lints.rust]
 missing-docs          = "warn"
@@ -65,4 +54,3 @@ all = "warn"
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
-tonic-build = "0.12"

@@ -42,8 +42,8 @@ text.
 
 Spawned miners inherit these streams and log for themselves, so miner lines
 appear alongside the coordinator's own. Both spawn paths — supervised and
-`drive` — pass `--log-level` through to the child. `MINER.md` describes what a
-miner logs at each level.
+`drive` — pass `--log-level` through to the child. The quip-solver-core repo
+describes what a miner logs at each level.
 
 What each level carries:
 
@@ -391,8 +391,8 @@ coordinator dispatches staged `Job`s, and each `Result` or `Reject` is a
 terminal event that frees a credit and advances accounting. A periodic `Ping` (every 15s) draws a
 `Status` that reports how busy the miner is and surfaces paused or stale-round
 liveness; `Shutdown` ends the session in-band. The harness owns credits, reject
-reasons, and liveness, so each backend only has to sample. `MINER_PROTOCOL.md`
-specifies this contract from the miner's side.
+reasons, and liveness, so each backend only has to sample. `SPEC.md` in the
+quip-solver-core repo specifies this contract from the miner's side.
 
 ## Supervision and shutdown
 

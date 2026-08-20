@@ -11,11 +11,9 @@ publishes release tags, container images, or native binaries consumed by
 |----------|--------|---------|-----|
 | **Git release tag** | SemVer, **hyphenated** pre-release: `vMAJOR.MINOR.PATCH-rcN` | `v0.2.1-rc17` | quip-node-manager parses this |
 | Stable git tag | `vMAJOR.MINOR.PATCH` | `v0.2.1` | — |
-| Python package version (`pyproject.toml`, `shared/version.py`) | **PEP 440**, no hyphen: `MAJOR.MINOR.PATCHrcN` | `0.2.1rc17` | setuptools requires PEP 440 |
 
-The numeric parts (`MAJOR.MINOR.PATCH` and the `rc` number) **must match**
-between the git tag and the package version. Only the separator differs: the
-git tag has a hyphen before `rc`, the Python version doesn't.
+This repository ships no Python package. The `quip-solver-core` wheel versions
+from its own repository.
 
 ## Why the hyphen matters (don't drop it)
 
@@ -32,10 +30,6 @@ the **git release tag** with a SemVer comparator
 
 We standardize the **tag** to the form node-manager already understands rather
 than changing the comparator, so any other SemVer consumer also works.
-
-The Python package version stays PEP 440 because setuptools/pip require it; it
-isn't used for the update comparison (node-manager keys off the git-tag
-release marker, which dominates the binary's self-reported version).
 
 ## CI tag rules
 
@@ -59,15 +53,13 @@ for the native binary.
 
 ## Cutting a release
 
-1. Bump the Python version (PEP 440) in `pyproject.toml` and the
-   `shared/version.py` fallback — keep them in lockstep (such as `0.2.1rc17`).
-2. Commit the bump.
-3. Tag with the **hyphenated** form and push:
+1. Bump the crate versions in `crates/*/Cargo.toml` and commit the bump.
+2. Tag with the **hyphenated** form and push:
    ```bash
    git tag -a v0.2.1-rc17 -m "v0.2.1-rc17"
    git push origin v0.2 && git push origin v0.2.1-rc17
    ```
-4. CI builds the image (`:v0.2` + `:v0.2.1-rc17`) and, for quip-protocol, the
+3. CI builds the image (`:v0.2` + `:v0.2.1-rc17`) and, for quip-protocol, the
    `quip-miner-*` native binaries attached to the GitLab release. The release
    marker node-manager records is the git tag, so the hyphenated form flows
    through to the update check.
