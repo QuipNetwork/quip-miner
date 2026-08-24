@@ -1,0 +1,27 @@
+[project]
+name = "tutte"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "networkx>=3.0",
+    "numpy>=1.24",
+    "sympy>=1.12",
+    "dwave-networkx>=0.8.0",
+    "scipy>=1.10",
+    "mpmath>=1.3.0",
+    # cffi + setuptools required for the `_treewidth_c` C extension. Without
+    # them the gate at `treewidth.py:1196` silently falls back to the pure-
+    # Python `compute_treewidth_tutte`, which is 5-15× slower for tw>=5
+    # graphs (and untenable for D-Wave headers like Cm2 / Z(1,2) / Pm2).
+    # The C extension is JIT-compiled on first import via `ffi.compile()`.
+    "cffi>=1.16",
+    "setuptools>=68",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+viz = [
+    "flask>=3.0",
+]
