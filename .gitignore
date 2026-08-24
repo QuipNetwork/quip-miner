@@ -26,6 +26,7 @@ results/
 
 # AI assistant config (project instructions live in AGENTS.md)
 .claude/
+AGENTS.md
 CLAUDE.md
 docs/superpowers/
 
