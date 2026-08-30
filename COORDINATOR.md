@@ -168,6 +168,14 @@ pallet computes in `account_to_bytes`, or the pallet rejects the proof with
 `InvalidNonce`. Fund and look up the account. Derive nonces from the
 identity.
 
+The H3-to-H4 signing migration keeps the keystore format and 32-byte master
+seed unchanged, so existing keystore files still load. Account derivation is
+domain-separated over the suite's full hybrid public key, however, and H4
+derives different public bytes from the same seed. The resulting SS58 account
+therefore changes. Re-fund the new account from the faucet and submit a fresh
+`register_miner` before mining. `miner_identity_bytes` changes with the
+account because it is the pallet-matched hash of that account's SCALE encoding.
+
 ### Confirming a submission
 
 The transaction status stream reports pool and inclusion progress only. It
@@ -200,7 +208,7 @@ only ever sees them for errors the node reports before inclusion.
 
 `RealChainClient` (`chain/real.rs`) is the live client over Substrate
 JSON-RPC. `FakeChain` (`chain/fake.rs`) backs the tests. Supporting
-modules: `extrinsic` (hybrid sr25519 + ML-DSA-44 signing, `load_hybrid_pair`,
+modules: `extrinsic` (H4 hybrid sr25519 + FN-DSA-512 signing, `load_hybrid_pair`,
 `miner_identity_bytes`, `signer_account_bytes`), `snapshot`
 (`MiningSnapshot`, `DecayParams`),
 `mempool` (`JobOrder`), `submit` (`Proof`, `classify_receipt`, `SubmitAction`),
