@@ -266,7 +266,6 @@ image-quip-miner-cuda:
       TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       DEST="--destination $IMAGE:$REF"
-      [ -n "$CI_COMMIT_TAG" ] && DEST="$DEST --destination $IMAGE:latest"
       [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
       /kaniko/executor \
         --context "$CI_PROJECT_DIR" \
