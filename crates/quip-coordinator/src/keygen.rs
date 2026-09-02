@@ -2,7 +2,7 @@
 //!
 //! The keystore holds a 32-byte master seed as hex. `chain::extrinsic::
 //! load_hybrid_pair` reads that seed and derives the hybrid sr25519 plus
-//! ML-DSA-44 pair from it, so the seed is the only secret on disk.
+//! FN-DSA-512 pair from it, so the seed is the only secret on disk.
 
 use std::fmt;
 use std::io::{ErrorKind, Write as _};

@@ -31,7 +31,7 @@ faucet_url = "https://faucet.testnet.quip.network"
 # than an endless retry.
 # max_submit_attempts = 5
 
-# Hybrid sr25519 + ML-DSA-44 signer. The entrypoint generates a keystore at
+# H4 hybrid sr25519 + FN-DSA-512 signer. The entrypoint generates a keystore at
 # exactly this path on first run when the file is missing, so a bare
 # `docker run` produces a miner whose proofs verify. Mount your own keystore
 # over /data/keystore.json to bring an existing key. BACK IT UP — the chain

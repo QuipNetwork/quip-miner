@@ -16,10 +16,10 @@ rayon = "1.10"
 bytemuck = "1"
 quip-proto = "0.0.0"
 quip-protocol = "0.0.0"
-quantum-validation = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", branch = "main", version = ">=0.2.2" }
-quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", branch = "main", version = ">=0.2.2" }
+quantum-validation = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "48383a91449e13522b223727e47d1ae7b5603dc4", version = ">=0.2.2" }
+quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "48383a91449e13522b223727e47d1ae7b5603dc4", version = ">=0.2.2" }
 parity-scale-codec = { version = "3.7.5", default-features = false, features = ["derive", "std"] }
-sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", branch = "v0.2", default-features = false, features = ["std"] }
+sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", rev = "30810786a6610de8798594bbc5d4f00670744c6d", default-features = false, features = ["std"] }
 blake2 = "0.10"
 twox-hash = "1.6"
 jsonrpsee = { version = "0.24", features = [
@@ -69,11 +69,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
-quantum-validation = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", branch = "main", version = ">=0.2.2" }
-quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", branch = "main", version = ">=0.2.2" }
+quantum-validation = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "48383a91449e13522b223727e47d1ae7b5603dc4", version = ">=0.2.2" }
+quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "48383a91449e13522b223727e47d1ae7b5603dc4", version = ">=0.2.2" }
+quip-transaction-crypto-core = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "48383a91449e13522b223727e47d1ae7b5603dc4", version = ">=0.1.0" }
 quip-protocol = "0.0.0"
 quip-proto = "0.0.0"
-sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", branch = "v0.2", default-features = false, features = ["std"] }
+sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", rev = "30810786a6610de8798594bbc5d4f00670744c6d", default-features = false, features = ["std"] }
 parity-scale-codec = { version = "3.7.5", default-features = false, features = ["derive", "std"] }
 jsonrpsee = { version = "0.24", features = ["ws-client", "client-ws-transport-tls", "macros"] }
 blake2 = "0.10"

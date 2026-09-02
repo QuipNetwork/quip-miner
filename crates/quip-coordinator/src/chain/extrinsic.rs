@@ -1,5 +1,4 @@
-//! Hybrid-signed extrinsic assembly (mirrors Python
-//! `substrate/scale_codec.py::_build_hybrid_signed_extrinsic`).
+//! H4 hybrid-signed extrinsic assembly for the Quip runtime transaction format.
 
 use parity_scale_codec::{Compact, Encode};
 use quip_transaction_crypto::{account_id_from_public, HybridPair, HybridTxSignature};
@@ -367,6 +366,7 @@ pub fn extrinsic_hash(ext: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::chain::scale_types::{encode_submit_proof_call, QuantumProof};
+    use quip_transaction_crypto_core::{HYBRID_PUBLIC_LEN, HYBRID_SIGNATURE_LEN};
     use sp_core::{H256, U256};
 
     /// `hex_encode` already prepends `0x` (see its doc comment); a caller that
@@ -422,8 +422,9 @@ mod tests {
         let a = HybridTxSignature::sign(&pair, msg);
         let b = HybridTxSignature::sign(&pair, msg);
         assert_eq!(a.encode(), b.encode());
-        // Public is 1344 bytes; signature 2484; SCALE is just concatenation.
-        assert_eq!(a.encode().len(), 1344 + 2484);
+        // The envelope SCALE-encodes as the pinned suite's public key followed
+        // by its fixed-size signature buffer.
+        assert_eq!(a.encode().len(), HYBRID_PUBLIC_LEN + HYBRID_SIGNATURE_LEN);
     }
 
     #[test]
