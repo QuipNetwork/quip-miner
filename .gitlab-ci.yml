@@ -406,7 +406,12 @@ release-binaries:
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   tags: [linux, amd64]
   rules:
-    - if: $CI_COMMIT_TAG
+    # Canonical tags only. quip-node-manager's native (macOS) updater offers
+    # the newest Release that carries the darwin bundle, filtering on channel
+    # alone, so a custom-suffixed tag such as v0.3.1-rc3-aglais-prerelease
+    # must not get a Release object. Its bundle still lands in the generic
+    # package registry under the tag; only the Releases entry is skipped.
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\d+)?$/
   needs: [bundle-darwin-arm64]
   before_script: []
   script:
