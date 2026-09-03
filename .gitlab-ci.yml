@@ -243,19 +243,27 @@ image-quip-miner-manifest:
   tags: [docker, amd64]
   needs: [image-quip-miner-amd64, image-quip-miner-arm64]
   rules:
+    # :latest follows released versions only. Every tag pipeline runs this job,
+    # so an unconditional --tags latest let release candidates claim the tag an
+    # unpinned `docker pull` resolves to, and nodes that set no QUIP_MINER_TAG
+    # silently tracked -aglais-prerelease builds. A candidate publishes under
+    # its own tag and moves nothing.
+    #
+    # Matching the release version positively, rather than excluding the
+    # candidates, keeps this default-deny: a tag that is not a plain vN.N.N
+    # moves nothing, including one nobody anticipated. This is deliberately
+    # stricter than release-binaries below, which admits -rcN because
+    # quip-node-manager offers candidates on the release channel. Floating
+    # :latest is what an operator gets by not choosing, so it takes the
+    # narrower gate. Change one and you have not changed the other.
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+      variables:
+        MOVE_LATEST: "1"
     - if: $CI_COMMIT_TAG
   script:
     - |
       IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"; REF="$CI_COMMIT_TAG"
-      # :latest follows released versions only. Every tag pipeline runs this
-      # job, so an unconditional --tags latest let release candidates claim the
-      # tag that an unpinned `docker pull` resolves to, and nodes that set no
-      # QUIP_MINER_TAG silently tracked -aglais-prerelease builds. A candidate
-      # publishes under its own tag and moves nothing.
-      case "$REF" in
-        *-rc*|*prerelease*) set -- ;;
-        *) set -- --tags "latest" ;;
-      esac
+      if [ "${MOVE_LATEST:-0}" = 1 ]; then set -- --tags "latest"; else set --; fi
       echo "publishing $IMAGE:$REF${1:+ and :latest}"
       manifest-tool \
         --username "$CI_REGISTRY_USER" --password "$CI_REGISTRY_PASSWORD" \
