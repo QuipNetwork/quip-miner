@@ -294,30 +294,22 @@ build-coordinator-darwin-arm64:
     - if: $CI_COMMIT_TAG
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  # This job deliberately installs nothing but Rust. Nothing in the workspace
+  # generates code from .proto files: there is no build.rs, and neither
+  # prost-build nor tonic-build resolves into Cargo.lock, because tonic and
+  # prost are runtime-only dependencies here. The Linux images build this same
+  # crate with only build-essential, curl and ca-certificates.
+  #
+  # A protoc bootstrap used to live here and took a release with it twice, both
+  # times on runner host state rather than on anything in the tree: v0.3.0-rc7
+  # hit "brew: command not found" on a runner that exported no Homebrew PATH,
+  # and v0.3.1-rc6-aglais-prerelease hit an unwritable /opt/homebrew on a runner
+  # whose Homebrew belonged to another user. Do not reintroduce it unless a
+  # build script genuinely calls protoc. If one ever does, cargo fails with a
+  # clear message naming protoc, which beats carrying this bootstrap forever.
   before_script:
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
     - source "$CARGO_HOME/env"
-    # The shell executor runs non-interactively and sources no login profile,
-    # so Homebrew's bin directory is not guaranteed to be on PATH. v0.3.0-rc7
-    # failed here with "brew: command not found" and took the whole binary
-    # release with it. Put brew on PATH from its known prefix, then install
-    # protobuf only when protoc is still missing.
-    - |
-      for prefix in /opt/homebrew /usr/local; do
-        if [ -x "$prefix/bin/brew" ]; then
-          eval "$("$prefix/bin/brew" shellenv)"
-          break
-        fi
-      done
-      if ! command -v protoc >/dev/null 2>&1; then
-        if ! command -v brew >/dev/null 2>&1; then
-          echo "protoc is missing and no brew was found under /opt/homebrew or /usr/local" >&2
-          echo "install protobuf on this runner, or put brew on the runner PATH" >&2
-          exit 1
-        fi
-        brew install protobuf
-      fi
-      protoc --version
   script:
     - cargo build --release -p quip-coordinator
     - mkdir -p dist
