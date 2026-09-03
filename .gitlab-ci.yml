@@ -232,7 +232,8 @@ image-quip-miner-arm64:
         $KANIKO_EXTRA \
         $DEST
 
-# Stitch the per-arch images into the consumer-facing multi-arch tag (+ :latest).
+# Stitch the per-arch images into the consumer-facing multi-arch tag, and move
+# :latest when the tag is a released version.
 # Tags only (needs the per-arch images pushed). manifest-tool substitutes ARCH.
 image-quip-miner-manifest:
   stage: build
@@ -246,13 +247,22 @@ image-quip-miner-manifest:
   script:
     - |
       IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"; REF="$CI_COMMIT_TAG"
+      # :latest follows released versions only. Every tag pipeline runs this
+      # job, so an unconditional --tags latest let release candidates claim the
+      # tag that an unpinned `docker pull` resolves to, and nodes that set no
+      # QUIP_MINER_TAG silently tracked -aglais-prerelease builds. A candidate
+      # publishes under its own tag and moves nothing.
+      case "$REF" in
+        *-rc*|*prerelease*) set -- ;;
+        *) set -- --tags "latest" ;;
+      esac
+      echo "publishing $IMAGE:$REF${1:+ and :latest}"
       manifest-tool \
         --username "$CI_REGISTRY_USER" --password "$CI_REGISTRY_PASSWORD" \
         push from-args \
         --platforms linux/amd64,linux/arm64 \
         --template "$IMAGE:$REF-ARCH" \
-        --target "$IMAGE:$REF" \
-        --tags "latest"
+        --target "$IMAGE:$REF" "$@"
 
 # quip-miner-cuda: amd64-only (nvidia/cuda base), single kaniko job on finney.
 image-quip-miner-cuda:
