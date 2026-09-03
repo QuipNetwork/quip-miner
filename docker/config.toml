@@ -60,11 +60,15 @@ binary = "quip-cpu-sa"   # or "quip-cpu-gibbs"
 # min_block_budget, then bursts until the pool drains. Durations accept
 # s/m/h/d/w suffixes or a plain number of seconds. num_reads/anneal_time come
 # from the chain difficulty target (SetTarget), not this section.
+# budget_cap must be at or above min_block_budget: the pool cannot exceed the
+# cap, so a cap below the start threshold means the gate never opens and every
+# job is rejected. The miner lifts such a cap and logs an error naming both.
 # [dwave]
 # binary = "quip-dwave-qa"
 # daily_budget = "30s"      # QPU access time granted per day
 # min_block_budget = "90s"  # start threshold; default min(90s, daily_budget)
 # budget_cap = "5m"         # max pool size; default uncapped
+# initial_budget = "90s"    # pool at process start; default min_block_budget
 
 # Mining-attempt dashboard and indexer REST surface. Records every solved
 # model as JSONL under data_dir/<qblock_id>/attempts.jsonl and serves:

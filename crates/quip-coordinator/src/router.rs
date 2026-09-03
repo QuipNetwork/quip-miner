@@ -3,6 +3,7 @@
 use quip_proto::v1::ising_problem;
 use quip_proto::v1::{Job, RejectReason};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 /// Capability envelope advertised in `Hello`.
 #[derive(Debug, Clone)]
@@ -41,12 +42,31 @@ struct MinerQueue {
     unsupported_kinds: HashSet<i32>,
 }
 
+/// How often one miner's dropped-job total may reach the log at `warn`.
+///
+/// A miner that rejects everything it is offered (a QPU with an exhausted
+/// budget, say) drops one job per dispatch, and at credit speed that is
+/// thousands of lines a second. The count is what an operator needs, not the
+/// individual jobs.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Dropped-job accounting for one miner, for the rate-limited warn.
+#[derive(Debug)]
+struct DropLog {
+    /// Jobs dropped since the last line reached the log.
+    since_warn: u64,
+    /// When that line was emitted.
+    last_warn: Instant,
+}
+
 /// Routes jobs to miners by capability, stages them, and gates dispatch on credits.
 #[derive(Debug, Default)]
 pub struct Router {
     miners: HashMap<String, MinerQueue>,
     /// Jobs that could not be routed (no capable miner).
     pub unroutable: Vec<Job>,
+    /// Per-miner drop counters behind [`DROP_WARN_INTERVAL`].
+    drops: HashMap<String, DropLog>,
 }
 
 impl Router {
@@ -178,11 +198,52 @@ impl Router {
             }
         }
         if self.route_excluding(job, Some(miner_id)).is_none() {
-            tracing::warn!(
+            tracing::debug!(
                 miner = %miner_id,
                 reason,
                 "rejected job has no alternative capable miner; dropping"
             );
+            self.note_drop(miner_id, reason);
+        }
+    }
+
+    /// Count one dropped job, and let the total through at `warn` no more than
+    /// once per [`DROP_WARN_INTERVAL`] per miner.
+    ///
+    /// The first drop after a quiet period reports immediately, so a one-off
+    /// still surfaces; a flood collapses into one line carrying the count.
+    fn note_drop(&mut self, miner_id: &str, reason: i32) {
+        let now = Instant::now();
+        match self.drops.get_mut(miner_id) {
+            Some(log) if now.duration_since(log.last_warn) < DROP_WARN_INTERVAL => {
+                log.since_warn += 1;
+            }
+            Some(log) => {
+                tracing::warn!(
+                    miner = %miner_id,
+                    reason,
+                    dropped = log.since_warn + 1,
+                    window_s = DROP_WARN_INTERVAL.as_secs(),
+                    "rejected jobs have no alternative capable miner; dropping"
+                );
+                log.since_warn = 0;
+                log.last_warn = now;
+            }
+            None => {
+                tracing::warn!(
+                    miner = %miner_id,
+                    reason,
+                    dropped = 1,
+                    "rejected job has no alternative capable miner; dropping"
+                );
+                let _ = self.drops.insert(
+                    miner_id.to_string(),
+                    DropLog {
+                        since_warn: 0,
+                        last_warn: now,
+                    },
+                );
+            }
         }
     }
 
@@ -469,6 +530,40 @@ mod tests {
         let _ = r.route(make_job(2, JobKind::IsingSample));
         assert_eq!(r.staged_len("cpu-0"), 0);
         assert_eq!(r.staged_len("cpu-1"), 2);
+    }
+
+    /// A miner that rejects everything (an exhausted QPU budget) drops one job
+    /// per dispatch. Those drops must collapse into one line per window, or the
+    /// session log is unreadable for as long as the condition lasts.
+    #[test]
+    fn repeated_drops_collapse_into_one_warn_window() {
+        let mut r = Router::new();
+        r.register_miner("qpu-0", caps_ising());
+        for g in 1..=50 {
+            let job = make_job(g, JobKind::IsingSample);
+            let _ = r.route(job);
+            r.grant_credits("qpu-0", 1);
+            let dispatched = r.next_job("qpu-0").expect("dispatched");
+            r.on_reject("qpu-0", dispatched, RejectReason::Overloaded as i32);
+        }
+        let log = r.drops.get("qpu-0").expect("drop log");
+        // The first drop reports at once and resets the counter; the other 49
+        // are counted for the next line instead of being logged one by one.
+        assert_eq!(log.since_warn, 49);
+    }
+
+    /// A one-off drop still reaches the log immediately: rate limiting must not
+    /// swallow the first occurrence.
+    #[test]
+    fn first_drop_opens_a_window_immediately() {
+        let mut r = Router::new();
+        r.register_miner("qpu-0", caps_ising());
+        let job = make_job(1, JobKind::IsingSample);
+        let _ = r.route(job);
+        r.grant_credits("qpu-0", 1);
+        let dispatched = r.next_job("qpu-0").expect("dispatched");
+        r.on_reject("qpu-0", dispatched, RejectReason::Overloaded as i32);
+        assert_eq!(r.drops.get("qpu-0").expect("drop log").since_warn, 0);
     }
 
     #[test]
