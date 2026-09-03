@@ -82,6 +82,16 @@ RUN groupadd --system --gid 1000 quip \
 COPY --from=builder /src/target/release/quip-coordinator /usr/local/bin/quip-coordinator
 COPY --from=builder /opt/venv /opt/venv
 
+# Rebuild the venv's bytecode, validated by source hash rather than mtime.
+# pip wrote .pyc files in the builder, but the COPY above crosses a stage
+# boundary and kaniko does not preserve the source mtimes those .pyc headers
+# recorded, so every cache arrives stale. The miner runs as `quip`, which
+# cannot rewrite root-owned site-packages, so each start recompiled the whole
+# dependency tree in memory and reprinted third-party SyntaxWarnings (homebase,
+# plucky, dwave.preprocessing) into the operator's log. `unchecked-hash` pins
+# validity to the hash taken here, which no later mtime rewrite disturbs.
+RUN python -m compileall -q -f --invalidation-mode unchecked-hash /opt/venv/lib >/dev/null
+
 # Released CPU miner binaries for this arch, via the shared fetch-miners.sh —
 # single source of truth (the native/host install runs the same script). The
 # script derives arch from `uname` (correct on the per-arch kaniko runners).
