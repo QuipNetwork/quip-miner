@@ -169,6 +169,26 @@ verify-fetch-miners:
 # shim dangles until kaniko unpacks the rootfs; it never reaches the image).
 # NOT applied on arm64: no firmware mount, and the aarch64 ELF interpreter lives
 # directly in /lib, so ignoring /lib would break every RUN.
+# :latest follows released versions only. Every tag pipeline builds images, so
+# publishing :latest unconditionally let release candidates claim the tag an
+# unpinned `docker pull` resolves to, and nodes that set no QUIP_MINER_TAG
+# silently tracked -aglais-prerelease builds. A candidate publishes under its
+# own tag and moves nothing.
+#
+# Matching the release version positively, rather than excluding the candidate
+# suffixes, keeps this default-deny: a tag that is not a plain vN.N.N moves
+# nothing, including one nobody anticipated. This is deliberately stricter than
+# release-binaries below, which admits -rcN because quip-node-manager offers
+# candidates on the release channel. Floating :latest is what an operator gets
+# by not choosing, so it takes the narrower gate.
+#
+# Anchored so the manifest job and the cuda job share one definition. Two jobs
+# publish :latest; they must not drift into disagreeing about what earns it.
+.release-tag-rule: &release-tag-rule
+  if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+  variables:
+    MOVE_LATEST: "1"
+
 .kaniko-image:
   stage: build
   image:
@@ -184,6 +204,7 @@ verify-fetch-miners:
         "$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')" \
         > /kaniko/.docker/config.json
   rules:
+    - *release-tag-rule
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH
       when: manual
@@ -243,22 +264,7 @@ image-quip-miner-manifest:
   tags: [docker, amd64]
   needs: [image-quip-miner-amd64, image-quip-miner-arm64]
   rules:
-    # :latest follows released versions only. Every tag pipeline runs this job,
-    # so an unconditional --tags latest let release candidates claim the tag an
-    # unpinned `docker pull` resolves to, and nodes that set no QUIP_MINER_TAG
-    # silently tracked -aglais-prerelease builds. A candidate publishes under
-    # its own tag and moves nothing.
-    #
-    # Matching the release version positively, rather than excluding the
-    # candidates, keeps this default-deny: a tag that is not a plain vN.N.N
-    # moves nothing, including one nobody anticipated. This is deliberately
-    # stricter than release-binaries below, which admits -rcN because
-    # quip-node-manager offers candidates on the release channel. Floating
-    # :latest is what an operator gets by not choosing, so it takes the
-    # narrower gate. Change one and you have not changed the other.
-    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
-      variables:
-        MOVE_LATEST: "1"
+    - *release-tag-rule
     - if: $CI_COMMIT_TAG
   script:
     - |
@@ -284,7 +290,10 @@ image-quip-miner-cuda:
       TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       DEST="--destination $IMAGE:$REF"
+      [ "${MOVE_LATEST:-0}" = 1 ] && DEST="$DEST --destination $IMAGE:latest"
+      # Last, so a branch validation never pushes anything, :latest included.
       [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
+      echo "publishing: $DEST"
       /kaniko/executor \
         --context "$CI_PROJECT_DIR" \
         --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner-cuda" \
