@@ -346,16 +346,37 @@ fn parse_launch(root: &toml::Table) -> Vec<LaunchEntry> {
 }
 
 fn parse_dashboard(root: &toml::Table) -> Option<DashboardConfig> {
-    root.get("dashboard")
-        .and_then(|v| v.as_table())
-        .and_then(|t| {
-            let listen = t.get("listen").and_then(|v| v.as_str())?;
-            let data_dir = t.get("data_dir").and_then(|v| v.as_str())?;
-            Some(DashboardConfig {
-                listen: listen.to_string(),
-                data_dir: data_dir.to_string(),
-            })
-        })
+    let table = root.get("dashboard").and_then(|v| v.as_table())?;
+    let listen = table.get("listen").and_then(|v| v.as_str());
+    let data_dir = table.get("data_dir").and_then(|v| v.as_str());
+    // A partial section still boots, but silently: the operator wrote a
+    // [dashboard] block, got no server, and the only symptom was whatever sits
+    // in front of the port refusing the connection. Name the missing key here
+    // so the config, not the reverse proxy, reports the fault.
+    let (Some(listen), Some(data_dir)) = (listen, data_dir) else {
+        tracing::warn!(
+            missing = missing_dashboard_keys(listen, data_dir),
+            "[dashboard] is incomplete and the dashboard server will not start; \
+             it needs both `listen` and `data_dir`"
+        );
+        return None;
+    };
+    Some(DashboardConfig {
+        listen: listen.to_string(),
+        data_dir: data_dir.to_string(),
+    })
+}
+
+/// Names the `[dashboard]` keys absent from a section that has at least one of
+/// them missing. Split out from `parse_dashboard` so the naming is testable
+/// without capturing log output.
+fn missing_dashboard_keys(listen: Option<&str>, data_dir: Option<&str>) -> &'static str {
+    match (listen.is_some(), data_dir.is_some()) {
+        (false, false) => "listen, data_dir",
+        (false, true) => "listen",
+        (true, false) => "data_dir",
+        (true, true) => "",
+    }
 }
 
 fn parse_miner_identity(miner: &toml::Table) -> Result<MinerIdentity, ConfigError> {
@@ -576,6 +597,24 @@ budget_cap = "5m"
         // erroring, so a partial config still boots.
         let partial = format!("{SAMPLE}\n[dashboard]\nlisten = \"127.0.0.1:9090\"\n");
         assert!(parse_config(&partial).unwrap().dashboard.is_none());
+
+        let no_listen = format!("{SAMPLE}\n[dashboard]\ndata_dir = \"/data/attempts\"\n");
+        assert!(parse_config(&no_listen).unwrap().dashboard.is_none());
+
+        let empty = format!("{SAMPLE}\n[dashboard]\n");
+        assert!(parse_config(&empty).unwrap().dashboard.is_none());
+    }
+
+    #[test]
+    fn incomplete_dashboard_names_the_missing_keys() {
+        // The warning is only useful if it names the key the operator left
+        // out, so the naming is checked directly rather than through the log.
+        assert_eq!(missing_dashboard_keys(None, None), "listen, data_dir");
+        assert_eq!(missing_dashboard_keys(None, Some("/data")), "listen");
+        assert_eq!(
+            missing_dashboard_keys(Some("127.0.0.1:9090"), None),
+            "data_dir"
+        );
     }
 
     #[test]

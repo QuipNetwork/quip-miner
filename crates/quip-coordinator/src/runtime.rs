@@ -1011,6 +1011,37 @@ pub async fn feeder_loop<C>(
 /// once `shutdown` resolves — fanning an in-band `Shutdown` to each live miner
 /// and killing after grace. Generic over [`ChainClient`] so tests drive it with
 /// `FakeChain`; `main` passes `RealChainClient`. `state` is shared with the
+/// Optional mining-attempt dashboard: a single writer thread records every
+/// solved model to `<data_dir>/<qblock_id>/attempts.jsonl`, and an HTTP task
+/// serves those files plus the three `/api/v1` endpoints.
+///
+/// Logs which way it went either way. A silent skip here used to surface only
+/// as a refused connection from whatever proxies the port, which points the
+/// operator at the proxy instead of at the config that disabled the server.
+async fn spawn_dashboard(
+    params: &RuntimeParams,
+    state: &Arc<Mutex<CoordinatorState>>,
+    metrics: &Arc<crate::metrics::CoordinatorMetrics>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some((listen, data_dir)) = params.dashboard.clone() else {
+        // Reached both when the config carries no [dashboard] section and when
+        // it carries an unusable one; `parse_dashboard` warns about the latter
+        // and names the missing key.
+        tracing::info!("dashboard disabled: no usable [dashboard] section in the config");
+        return None;
+    };
+    tracing::info!(%listen, data_dir = %data_dir.display(), "dashboard enabled");
+    let tx = crate::attempt::spawn_writer(data_dir.clone());
+    state.lock().await.attempt_tx = Some(tx);
+    Some(tokio::spawn(crate::dashboard::serve(
+        listen,
+        crate::dashboard::DashboardState {
+            data_dir,
+            metrics: Arc::clone(metrics),
+        },
+    )))
+}
+
 /// caller so a live coordinator (and tests) can inspect routing/inflight.
 ///
 /// # Errors
@@ -1058,22 +1089,7 @@ where
     metrics.set_identity(params.identity.clone());
     state.lock().await.metrics = Arc::clone(&metrics);
 
-    // Optional mining-attempt dashboard: a single writer thread records every
-    // solved model to `<data_dir>/<qblock_id>/attempts.jsonl`, and an HTTP task
-    // serves those files plus the three `/api/v1` endpoints.
-    let dashboard_server = if let Some((listen, data_dir)) = params.dashboard.clone() {
-        let tx = crate::attempt::spawn_writer(data_dir.clone());
-        state.lock().await.attempt_tx = Some(tx);
-        Some(tokio::spawn(crate::dashboard::serve(
-            listen,
-            crate::dashboard::DashboardState {
-                data_dir,
-                metrics: Arc::clone(&metrics),
-            },
-        )))
-    } else {
-        None
-    };
+    let dashboard_server = spawn_dashboard(&params, &state, &metrics).await;
 
     let svc = CoordinatorService {
         state: Arc::clone(&state),
