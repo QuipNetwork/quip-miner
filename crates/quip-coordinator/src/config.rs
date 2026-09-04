@@ -1,6 +1,6 @@
 //! Parse `config.toml` into a per-miner launch plan.
 
-use crate::chain::scale_types::SystemInfoScale;
+use crate::chain::scale_types::{RuntimeInfoScale, SystemInfoScale};
 use crate::chain::{MinerKind, MinerSpecScale, NodeLogLevel};
 use quip_proto::v1::Configure;
 use std::collections::BTreeMap;
@@ -241,6 +241,8 @@ pub struct DescriptorParams {
     /// [`crate::survey::collect`]. Already inside every pallet bound. `None`
     /// when the probe missed its budget or could not run.
     pub system_info: Option<SystemInfoScale>,
+    /// Node-software block, collected alongside [`Self::system_info`].
+    pub runtime: Option<RuntimeInfoScale>,
 }
 
 impl Default for DescriptorParams {
@@ -255,6 +257,7 @@ impl Default for DescriptorParams {
             rpc_endpoints: Vec::new(),
             miners: Vec::new(),
             system_info: None,
+            runtime: None,
         }
     }
 }
@@ -277,6 +280,7 @@ impl DescriptorParams {
             // is what makes a TOML value structurally unable to reach
             // `SystemInfoScale`. `main` fills the field in afterwards.
             system_info: None,
+            runtime: None,
         }
     }
 }

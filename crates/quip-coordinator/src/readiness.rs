@@ -334,6 +334,15 @@ pub(crate) fn build_descriptor_payload(
         }
         fits
     });
+    let runtime = params.runtime.clone().filter(|info| {
+        let fits = crate::survey::runtime_fits_pallet_bounds(info);
+        if !fits {
+            tracing::warn!(
+                "runtime block exceeds a pallet bound; filing the descriptor without it"
+            );
+        }
+        fits
+    });
 
     Some(NodeDescriptorV2Input {
         node_id: node_id.into_bytes(),
@@ -345,7 +354,7 @@ pub(crate) fn build_descriptor_payload(
         log_level: params.log_level,
         miners: params.miners.clone(),
         system_info,
-        runtime: None,
+        runtime,
     })
 }
 
@@ -574,6 +583,9 @@ mod tests {
                 memory_mb: Some(16_376),
                 utilization_pct: Some(0),
             }],
+            python: "3.12.7".into(),
+            in_docker: true,
+            docker_image: Some("registry.example/quip-miner:beta".into()),
         }
     }
 
@@ -581,11 +593,13 @@ mod tests {
     fn survey_reaches_the_wire() {
         let expected = sanitize(surveyed_host());
         let params = DescriptorParams {
-            system_info: Some(expected.clone()),
+            system_info: Some(expected.system.clone()),
+            runtime: Some(expected.runtime.clone()),
             ..named_descriptor()
         };
         let payload = build_descriptor_payload(&params, account()).expect("payload");
-        assert_eq!(payload.system_info, Some(expected));
+        assert_eq!(payload.system_info, Some(expected.system));
+        assert_eq!(payload.runtime, Some(expected.runtime));
     }
 
     #[test]
@@ -603,10 +617,12 @@ mod tests {
         // Hand-built to bypass the sanitizer: a 200-byte brand against the
         // 96-byte pallet bound. On the wire this is a SCALE decode failure the
         // coordinator would misread as transient, so the gate must catch it.
-        let mut info = sanitize(surveyed_host());
+        let surveyed = sanitize(surveyed_host());
+        let mut info = surveyed.system;
         info.cpu.brand = vec![b'x'; 200];
         let params = DescriptorParams {
             system_info: Some(info),
+            runtime: Some(surveyed.runtime),
             ..named_descriptor()
         };
         let payload = build_descriptor_payload(&params, account()).expect("payload");
@@ -614,6 +630,9 @@ mod tests {
             payload.system_info.is_none(),
             "an over-length survey must be dropped, not filed"
         );
+        // The two blocks are gated independently, so a bad survey must not
+        // take the runtime block down with it.
+        assert!(payload.runtime.is_some());
     }
 
     #[test]
@@ -644,7 +663,8 @@ token = "{SENTINEL}"
         );
         let cfg = crate::config::parse_config(&toml).expect("config parses");
         let params = DescriptorParams {
-            system_info: Some(sanitize(surveyed_host())),
+            system_info: Some(sanitize(surveyed_host()).system),
+            runtime: Some(sanitize(surveyed_host()).runtime),
             ..DescriptorParams::from_config(&cfg)
         };
         let payload = build_descriptor_payload(&params, account()).expect("payload");

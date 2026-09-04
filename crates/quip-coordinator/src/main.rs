@@ -364,8 +364,12 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
     // fn reached from async with no `spawn_blocking`, so probing there would
     // stall a tokio worker. Once per process also matches the semantics of the
     // `descriptor_filed` latch.
-    descriptor.system_info =
-        quip_coordinator::survey::collect(quip_coordinator::survey::SURVEY_BUDGET);
+    if let Some(surveyed) =
+        quip_coordinator::survey::collect(quip_coordinator::survey::SURVEY_BUDGET)
+    {
+        descriptor.system_info = Some(surveyed.system);
+        descriptor.runtime = Some(surveyed.runtime);
+    }
     let descriptor_filed = Arc::new(AtomicBool::new(false));
     let miner_registered = Arc::new(AtomicBool::new(false));
     if let Some(code) = run_startup_prepare(
