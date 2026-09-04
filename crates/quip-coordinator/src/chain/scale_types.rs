@@ -260,6 +260,26 @@ pub const MAX_MINER_BACKEND_BYTES: usize = 32;
 /// Pallet `MaxMinerDeviceIdBytes`.
 pub const MAX_MINER_DEVICE_ID_BYTES: usize = 128;
 
+// The V2 survey bounds below mirror the validator runtime at the rev already
+// pinned in Cargo.toml (`runtime/src/configs/mod.rs`). Nothing links them at
+// compile time, so a runtime upgrade that moves a bound is a coordinator
+// change too. Over-length is a SCALE decode failure rather than a pallet
+// error, so it never reaches `DESCRIPTOR_REJECT`; see `crate::survey`.
+
+/// Pallet `MaxOsStringBytes`. One bound for `os.system`, `os.release`, and
+/// `os.machine` alike.
+pub const MAX_OS_STRING_BYTES: usize = 64;
+/// Pallet `MaxCpuBrandBytes`.
+pub const MAX_CPU_BRAND_BYTES: usize = 96;
+/// Pallet `MaxArchBytes`.
+pub const MAX_ARCH_BYTES: usize = 16;
+/// Pallet `MaxGpuVendorBytes`.
+pub const MAX_GPU_VENDOR_BYTES: usize = 16;
+/// Pallet `MaxGpuNameBytes`.
+pub const MAX_GPU_NAME_BYTES: usize = 96;
+/// Pallet `MaxGpus`.
+pub const MAX_GPUS: usize = 16;
+
 /// SCALE tag order must match `pallet_miner_registry::MinerKind`.
 #[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
 pub enum MinerKind {
@@ -393,7 +413,8 @@ pub struct NodeDescriptorV2Input {
     pub log_level: NodeLogLevel,
     /// Miners on this node.
     pub miners: Vec<MinerSpecScale>,
-    /// Optional hardware survey. The coordinator sends `None`.
+    /// Optional hardware survey, from [`crate::survey::collect`]. `None` when
+    /// the probe missed its budget or left a pallet bound violated.
     pub system_info: Option<SystemInfoScale>,
     /// Optional node-software block. The coordinator sends `None`.
     pub runtime: Option<RuntimeInfoScale>,

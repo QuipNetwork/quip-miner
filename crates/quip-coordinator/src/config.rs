@@ -1,7 +1,9 @@
 //! Parse `config.toml` into a per-miner launch plan.
 
+use crate::chain::scale_types::SystemInfoScale;
 use crate::chain::{MinerKind, MinerSpecScale, NodeLogLevel};
 use quip_proto::v1::Configure;
+use std::collections::BTreeMap;
 
 /// Errors raised while parsing a coordinator TOML config.
 #[derive(Debug, PartialEq)]
@@ -24,6 +26,29 @@ pub enum ConfigError {
         /// Key name, e.g. `public_host`.
         key: &'static str,
     },
+    /// A single-device backend section was written in the indexed
+    /// `[backend.N]` form. Only `[cuda]` takes an ordinal; elsewhere the
+    /// nested table is not a section at all — it lands in the miner's
+    /// `backend_toml` verbatim while the entry silently keeps device 0 and
+    /// ignores the `binary` key underneath it.
+    IndexedSingleDeviceSection {
+        /// Backend name, e.g. `metal`.
+        backend: &'static str,
+        /// The offending sub-table key, as written in the config.
+        key: String,
+    },
+    /// A `[cuda.N]` section key is not a device ordinal. N is passed to the
+    /// miner as `--device N`, so a non-numeric key names no GPU.
+    CudaSectionNotIndexed {
+        /// The offending section key, as written in the config.
+        key: String,
+    },
+    /// Two `[cuda.N]` sections normalize to the same ordinal (`[cuda.1]` and
+    /// `[cuda.01]`), which would spawn two miners contending on one GPU.
+    DuplicateCudaDevice {
+        /// The ordinal both sections resolve to.
+        device: usize,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -32,6 +57,18 @@ impl std::fmt::Display for ConfigError {
             Self::MissingMiner => write!(f, "missing [miner] section"),
             Self::BadToml(e) => write!(f, "bad toml: {e}"),
             Self::MissingMinerKey { key } => write!(f, "missing [miner].{key}"),
+            Self::IndexedSingleDeviceSection { backend, key } => write!(
+                f,
+                "bad [{backend}.{key}] section: only [cuda.N] is indexed by device;                  write [{backend}] and select the device with the miner's --device flag"
+            ),
+            Self::CudaSectionNotIndexed { key } => write!(
+                f,
+                "bad [cuda.{key}] section: the key must be a CUDA device index \
+                 (a non-negative integer)"
+            ),
+            Self::DuplicateCudaDevice { device } => {
+                write!(f, "two [cuda] sections resolve to device {device}")
+            }
             Self::NoBackends { looks_like_v0_2 } => {
                 write!(
                     f,
@@ -111,6 +148,13 @@ pub struct LaunchEntry {
     pub configure: Configure,
     /// Backend section that produced this entry (`cpu`, `cuda`, `metal`, `dwave`).
     pub backend: String,
+    /// CUDA device ordinal from the `[cuda.N]` section key, forwarded to the
+    /// child as `--device N`. `None` for backends whose binary has no
+    /// `--device` flag (`cpu`, `dwave`) and for `[metal]`, which the
+    /// coordinator only ever emits as device 0. This cannot travel in
+    /// `Configure.backend_toml`: the miner opens its device inside the `open`
+    /// closure, before the session receives `Configure`.
+    pub device: Option<usize>,
 }
 
 impl LaunchEntry {
@@ -127,7 +171,11 @@ impl LaunchEntry {
             kind: self.miner_kind(),
             label: Some(self.miner_id.as_bytes().to_vec()),
             backend: Some(self.backend.as_bytes().to_vec()),
-            device_id: None,
+            // The ordinal as text, matching `label` and `backend`. It is the
+            // only remote signal of which GPU a `cuda-N` miner actually holds:
+            // the label alone said `cuda-1` even while every miner shared
+            // GPU 0. `None` for backends that name no device.
+            device_id: self.device.map(|n| n.to_string().into_bytes()),
         }
     }
 }
@@ -189,6 +237,10 @@ pub struct DescriptorParams {
     pub rpc_endpoints: Vec<String>,
     /// Miner specs derived from the launch plan.
     pub miners: Vec<MinerSpecScale>,
+    /// Host hardware survey, collected once at startup by
+    /// [`crate::survey::collect`]. Already inside every pallet bound. `None`
+    /// when the probe missed its budget or could not run.
+    pub system_info: Option<SystemInfoScale>,
 }
 
 impl Default for DescriptorParams {
@@ -202,6 +254,7 @@ impl Default for DescriptorParams {
             log_level: NodeLogLevel::Info,
             rpc_endpoints: Vec::new(),
             miners: Vec::new(),
+            system_info: None,
         }
     }
 }
@@ -219,6 +272,11 @@ impl DescriptorParams {
             log_level: cfg.node_log_level,
             rpc_endpoints: cfg.validators.clone(),
             miners: cfg.launch.iter().map(LaunchEntry::miner_spec).collect(),
+            // Stays `None`, and stays free of I/O. This is the one function
+            // that sees a `CoordinatorConfig`, so leaving the survey out of it
+            // is what makes a TOML value structurally unable to reach
+            // `SystemInfoScale`. `main` fills the field in afterwards.
+            system_info: None,
         }
     }
 }
@@ -276,7 +334,7 @@ fn default_binary(backend: &str) -> String {
     }
 }
 
-fn entry(miner_id: &str, backend: &str, table: &toml::Table) -> LaunchEntry {
+fn entry(miner_id: &str, backend: &str, device: Option<usize>, table: &toml::Table) -> LaunchEntry {
     let binary = table
         .get("binary")
         .and_then(|v| v.as_str())
@@ -286,6 +344,7 @@ fn entry(miner_id: &str, backend: &str, table: &toml::Table) -> LaunchEntry {
         binary,
         configure: make_configure(table),
         backend: backend.into(),
+        device,
     }
 }
 
@@ -317,22 +376,59 @@ fn parse_node_log_level(raw: Option<&str>) -> NodeLogLevel {
     }
 }
 
-fn parse_launch(root: &toml::Table) -> Vec<LaunchEntry> {
+/// Reject `[backend.N]` under a backend that launches exactly one miner.
+///
+/// Only `[cuda]` is indexed. Written anywhere else, the sub-table is not a
+/// section: `entry()` reads the *outer* table, so the `binary` key nested
+/// under `N` is ignored and the sub-table is serialized into the miner's
+/// `backend_toml` as a stray `[N]` block. The entry still launches, on device
+/// 0, under the unindexed id — the same silent-wrong-GPU shape as the CUDA
+/// bug, which is why this is an error rather than a warning.
+fn reject_indexed(backend: &'static str, table: &toml::Table) -> Result<(), ConfigError> {
+    for (key, value) in table {
+        if value.is_table() {
+            return Err(ConfigError::IndexedSingleDeviceSection {
+                backend,
+                key: key.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Build the launch plan from the backend sections.
+///
+/// Two invariants hold for CUDA. The miner id is built from the *parsed*
+/// ordinal, so the id and the forwarded `--device` can never disagree
+/// (`[cuda.01]` becomes `cuda-1` on device 1). And entries come out in numeric
+/// order, so device 2 precedes device 10 — the old lexicographic key sort put
+/// them the other way round.
+fn parse_launch(root: &toml::Table) -> Result<Vec<LaunchEntry>, ConfigError> {
     let mut launch = Vec::new();
     if let Some(t) = root.get("cpu").and_then(|v| v.as_table()) {
-        launch.push(entry("cpu-0", "cpu", t));
+        reject_indexed("cpu", t)?;
+        launch.push(entry("cpu-0", "cpu", None, t));
     }
     if let Some(cuda) = root.get("cuda").and_then(|v| v.as_table()) {
-        let mut idxs: Vec<&String> = cuda.keys().collect();
-        idxs.sort();
-        for k in idxs {
-            if let Some(t) = cuda.get(k).and_then(|v| v.as_table()) {
-                launch.push(entry(&format!("cuda-{k}"), "cuda", t));
+        // The section key is an executable device ordinal now, not a label, so
+        // a key that is not a number must not fall through to device 0.
+        let mut by_device: BTreeMap<usize, &toml::Table> = BTreeMap::new();
+        for (k, v) in cuda {
+            let Some(t) = v.as_table() else { continue }; // non-table keys ignored, as today
+            let n = k
+                .parse::<usize>()
+                .map_err(|_| ConfigError::CudaSectionNotIndexed { key: k.clone() })?;
+            if by_device.insert(n, t).is_some() {
+                return Err(ConfigError::DuplicateCudaDevice { device: n });
             }
+        }
+        for (n, t) in by_device {
+            launch.push(entry(&format!("cuda-{n}"), "cuda", Some(n), t));
         }
     }
     if let Some(t) = root.get("metal").and_then(|v| v.as_table()) {
-        launch.push(entry("metal-0", "metal", t));
+        reject_indexed("metal", t)?;
+        launch.push(entry("metal-0", "metal", None, t));
     }
     // Prefer [dwave], fall back to [qpu].
     if let Some(t) = root
@@ -340,9 +436,9 @@ fn parse_launch(root: &toml::Table) -> Vec<LaunchEntry> {
         .or_else(|| root.get("qpu"))
         .and_then(|v| v.as_table())
     {
-        launch.push(entry("qpu-0", "dwave", t));
+        launch.push(entry("qpu-0", "dwave", None, t));
     }
-    launch
+    Ok(launch)
 }
 
 fn parse_dashboard(root: &toml::Table) -> Option<DashboardConfig> {
@@ -410,7 +506,11 @@ fn parse_miner_identity(miner: &toml::Table) -> Result<MinerIdentity, ConfigErro
 /// Returns [`ConfigError::MissingMiner`] when the `[miner]` section is absent,
 /// [`ConfigError::MissingMinerKey`] when a required `[miner]` identity key is
 /// missing or unusable, or [`ConfigError::BadToml`] when the input is not
-/// valid TOML.
+/// valid TOML. Returns [`ConfigError::CudaSectionNotIndexed`] when a `[cuda.N]`
+/// key is not a device ordinal, and [`ConfigError::DuplicateCudaDevice`] when
+/// two such sections resolve to the same ordinal. Returns
+/// [`ConfigError::IndexedSingleDeviceSection`] when a backend that launches one
+/// miner (`[cpu]`, `[metal]`) is written in the indexed `[backend.N]` form.
 pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
     let root: toml::Table =
         toml::from_str(toml_text).map_err(|e| ConfigError::BadToml(e.to_string()))?;
@@ -476,7 +576,7 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
         .and_then(|i| u32::try_from(i).ok())
         .unwrap_or(5);
 
-    let launch = parse_launch(&root);
+    let launch = parse_launch(&root)?;
     let dashboard = parse_dashboard(&root);
 
     if launch.is_empty() {
@@ -528,10 +628,8 @@ queue_depth = 4
 idle_timeout_s = 120
 
 [cuda.0]
-device_index = 0
 
 [cuda.1]
-device_index = 1
 
 [dwave]
 daily_budget = "30s"
@@ -545,6 +643,132 @@ budget_cap = "5m"
         assert_eq!(c.validators, vec!["ws://127.0.0.1:9944"]);
         let ids: Vec<&str> = c.launch.iter().map(|e| e.miner_id.as_str()).collect();
         assert_eq!(ids, vec!["cpu-0", "cuda-0", "cuda-1", "qpu-0"]);
+    }
+
+    /// The descriptor is the only place an operator can see, remotely, which
+    /// GPU a miner holds. Before the ordinal was forwarded, `cuda-1` was a
+    /// label with nothing behind it.
+    #[test]
+    fn miner_spec_reports_the_device_ordinal() {
+        let c = parse_config(SAMPLE).unwrap();
+        let spec = |id: &str| {
+            c.launch
+                .iter()
+                .find(|e| e.miner_id == id)
+                .unwrap_or_else(|| panic!("no {id}"))
+                .miner_spec()
+        };
+        assert_eq!(spec("cuda-0").device_id.as_deref(), Some(b"0".as_slice()));
+        assert_eq!(spec("cuda-1").device_id.as_deref(), Some(b"1".as_slice()));
+        // A backend that names no device must not invent one.
+        assert_eq!(spec("cpu-0").device_id, None);
+    }
+
+    #[test]
+    fn cuda_sections_carry_their_device_ordinal() {
+        // The section key is what binds the GPU: it reaches the miner as
+        // `--device N`, so it must survive parsing as a number.
+        let c = parse_config(SAMPLE).unwrap();
+        let dev = |id: &str| {
+            c.launch
+                .iter()
+                .find(|e| e.miner_id == id)
+                .unwrap_or_else(|| panic!("no {id}"))
+                .device
+        };
+        assert_eq!(dev("cuda-0"), Some(0));
+        assert_eq!(dev("cuda-1"), Some(1));
+    }
+
+    #[test]
+    fn non_cuda_sections_have_no_device() {
+        // `--device` is never sprayed at a binary whose CLI rejects it.
+        let c = parse_config(SAMPLE).unwrap();
+        for id in ["cpu-0", "qpu-0"] {
+            let e = c.launch.iter().find(|e| e.miner_id == id).unwrap();
+            assert_eq!(e.device, None, "{id} must not carry a device ordinal");
+        }
+    }
+
+    #[test]
+    fn cuda_sections_order_numerically() {
+        let cfg = "\n[miner]\npublic_host = \"h\"\npublic_port = 1\n\n[cuda.10]\n\n[cuda.2]\n";
+        let c = parse_config(cfg).unwrap();
+        let ids: Vec<&str> = c.launch.iter().map(|e| e.miner_id.as_str()).collect();
+        assert_eq!(ids, vec!["cuda-2", "cuda-10"]);
+        let devs: Vec<Option<usize>> = c.launch.iter().map(|e| e.device).collect();
+        assert_eq!(devs, vec![Some(2), Some(10)]);
+    }
+
+    #[test]
+    fn cuda_id_is_normalized_from_the_parsed_ordinal() {
+        // Id and flag come from one number, so they cannot disagree.
+        let cfg = "\n[miner]\npublic_host = \"h\"\npublic_port = 1\n\n[cuda.01]\n";
+        let c = parse_config(cfg).unwrap();
+        assert_eq!(c.launch.len(), 1);
+        let e = c.launch.first().unwrap();
+        assert_eq!(e.miner_id, "cuda-1");
+        assert_eq!(e.device, Some(1));
+    }
+
+    /// `[metal.1]` used to parse as `metal-0` on device 0, with the nested
+    /// table leaking into the miner's `backend_toml` as a stray `[1]` block
+    /// and the `binary` key under it ignored.
+    #[test]
+    fn indexed_metal_section_is_rejected() {
+        let toml = "[miner]\npublic_host = \"h\"\npublic_port = 1\n\n\
+                    [metal.1]\nbinary = \"quip-metal-sa\"\n";
+        assert_eq!(
+            parse_config(toml).err(),
+            Some(ConfigError::IndexedSingleDeviceSection {
+                backend: "metal",
+                key: "1".to_string()
+            })
+        );
+    }
+
+    /// Same shape under `[cpu]`, which is likewise a single-miner backend.
+    #[test]
+    fn indexed_cpu_section_is_rejected() {
+        let toml = "[miner]\npublic_host = \"h\"\npublic_port = 1\n\n[cpu.0]\n";
+        assert_eq!(
+            parse_config(toml).err(),
+            Some(ConfigError::IndexedSingleDeviceSection {
+                backend: "cpu",
+                key: "0".to_string()
+            })
+        );
+    }
+
+    /// The ordinary unindexed form must keep parsing, scalar keys and all.
+    #[test]
+    fn plain_metal_section_still_launches() {
+        let toml = "[miner]\npublic_host = \"h\"\npublic_port = 1\n\n\
+                    [metal]\nbinary = \"quip-metal-sa\"\nutilization = 50\n";
+        let c = parse_config(toml).unwrap();
+        let e = c.launch.iter().find(|e| e.miner_id == "metal-0").unwrap();
+        assert_eq!(e.binary, "quip-metal-sa");
+        assert_eq!(e.device, None);
+    }
+
+    #[test]
+    fn non_numeric_cuda_section_is_rejected() {
+        let cfg = "\n[miner]\npublic_host = \"h\"\npublic_port = 1\n\n[cuda.gpu0]\n";
+        assert_eq!(
+            parse_config(cfg).err(),
+            Some(ConfigError::CudaSectionNotIndexed {
+                key: "gpu0".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_cuda_ordinal_is_rejected() {
+        let cfg = "\n[miner]\npublic_host = \"h\"\npublic_port = 1\n\n[cuda.1]\n\n[cuda.01]\n";
+        assert_eq!(
+            parse_config(cfg).err(),
+            Some(ConfigError::DuplicateCudaDevice { device: 1 })
+        );
     }
 
     #[test]

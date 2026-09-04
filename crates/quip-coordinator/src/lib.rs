@@ -22,6 +22,7 @@ pub mod runtime;
 pub mod session;
 pub mod stash;
 pub mod supervisor;
+pub mod survey;
 pub mod timing;
 pub mod topology;
 pub mod validate;

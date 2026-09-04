@@ -71,6 +71,7 @@ fn cpu_entry(binary: String) -> LaunchEntry {
         miner_id: "cpu-0".into(),
         binary,
         backend: "cpu".into(),
+        device: None,
         configure: Configure {
             // Long idle so the miner stays connected until we shut it down.
             queue_depth: 3,
