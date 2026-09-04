@@ -81,6 +81,7 @@ async fn clean_exit_reclaims_and_reroutes_inflight() {
         miner_id: "cpu-0".into(),
         binary: true_bin.to_string(),
         backend: "cpu".into(),
+        device: None,
         configure: Configure::default(),
     };
     // Large base_ms: after the code-0 exit the supervisor parks in the OnDemand
@@ -127,4 +128,102 @@ async fn clean_exit_reclaims_and_reroutes_inflight() {
 
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
+/// The spawn must actually use the argv builder: `child_args` can be correct
+/// while `spawn_supervised_child` forgets to call it. A fake miner records its
+/// own argv and exits 0, so the assertion is on what the process really got.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawned_child_receives_device_flag() {
+    use quip_coordinator::config::LaunchEntry;
+    use quip_coordinator::session::CoordinatorState;
+    use quip_coordinator::supervisor::{supervise_miner, BackoffPolicy};
+    use quip_proto::v1::Configure;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{watch, Mutex};
+
+    // Unique per run: two test binaries may share a pid namespace, and a stale
+    // argv file from an earlier run would make this assert on the wrong argv.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("quip-argv-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let argv_file = dir.join("argv.txt");
+    let script = dir.join("fake-miner.sh");
+    // Write the script from a child process, never from this one. A sibling
+    // test forking while this process still held a write handle on the file
+    // would make the exec below fail with ETXTBSY, and a supervised spawn
+    // failure is indistinguishable here from an argv bug.
+    // Write to a sibling then rename: a rename within one directory is atomic,
+    // so the poll below either sees nothing or sees the whole argv. A plain
+    // redirect truncates first, and a read landing mid-write would return a
+    // prefix that silently passes the "non-empty" check with `--device` missing.
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {0}.tmp\nmv {0}.tmp {0}\nexit 0\n",
+        argv_file.display()
+    );
+    let made = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("printf '%s' \"$1\" > \"$2\" && chmod +x \"$2\"")
+        .arg("sh")
+        .arg(&body)
+        .arg(&script)
+        .status()
+        .expect("write fake miner");
+    assert!(made.success(), "could not write the fake miner script");
+
+    let entry = LaunchEntry {
+        miner_id: "cuda-1".into(),
+        binary: script.to_string_lossy().into_owned(),
+        backend: "cuda".into(),
+        configure: Configure::default(),
+        device: Some(1),
+    };
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let policy = BackoffPolicy {
+        base_ms: 60_000,
+        max_ms: 60_000,
+        budget: 100,
+        window_ms: 60_000,
+    };
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let handle = tokio::spawn(supervise_miner(
+        entry,
+        "unix:///nonexistent.sock".into(),
+        Arc::clone(&state),
+        policy,
+        200,
+        quip_coordinator::logging::LogLevel::Info,
+        stop_rx,
+    ));
+
+    let mut argv: Vec<String> = Vec::new();
+    for _ in 0..250 {
+        if let Ok(text) = std::fs::read_to_string(&argv_file) {
+            if !text.trim().is_empty() {
+                argv = text.lines().map(str::to_string).collect();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let value_after = |flag: &str| -> Option<String> {
+        let i = argv.iter().position(|a| a == flag)?;
+        argv.get(i + 1).cloned()
+    };
+    assert!(!argv.is_empty(), "fake miner never recorded its argv");
+    assert_eq!(value_after("--device").as_deref(), Some("1"), "{argv:?}");
+    assert_eq!(
+        value_after("--miner-id").as_deref(),
+        Some("cuda-1"),
+        "{argv:?}"
+    );
 }

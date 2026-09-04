@@ -74,9 +74,10 @@ and the feeder is the policy on top of it.
 with a fresh per-spawn session token and applies the exit-code restart policy
 (`restart_policy`, `supervisor.rs:25`). Clean exits respawn on demand,
 operator and environment errors (64, 69, 77) never respawn, and crashes back off
-by `2^consecutive` within a failure budget. `shutdown_all` (`supervisor.rs:176`)
-ends the run: it sends an in-band `Shutdown`, waits the grace period, then kills
-any survivor. The protocol kill line is the `Shutdown` and `Cancel` control
+by `2^consecutive` within a failure budget. A clap usage error (2) also never
+respawns: the argv does not match the binary, and no retry can fix that.
+`supervise_miner` also ends the run: on a stop signal it sends an in-band
+`Shutdown`, waits the grace period, then kills any survivor. The protocol kill line is the `Shutdown` and `Cancel` control
 messages. The coordinator emits them (`session.rs:391` `send_cancel`,
 `session.rs:896` `shutdown_msg`); the `quip-solver-core` harness honors them
 and drains in-flight work (its session loop and `SPEC.md` section 5 cover the

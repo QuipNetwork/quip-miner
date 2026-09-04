@@ -159,6 +159,12 @@ struct DriveArgs {
     /// Forward `--yielding` to the spawned miner (cuda/metal only).
     #[arg(long, default_value_t = false)]
     yielding: bool,
+    /// CUDA device ordinal for the spawned miner. A config run takes this from
+    /// the `[cuda.N]` section key, which drive has no equivalent of, so a
+    /// multi-GPU host needs it stated here or the miner lands on GPU 0.
+    /// Omit for backends whose CLI has no `--device`.
+    #[arg(long)]
+    device: Option<usize>,
 }
 
 #[expect(
@@ -353,7 +359,13 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
         top_up: cfg.faucet_top_up_plancks,
         timeout: std::time::Duration::from_secs(cfg.funding_timeout_s),
     };
-    let descriptor = quip_coordinator::config::DescriptorParams::from_config(&cfg);
+    let mut descriptor = quip_coordinator::config::DescriptorParams::from_config(&cfg);
+    // Survey the host once, here. `build_descriptor_payload` is a synchronous
+    // fn reached from async with no `spawn_blocking`, so probing there would
+    // stall a tokio worker. Once per process also matches the semantics of the
+    // `descriptor_filed` latch.
+    descriptor.system_info =
+        quip_coordinator::survey::collect(quip_coordinator::survey::SURVEY_BUDGET);
     let descriptor_filed = Arc::new(AtomicBool::new(false));
     let miner_registered = Arc::new(AtomicBool::new(false));
     if let Some(code) = run_startup_prepare(
@@ -693,6 +705,28 @@ fn run_drive_cli(args: DriveArgs, log_level: LogLevel) -> StdExitCode {
     rt.block_on(drive_main(args, log_level))
 }
 
+/// The launch entry `drive` spawns its miner from.
+///
+/// Split out of `drive_main` so the one field an operator can get wrong is
+/// testable without standing up a session: `--device` is the only way a drive
+/// run reaches a GPU other than 0, because drive has no `[cuda.N]` section to
+/// take an ordinal from.
+fn drive_entry(args: &DriveArgs) -> LaunchEntry {
+    LaunchEntry {
+        miner_id: "drive-0".into(),
+        binary: args.miner.to_string_lossy().into_owned(),
+        backend: "cpu".into(),
+        device: args.device,
+        configure: Configure {
+            queue_depth: 3,
+            idle_timeout_s: 30,
+            heartbeat_s: 15,
+            reconnect_window_s: 60,
+            backend_toml: String::new(),
+        },
+    }
+}
+
 #[expect(
     clippy::print_stderr,
     reason = "CLI binary reports drive run failures to stderr"
@@ -713,18 +747,7 @@ async fn drive_main(args: DriveArgs, log_level: LogLevel) -> StdExitCode {
         }
     };
 
-    let entry = LaunchEntry {
-        miner_id: "drive-0".into(),
-        binary: args.miner.to_string_lossy().into_owned(),
-        backend: "cpu".into(),
-        configure: Configure {
-            queue_depth: 3,
-            idle_timeout_s: 30,
-            heartbeat_s: 15,
-            reconnect_window_s: 60,
-            backend_toml: String::new(),
-        },
-    };
+    let entry = drive_entry(&args);
     let sock = format!("/tmp/quip-coordinator-drive-{}.sock", std::process::id());
     let token = gen_session_token();
     let report = run_drive(DriveManyParams {
@@ -775,6 +798,23 @@ async fn drive_main(args: DriveArgs, log_level: LogLevel) -> StdExitCode {
 mod tests {
     use super::*;
 
+    /// The drive counterpart of the `[cuda.N]` bug: without `--device`, a
+    /// drive run on a multi-GPU host silently lands on GPU 0.
+    #[test]
+    fn drive_device_flag_reaches_the_launch_entry() {
+        let mut args = drive_args(DriveSourceKind::Random);
+        args.device = Some(1);
+        assert_eq!(drive_entry(&args).device, Some(1));
+    }
+
+    /// Backends whose CLI has no `--device` must not be sent one, so the
+    /// absent flag has to stay absent rather than defaulting to 0.
+    #[test]
+    fn drive_without_the_flag_forwards_no_device() {
+        let args = drive_args(DriveSourceKind::Random);
+        assert_eq!(drive_entry(&args).device, None);
+    }
+
     fn drive_args(source: DriveSourceKind) -> DriveArgs {
         DriveArgs {
             miner: PathBuf::from("miner"),
@@ -789,6 +829,7 @@ mod tests {
             num_reads: None,
             num_sweeps: None,
             deadline_ms: 1000,
+            device: None,
             report: None,
             utilization: None,
             yielding: false,

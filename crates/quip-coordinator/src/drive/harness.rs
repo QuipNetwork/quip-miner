@@ -571,16 +571,19 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
 
     let socket_uri = format!("unix://{sock_path}");
     let mut cmd = Command::new(p.miner_bin);
+    // The session flags — including `--device` when the entry carries one —
+    // come from the supervised path's builder, so drive cannot drift from the
+    // argv a real run produces. Only the governor flags below are drive's own.
     let _ = cmd
-        .arg("--quip-coordinator")
-        .arg(&socket_uri)
-        .arg("--miner-id")
-        .arg(miner_id)
-        .arg("--log-level")
-        .arg(p.log_level.to_string())
+        .args(crate::supervisor::child_args(
+            p.entry,
+            &socket_uri,
+            p.log_level,
+        ))
         .env("QUIP_SESSION_TOKEN", p.token);
     // Mechanism A: forward governor flags to the spawned miner's own CLI
-    // (cuda/metal). config.toml still overrides these via backend_toml.
+    // (cuda/metal). Drive has no `backend_toml` to carry them, which is why
+    // these are argv here and are not in the supervised path.
     if let Some(util) = p.utilization {
         let _ = cmd.arg("--utilization").arg(util.to_string());
     }

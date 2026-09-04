@@ -58,6 +58,7 @@ async fn drives_two_entry_list_end_to_end() {
         miner_id: "cpu-0".into(),
         binary: miner.clone(),
         backend: "cpu".into(),
+        device: None,
         configure: Configure {
             queue_depth: 3,
             idle_timeout_s: 30,

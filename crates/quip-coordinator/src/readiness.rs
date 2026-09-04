@@ -319,6 +319,22 @@ pub(crate) fn build_descriptor_payload(
         rpc_endpoints.push(trimmed.as_bytes().to_vec());
     }
 
+    // Last gate before the wire. The sanitizer already guarantees the bounds,
+    // so this only fires if a future edit to the probe or the sanitizer breaks
+    // one. It matters because an over-length field is a SCALE decode failure
+    // at the node, not a pallet error: it matches nothing in
+    // `DESCRIPTOR_REJECT`, so it is misclassified as transient, burns the
+    // three attempts, and latches the node into filing no descriptor at all
+    // for the rest of the process. Dropping the survey degrades to a
+    // descriptor without hardware instead of to an invisible node.
+    let system_info = params.system_info.clone().filter(|info| {
+        let fits = crate::survey::fits_pallet_bounds(info);
+        if !fits {
+            tracing::warn!("host survey exceeds a pallet bound; filing the descriptor without it");
+        }
+        fits
+    });
+
     Some(NodeDescriptorV2Input {
         node_id: node_id.into_bytes(),
         node_name: name.as_bytes().to_vec(),
@@ -328,7 +344,7 @@ pub(crate) fn build_descriptor_payload(
         auto_mine: params.auto_mine,
         log_level: params.log_level,
         miners: params.miners.clone(),
-        system_info: None,
+        system_info,
         runtime: None,
     })
 }
@@ -439,8 +455,9 @@ pub(crate) async fn declare_round_participation<C: ChainClient>(
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_qblock_id, declare_round_participation, file_round_descriptor, prepare_round,
-        register_round_miner, HttpFaucet, ProcessLatches, SUBMIT_ATTEMPTS,
+        build_descriptor_payload, candidate_qblock_id, declare_round_participation,
+        file_round_descriptor, prepare_round, register_round_miner, HttpFaucet, ProcessLatches,
+        SUBMIT_ATTEMPTS,
     };
     use crate::chain::{
         ChainError, DescriptorOutcome, FakeChain, MinerKind, MinerSpecScale, MiningSnapshot,
@@ -448,6 +465,7 @@ mod tests {
     };
     use crate::config::DescriptorParams;
     use crate::funding::FundingParams;
+    use crate::survey::{sanitize, RawGpu, RawSurvey};
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -538,6 +556,105 @@ mod tests {
             ],
             ..DescriptorParams::default()
         }
+    }
+
+    fn surveyed_host() -> RawSurvey {
+        RawSurvey {
+            os_system: "Linux".into(),
+            os_release: "6.1.0-52-amd64".into(),
+            os_machine: "x86_64".into(),
+            cpu_brand: "AMD Ryzen 9 5950X 16-Core Processor".into(),
+            cpu_arch: "x86_64".into(),
+            logical_cores: Some(32),
+            physical_cores: Some(16),
+            memory_mb: Some(128_693),
+            gpus: vec![RawGpu {
+                vendor: "NVIDIA".into(),
+                name: "NVIDIA RTX A4000".into(),
+                memory_mb: Some(16_376),
+                utilization_pct: Some(0),
+            }],
+        }
+    }
+
+    #[test]
+    fn survey_reaches_the_wire() {
+        let expected = sanitize(surveyed_host());
+        let params = DescriptorParams {
+            system_info: Some(expected.clone()),
+            ..named_descriptor()
+        };
+        let payload = build_descriptor_payload(&params, account()).expect("payload");
+        assert_eq!(payload.system_info, Some(expected));
+    }
+
+    #[test]
+    fn descriptor_files_without_a_survey() {
+        let params = DescriptorParams {
+            system_info: None,
+            ..named_descriptor()
+        };
+        let payload = build_descriptor_payload(&params, account()).expect("payload");
+        assert!(payload.system_info.is_none());
+    }
+
+    #[test]
+    fn oversize_survey_is_dropped_not_fatal() {
+        // Hand-built to bypass the sanitizer: a 200-byte brand against the
+        // 96-byte pallet bound. On the wire this is a SCALE decode failure the
+        // coordinator would misread as transient, so the gate must catch it.
+        let mut info = sanitize(surveyed_host());
+        info.cpu.brand = vec![b'x'; 200];
+        let params = DescriptorParams {
+            system_info: Some(info),
+            ..named_descriptor()
+        };
+        let payload = build_descriptor_payload(&params, account()).expect("payload");
+        assert!(
+            payload.system_info.is_none(),
+            "an over-length survey must be dropped, not filed"
+        );
+    }
+
+    #[test]
+    fn toml_token_does_not_reach_the_wire() {
+        const SENTINEL: &str = "QUIPSENTINEL0123456789";
+        let toml = format!(
+            r#"
+[miner]
+validators = ["ws://127.0.0.1:9944"]
+signer_key = "//Alice"
+public_host = "203.0.113.10"
+public_port = 20050
+node_name = "Tesla"
+
+[cpu]
+binary = "quip-cpu-gibbs"
+num_cpus = 8
+token = "{SENTINEL}"
+
+[cuda.0]
+device_index = 0
+api_key = "{SENTINEL}"
+
+[dwave]
+daily_budget = "30s"
+token = "{SENTINEL}"
+"#
+        );
+        let cfg = crate::config::parse_config(&toml).expect("config parses");
+        let params = DescriptorParams {
+            system_info: Some(sanitize(surveyed_host())),
+            ..DescriptorParams::from_config(&cfg)
+        };
+        let payload = build_descriptor_payload(&params, account()).expect("payload");
+        let bytes = crate::chain::scale_types::encode_set_descriptor_call(&payload);
+        assert!(
+            !bytes
+                .windows(SENTINEL.len())
+                .any(|window| window == SENTINEL.as_bytes()),
+            "an operator token from config.toml reached the descriptor payload"
+        );
     }
 
     #[tokio::test]

@@ -36,9 +36,10 @@ idle_timeout_s = 300
 # at or below this budget.
 # num_cpus = 6
 
-# One CUDA miner per device (amd64 only). Default binary: quip-cuda-sa.
+# One CUDA miner per device (amd64 only). N in `[cuda.N]` is the CUDA device
+# ordinal; the coordinator passes it to the miner as `--device N`.
+# Default binary: quip-cuda-sa.
 [cuda.0]
-device_index = 0
 binary = "quip-cuda-sa"       # or "quip-cuda-gibbs"
 
 # Apple Silicon Metal miner. Default binary: quip-metal-sa.

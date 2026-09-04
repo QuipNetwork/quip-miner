@@ -104,6 +104,7 @@ async fn e2e_mock_miner_pow_submit_via_fake_chain() {
         miner_id: "cpu-0".into(),
         binary: miner.clone(),
         backend: "cpu".into(),
+        device: None,
         configure: Configure {
             queue_depth: 3,
             idle_timeout_s: 30,

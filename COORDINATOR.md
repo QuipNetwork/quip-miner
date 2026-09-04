@@ -441,6 +441,40 @@ fields of the `Configure` message; every other key passes through verbatim in
 `Configure.backend_toml`, which the coordinator forwards to the miner. This is
 how a backend receives its own settings without the coordinator knowing them.
 
+For CUDA, N is the device ordinal as well as the miner id. The coordinator
+forwards it on the child argv as `--device N`. The id and the flag come from the
+same parsed number, so they cannot disagree. The ordinal also reaches the
+on-chain descriptor as `device_id`, which is how an operator confirms the
+binding remotely. `quip-coordinator drive` has no config sections, so it takes
+the ordinal from its own `--device` flag and defaults to GPU 0 without one. A `[cuda.N]` *section* whose key is
+not a non-negative integer, and two sections that resolve to one ordinal
+(`[cuda.1]` and `[cuda.01]`), are config errors. A non-table key under `[cuda]`
+is ignored, as before.
+
+**Upgrading:** two behaviors change for configs written against earlier
+releases. `[cuda.N]` now binds GPU N, so miners that all shared GPU 0 on a
+multi-GPU host spread across cards; throughput and thermals change with them.
+Check `nvidia-smi -L | wc -l` against the highest `[cuda.N]` first, because a
+section naming a GPU the host does not have now fails at device open (exit 69,
+never restarted) instead of mining on GPU 0. A non-numeric section such as
+`[cuda.gpu0]`, which used to launch a miner named `cuda-gpu0` on GPU 0, is now
+a startup error: rename the key to the device ordinal. `[cuda]` is the only
+indexed backend, so `[metal.N]` and `[cpu.N]` are startup errors too: they used
+to launch as `metal-0`/`cpu-0` on device 0 with the nested table leaking into
+the miner's `backend_toml` and the `binary` key under it ignored. Write
+`[metal]` or `[cpu]`. The `device_index` key
+was never read and is gone from `config.toml.example`; leaving it in an
+existing config costs one "unknown field" warning from the miner.
+
+A backend key travels on the child argv only when the miner must know it
+*before* it opens its device. Every other key travels in
+`Configure.backend_toml`. `--device` is the only key that meets this test: the
+CUDA context is created inside the miner `open` closure, before any wire byte is
+read, while `apply_config` runs after the handshake. Keys such as `utilization`
+and `yielding` are therefore never forwarded on argv from the supervised path.
+They already arrive in `backend_toml`, and sending them twice would put one
+operator value into two channels.
+
 ## Dashboard and REST surface
 
 The optional `[dashboard]` section starts a read-only HTTP server. `listen`
