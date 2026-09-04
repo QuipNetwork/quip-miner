@@ -279,6 +279,11 @@ pub const MAX_GPU_VENDOR_BYTES: usize = 16;
 pub const MAX_GPU_NAME_BYTES: usize = 96;
 /// Pallet `MaxGpus`.
 pub const MAX_GPUS: usize = 16;
+/// Pallet `MaxRuntimeVersionBytes`. One bound for `python` and `quip_version`
+/// alike.
+pub const MAX_RUNTIME_VERSION_BYTES: usize = 48;
+/// Pallet `MaxDockerImageBytes`.
+pub const MAX_DOCKER_IMAGE_BYTES: usize = 256;
 
 /// SCALE tag order must match `pallet_miner_registry::MinerKind`.
 #[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
@@ -416,7 +421,8 @@ pub struct NodeDescriptorV2Input {
     /// Optional hardware survey, from [`crate::survey::collect`]. `None` when
     /// the probe missed its budget or left a pallet bound violated.
     pub system_info: Option<SystemInfoScale>,
-    /// Optional node-software block. The coordinator sends `None`.
+    /// Optional node-software block, from [`crate::survey::collect`]. `None`
+    /// when the probe missed its budget or left a pallet bound violated.
     pub runtime: Option<RuntimeInfoScale>,
 }
 

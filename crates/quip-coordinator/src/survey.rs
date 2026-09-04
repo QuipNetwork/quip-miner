@@ -4,12 +4,13 @@
 //! `AccountId` to the hardware behind it. Three invariants hold this module
 //! together, and each is enforced structurally rather than by convention:
 //!
-//! 1. [`probe`] takes no arguments. It reads the host and nothing else: no
-//!    config, no chain state, and no environment variable of its own. That
-//!    signature is the security control, because an operator secret from a
-//!    TOML backend table then has no path into [`SystemInfoScale`] for a
-//!    redaction pass to remove. The one caveat: the probe helpers
-//!    (`nvidia-smi`, `sysctl`, `system_profiler`) resolve through `PATH` and
+//! 1. [`probe`] takes no arguments. It reads no config file and no chain
+//!    state, so an operator secret from a TOML backend table has no path into
+//!    the payload for a redaction pass to remove. Two caveats, both real:
+//!    `QUIP_DOCKER_IMAGE` is the single environment variable read, and it is
+//!    operator-settable, so it goes through the same credential scan and byte
+//!    bound as every probed string; and the probe helpers (`nvidia-smi`,
+//!    `sysctl`, `system_profiler`, `python`) resolve through `PATH` and
 //!    inherit the process environment like any child, so whoever controls
 //!    `PATH` chooses whose stdout becomes on-chain data.
 //! 2. [`sanitize`] is pure and total. Every output satisfies
@@ -22,8 +23,9 @@
 //! `"unknown"`, and nothing here can stop the node from filing a descriptor.
 
 use crate::chain::scale_types::{
-    CpuInfoScale, GpuInfoScale, OsInfoScale, SystemInfoScale, MAX_ARCH_BYTES, MAX_CPU_BRAND_BYTES,
-    MAX_GPUS, MAX_GPU_NAME_BYTES, MAX_GPU_VENDOR_BYTES, MAX_OS_STRING_BYTES,
+    CpuInfoScale, GpuInfoScale, OsInfoScale, RuntimeInfoScale, SystemInfoScale, MAX_ARCH_BYTES,
+    MAX_CPU_BRAND_BYTES, MAX_DOCKER_IMAGE_BYTES, MAX_GPUS, MAX_GPU_NAME_BYTES,
+    MAX_GPU_VENDOR_BYTES, MAX_OS_STRING_BYTES, MAX_RUNTIME_VERSION_BYTES,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -35,6 +37,18 @@ const UNKNOWN: &str = "unknown";
 
 /// Stand-in for a field whose probed value looked like a credential.
 const REDACTED: &str = "redacted";
+
+/// Reported `python` when no interpreter answers.
+///
+/// The pallet rejects an empty `python`, so the field needs a value even on a
+/// host with no Python at all. A version-shaped sentinel keeps the field
+/// parseable by anything that reads it as a version.
+const PYTHON_UNKNOWN: &str = "v0.0.0";
+
+/// Protocol version this coordinator speaks.
+///
+/// Mirrors the `protocol 1` the binary reports in `--version` (`main.rs`).
+const PROTOCOL_VERSION: u32 = 1;
 
 /// Wall-clock budget for the whole survey.
 ///
@@ -78,6 +92,21 @@ pub struct RawSurvey {
     pub memory_mb: Option<u32>,
     /// Attached GPUs.
     pub gpus: Vec<RawGpu>,
+    /// Python interpreter version, or [`PYTHON_UNKNOWN`] when none answers.
+    pub python: String,
+    /// Whether the process runs inside a container.
+    pub in_docker: bool,
+    /// Container image, when the operator set one.
+    pub docker_image: Option<String>,
+}
+
+/// Both descriptor blocks the survey produces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostSurvey {
+    /// Hardware block.
+    pub system: SystemInfoScale,
+    /// Node-software block.
+    pub runtime: RuntimeInfoScale,
 }
 
 /// Survey the host, returning a payload already inside every pallet bound.
@@ -86,7 +115,7 @@ pub struct RawSurvey {
 /// probe runs detached, so a hung driver leaks one thread rather than blocking
 /// startup or process exit.
 #[must_use]
-pub fn collect(budget: Duration) -> Option<SystemInfoScale> {
+pub fn collect(budget: Duration) -> Option<HostSurvey> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<RawSurvey>(1);
     let spawned = std::thread::Builder::new()
         .name("quip-survey".to_owned())
@@ -117,8 +146,30 @@ pub fn collect(budget: Duration) -> Option<SystemInfoScale> {
 
 /// Clamp a raw survey into the pallet's shape. Pure, total, and free of I/O.
 #[must_use]
-pub fn sanitize(raw: RawSurvey) -> SystemInfoScale {
-    SystemInfoScale {
+pub fn sanitize(raw: RawSurvey) -> HostSurvey {
+    let runtime = RuntimeInfoScale {
+        python: bounded_nonempty(&raw.python, MAX_RUNTIME_VERSION_BYTES, "runtime.python"),
+        // Compile-time, so this is structurally non-empty and the pallet's
+        // `EmptyQuipVersion` is unreachable.
+        quip_version: bounded_nonempty(
+            env!("CARGO_PKG_VERSION"),
+            MAX_RUNTIME_VERSION_BYTES,
+            "runtime.quip_version",
+        ),
+        protocol_version: PROTOCOL_VERSION,
+        in_docker: raw.in_docker,
+        // Dropping an empty value is load-bearing, not tidiness: both shipped
+        // images declare `ARG QUIP_DOCKER_IMAGE=""`, so an image built without
+        // `--build-arg` sets the variable to the empty string. Sending
+        // `Some("")` trips `EmptyDockerImage`, and one rejection latches the
+        // descriptor off for the whole process.
+        docker_image: raw
+            .docker_image
+            .as_deref()
+            .map(|image| bounded(image, MAX_DOCKER_IMAGE_BYTES, "runtime.docker_image"))
+            .filter(|image| !image.is_empty()),
+    };
+    let system = SystemInfoScale {
         os: OsInfoScale {
             system: bounded_nonempty(&raw.os_system, MAX_OS_STRING_BYTES, "os.system"),
             release: bounded(&raw.os_release, MAX_OS_STRING_BYTES, "os.release"),
@@ -146,7 +197,8 @@ pub fn sanitize(raw: RawSurvey) -> SystemInfoScale {
             .enumerate()
             .map(|(index, gpu)| sanitize_gpu(index, &gpu))
             .collect(),
-    }
+    };
+    HostSurvey { system, runtime }
 }
 
 /// Whether every field satisfies the pallet's `BoundedVec` limits.
@@ -173,6 +225,23 @@ pub fn fits_pallet_bounds(info: &SystemInfoScale) -> bool {
                 && gpu.utilization_pct.is_none_or(|pct| pct <= 100)
         });
     os_ok && cpu_ok && gpus_ok
+}
+
+/// Whether the runtime block satisfies the pallet's limits.
+///
+/// Checked separately from [`fits_pallet_bounds`] so a bad runtime block drops
+/// only itself, rather than taking the hardware survey off the descriptor with
+/// it.
+#[must_use]
+pub fn runtime_fits_pallet_bounds(info: &RuntimeInfoScale) -> bool {
+    !info.python.is_empty()
+        && info.python.len() <= MAX_RUNTIME_VERSION_BYTES
+        && !info.quip_version.is_empty()
+        && info.quip_version.len() <= MAX_RUNTIME_VERSION_BYTES
+        && info
+            .docker_image
+            .as_ref()
+            .is_none_or(|image| !image.is_empty() && image.len() <= MAX_DOCKER_IMAGE_BYTES)
 }
 
 /// Whether a probed value carries the shape of a credential.
@@ -364,7 +433,49 @@ fn probe() -> RawSurvey {
         physical_cores: physical_cores(&sysctl),
         memory_mb: memory_mb(&sysctl),
         gpus,
+        python: python_version(),
+        in_docker: Path::new("/.dockerenv").exists(),
+        docker_image: docker_image(),
     }
+}
+
+/// Python interpreter version, as `X.Y.Z`.
+///
+/// The D-Wave miner runs on the `quip-solver-core` wheel, so the interpreter
+/// behind it is worth reporting. The bundled virtualenv comes first because a
+/// containerized node has one, and a bare `python3` on `PATH` may be a
+/// different interpreter than the one the miner uses. Returns
+/// [`PYTHON_UNKNOWN`] when nothing answers, which is the common case on a
+/// CPU-only or Metal host.
+fn python_version() -> String {
+    for program in ["/opt/venv/bin/python", "python3", "python"] {
+        // Python 3.4 and newer print the version to stdout; older releases
+        // used stderr, which `run_probe` discards. Those are long unsupported.
+        let probed = run_probe(program, &["--version"]);
+        if let Some(version) = probed.as_deref().and_then(parse_python_version) {
+            return version;
+        }
+    }
+    PYTHON_UNKNOWN.to_owned()
+}
+
+/// Pull `3.12.7` out of `Python 3.12.7`.
+fn parse_python_version(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .nth(1)
+        .filter(|version| version.starts_with(|c: char| c.is_ascii_digit()))
+        .map(str::to_owned)
+}
+
+/// Container image, when the operator set one.
+///
+/// The single environment read in this module. Trimmed and emptied-to-`None`
+/// because both shipped images default the variable to the empty string.
+fn docker_image() -> Option<String> {
+    std::env::var("QUIP_DOCKER_IMAGE")
+        .ok()
+        .map(|image| image.trim().to_owned())
+        .filter(|image| !image.is_empty())
 }
 
 /// The OS family token, matching what v0.2 descriptors carried.
@@ -660,6 +771,11 @@ mod tests {
     };
     use std::time::Duration;
 
+    /// Sanitize and keep the hardware block. Most tests assert on that half.
+    fn sys(raw: RawSurvey) -> crate::chain::scale_types::SystemInfoScale {
+        sanitize(raw).system
+    }
+
     fn gpu(vendor: &str, name: &str) -> RawGpu {
         RawGpu {
             vendor: vendor.to_owned(),
@@ -704,7 +820,7 @@ mod tests {
             },
         ];
         for raw in cases {
-            let out = sanitize(raw);
+            let out = sys(raw);
             assert!(fits_pallet_bounds(&out), "sanitize left a bound violated");
         }
     }
@@ -721,7 +837,7 @@ mod tests {
 
     #[test]
     fn guarded_fields_are_never_empty() {
-        let out = sanitize(RawSurvey {
+        let out = sys(RawSurvey {
             gpus: vec![RawGpu::default()],
             ..RawSurvey::default()
         });
@@ -738,7 +854,7 @@ mod tests {
 
     #[test]
     fn gpu_list_is_capped_and_reindexed() {
-        let out = sanitize(RawSurvey {
+        let out = sys(RawSurvey {
             gpus: (0..40)
                 .map(|i| gpu("NVIDIA", &format!("card {i}")))
                 .collect(),
@@ -751,7 +867,7 @@ mod tests {
 
     #[test]
     fn utilization_is_clamped_never_dropped() {
-        let out = sanitize(RawSurvey {
+        let out = sys(RawSurvey {
             gpus: vec![RawGpu {
                 utilization_pct: Some(250),
                 ..gpu("NVIDIA", "RTX A4000")
@@ -763,7 +879,7 @@ mod tests {
 
     #[test]
     fn scrub_strips_control_characters() {
-        let out = sanitize(RawSurvey {
+        let out = sys(RawSurvey {
             cpu_brand: "AMD Ryzen\t9\u{0}  5950X\nrogue".to_owned(),
             ..RawSurvey::default()
         });
@@ -803,7 +919,7 @@ mod tests {
 
     #[test]
     fn redaction_replaces_the_field_not_the_survey() {
-        let out = sanitize(RawSurvey {
+        let out = sys(RawSurvey {
             cpu_brand: "DWAVE_API_KEY".to_owned(),
             os_system: "Linux".to_owned(),
             cpu_arch: "x86_64".to_owned(),
@@ -828,8 +944,75 @@ mod tests {
         // invariant the module actually promises: if a survey comes back, it
         // fits every pallet bound.
         if let Some(surveyed) = collect(SURVEY_BUDGET) {
-            assert!(fits_pallet_bounds(&surveyed));
+            assert!(fits_pallet_bounds(&surveyed.system));
+            assert!(super::runtime_fits_pallet_bounds(&surveyed.runtime));
         }
+    }
+
+    #[test]
+    fn runtime_block_is_always_fileable() {
+        // The pallet rejects an empty python, an empty quip_version, and
+        // Some("") for docker_image. None of the three can be produced here.
+        let bare = sanitize(RawSurvey::default()).runtime;
+        assert_eq!(bare.python, b"unknown");
+        assert!(!bare.quip_version.is_empty());
+        assert_eq!(bare.protocol_version, 1);
+        assert!(bare.docker_image.is_none());
+        assert!(super::runtime_fits_pallet_bounds(&bare));
+
+        // The shipped images default QUIP_DOCKER_IMAGE to "", which must not
+        // reach the wire as Some("") — that trips EmptyDockerImage and latches
+        // the descriptor off for the whole process.
+        let empty_image = sanitize(RawSurvey {
+            docker_image: Some("   ".to_owned()),
+            ..RawSurvey::default()
+        })
+        .runtime;
+        assert!(empty_image.docker_image.is_none());
+        assert!(super::runtime_fits_pallet_bounds(&empty_image));
+
+        // A probed interpreter survives; the sentinel stands in when none does.
+        let probed = sanitize(RawSurvey {
+            python: "3.12.7".to_owned(),
+            docker_image: Some("registry.example/quip-miner:beta".to_owned()),
+            in_docker: true,
+            ..RawSurvey::default()
+        })
+        .runtime;
+        assert_eq!(probed.python, b"3.12.7");
+        assert!(probed.in_docker);
+        assert_eq!(
+            probed.docker_image.as_deref(),
+            Some(b"registry.example/quip-miner:beta".as_slice())
+        );
+        assert!(super::runtime_fits_pallet_bounds(&probed));
+    }
+
+    #[test]
+    fn runtime_bounds_hold_under_adversarial_input() {
+        let out = sanitize(RawSurvey {
+            python: "9".repeat(400),
+            docker_image: Some("i".repeat(4096)),
+            ..RawSurvey::default()
+        })
+        .runtime;
+        assert!(super::runtime_fits_pallet_bounds(&out));
+        assert!(out.python.len() <= 48);
+        assert!(out.docker_image.is_none_or(|image| image.len() <= 256));
+    }
+
+    #[test]
+    fn python_version_is_parsed_from_the_banner() {
+        assert_eq!(
+            super::parse_python_version("Python 3.12.7\n").as_deref(),
+            Some("3.12.7")
+        );
+        assert_eq!(super::parse_python_version("Python").as_deref(), None);
+        // A wrapper that prints something else must not become a version.
+        assert_eq!(
+            super::parse_python_version("bash: no python").as_deref(),
+            None
+        );
     }
 
     #[test]
@@ -837,7 +1020,7 @@ mod tests {
         // U+202E reverses rendering from that point on; the zero-width members
         // let two distinct nodes render identically. Both land in permanent
         // public storage, so they must not survive scrubbing.
-        let out = sanitize(RawSurvey {
+        let out = sys(RawSurvey {
             cpu_brand: "AMD EPYC 9654\u{202e}dexednu\u{200b} 96-Core".to_owned(),
             os_release: "6.1.0\u{feff}-52\u{00ad}-amd64".to_owned(),
             ..RawSurvey::default()
@@ -857,7 +1040,7 @@ mod tests {
     fn physical_cores_never_exceed_logical_cores() {
         // The container case: `available_parallelism` sees the cgroup quota,
         // the /sys walk sees the whole host.
-        let out = sanitize(RawSurvey {
+        let out = sys(RawSurvey {
             logical_cores: Some(4),
             physical_cores: Some(16),
             ..RawSurvey::default()
@@ -866,7 +1049,7 @@ mod tests {
         assert_eq!(out.cpu.physical_cores, Some(4));
 
         // Bare metal stays untouched.
-        let bare = sanitize(RawSurvey {
+        let bare = sys(RawSurvey {
             logical_cores: Some(32),
             physical_cores: Some(16),
             ..RawSurvey::default()
@@ -884,7 +1067,7 @@ mod tests {
         // statement: clippy::items_after_statements.
         type Mutate = fn(&mut SystemInfoScale);
 
-        let base = sanitize(RawSurvey {
+        let base = sys(RawSurvey {
             os_system: "Linux".into(),
             os_release: "6.1.0-52-amd64".into(),
             os_machine: "x86_64".into(),
