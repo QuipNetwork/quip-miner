@@ -1280,7 +1280,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1860,7 +1860,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -2931,8 +2931,8 @@ dependencies = [
 
 [[package]]
 name = "quantum-validation"
-version = "0.2.2"
-source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=48383a91449e13522b223727e47d1ae7b5603dc4#48383a91449e13522b223727e47d1ae7b5603dc4"
+version = "0.3.0-rc1"
+source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=56a60660770714282f9678c80cd1afd5df3a92d7#56a60660770714282f9678c80cd1afd5df3a92d7"
 dependencies = [
  "blake3",
  "libm",
@@ -2957,7 +2957,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -2995,14 +2995,14 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "quip-coordinator"
-version = "0.3.1-rc9"
+version = "0.3.1-rc10"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -3099,9 +3099,9 @@ dependencies = [
 
 [[package]]
 name = "quip-proto"
-version = "0.0.0"
+version = "0.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b08b88cb15ee235688c7029b9946f5b74c9731534cec6062a10c46f16d3e3520"
+checksum = "6b6c09ef8df03dec54672cf6f20109a0217e772018a1515f1cf76587cb79e6df"
 dependencies = [
  "prost",
  "tonic",
@@ -3109,9 +3109,9 @@ dependencies = [
 
 [[package]]
 name = "quip-protocol"
-version = "0.0.0"
+version = "0.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f56433db21e6b982ba7a85f77dfacfd12afb55e5bc62d413752522e048cc23d6"
+checksum = "662b61607000230563ffeeea5b2c2226209ff06fd1eebe912d35753ce2dc462d"
 dependencies = [
  "blake3",
  "quip-proto",
@@ -3119,9 +3119,9 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-core"
-version = "0.0.0"
+version = "0.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6963550fe7ecc69d10e3233fb07a09b9d19da8a62e0daa7d6fbaf87bfbf876cb"
+checksum = "3146536d40f2d0bd44d1cc81a578129e9d9cbd56825e6b8b9f1770be48aec096"
 dependencies = [
  "base64",
  "clap",
@@ -3143,8 +3143,8 @@ dependencies = [
 
 [[package]]
 name = "quip-transaction-crypto"
-version = "0.2.2"
-source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=48383a91449e13522b223727e47d1ae7b5603dc4#48383a91449e13522b223727e47d1ae7b5603dc4"
+version = "0.3.0-rc1"
+source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=56a60660770714282f9678c80cd1afd5df3a92d7#56a60660770714282f9678c80cd1afd5df3a92d7"
 dependencies = [
  "log",
  "parity-scale-codec",
@@ -3158,7 +3158,7 @@ dependencies = [
 [[package]]
 name = "quip-transaction-crypto-core"
 version = "0.1.0"
-source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=48383a91449e13522b223727e47d1ae7b5603dc4#48383a91449e13522b223727e47d1ae7b5603dc4"
+source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=56a60660770714282f9678c80cd1afd5df3a92d7#56a60660770714282f9678c80cd1afd5df3a92d7"
 dependencies = [
  "bip39",
  "blake2",
@@ -3462,7 +3462,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4439,7 +4439,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5246,7 +5246,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
