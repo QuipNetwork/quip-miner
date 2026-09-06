@@ -169,25 +169,37 @@ verify-fetch-miners:
 # shim dangles until kaniko unpacks the rootfs; it never reaches the image).
 # NOT applied on arm64: no firmware mount, and the aarch64 ELF interpreter lives
 # directly in /lib, so ignoring /lib would break every RUN.
-# :latest follows released versions only. Every tag pipeline builds images, so
-# publishing :latest unconditionally let release candidates claim the tag an
-# unpinned `docker pull` resolves to, and nodes that set no QUIP_MINER_TAG
-# silently tracked -aglais-prerelease builds. A candidate publishes under its
-# own tag and moves nothing.
+# Two floating channels an operator can follow without naming a version:
 #
-# Matching the release version positively, rather than excluding the candidate
-# suffixes, keeps this default-deny: a tag that is not a plain vN.N.N moves
-# nothing, including one nobody anticipated. This is deliberately stricter than
-# release-binaries below, which admits -rcN because quip-node-manager offers
-# candidates on the release channel. Floating :latest is what an operator gets
-# by not choosing, so it takes the narrower gate.
+#   :beta   the newest release candidate, and every release.
+#   :prod   released versions only. :latest is its long-standing alias.
+#
+# A release moves all three, because a release is newer than every candidate
+# that came before it. A beta channel that stopped at the last rc would strand
+# its followers on a candidate until someone cut the next one, which is the
+# staleness this scheme exists to remove.
+#
+# Both gates match positively, so a tag nobody anticipated moves nothing. That
+# default-deny matters: :beta and :prod are what an operator gets by not
+# choosing. A suffixed tag such as v0.3.1-rc3-aglais-prerelease publishes under
+# its own name and claims no channel. This is stricter than release-binaries
+# below, which admits every -rcN because quip-node-manager offers candidates on
+# the release channel.
 #
 # Anchored so the manifest job and the cuda job share one definition. Two jobs
-# publish :latest; they must not drift into disagreeing about what earns it.
+# publish these tags; they must not drift into disagreeing about what earns
+# them.
 .release-tag-rule: &release-tag-rule
   if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
   variables:
     MOVE_LATEST: "1"
+    MOVE_PROD: "1"
+    MOVE_BETA: "1"
+
+.rc-tag-rule: &rc-tag-rule
+  if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+-rc\d+$/
+  variables:
+    MOVE_BETA: "1"
 
 .kaniko-image:
   stage: build
@@ -205,6 +217,7 @@ verify-fetch-miners:
         > /kaniko/.docker/config.json
   rules:
     - *release-tag-rule
+    - *rc-tag-rule
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH
       when: manual
@@ -265,12 +278,19 @@ image-quip-miner-manifest:
   needs: [image-quip-miner-amd64, image-quip-miner-arm64]
   rules:
     - *release-tag-rule
+    - *rc-tag-rule
     - if: $CI_COMMIT_TAG
   script:
     - |
       IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"; REF="$CI_COMMIT_TAG"
-      if [ "${MOVE_LATEST:-0}" = 1 ]; then set -- --tags "latest"; else set --; fi
-      echo "publishing $IMAGE:$REF${1:+ and :latest}"
+      # One comma-separated --tags list, because manifest-tool takes a single
+      # flag. POSIX sh only: the alpine image ships no bash.
+      FLOATING=""
+      [ "${MOVE_BETA:-0}" = 1 ] && FLOATING="${FLOATING:+$FLOATING,}beta"
+      [ "${MOVE_PROD:-0}" = 1 ] && FLOATING="${FLOATING:+$FLOATING,}prod"
+      [ "${MOVE_LATEST:-0}" = 1 ] && FLOATING="${FLOATING:+$FLOATING,}latest"
+      if [ -n "$FLOATING" ]; then set -- --tags "$FLOATING"; else set --; fi
+      echo "publishing $IMAGE:$REF${FLOATING:+ and floating tags: $FLOATING}"
       manifest-tool \
         --username "$CI_REGISTRY_USER" --password "$CI_REGISTRY_PASSWORD" \
         push from-args \
@@ -290,8 +310,11 @@ image-quip-miner-cuda:
       TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       DEST="--destination $IMAGE:$REF"
+      [ "${MOVE_BETA:-0}" = 1 ] && DEST="$DEST --destination $IMAGE:beta"
+      [ "${MOVE_PROD:-0}" = 1 ] && DEST="$DEST --destination $IMAGE:prod"
       [ "${MOVE_LATEST:-0}" = 1 ] && DEST="$DEST --destination $IMAGE:latest"
-      # Last, so a branch validation never pushes anything, :latest included.
+      # Last, so a branch validation never pushes anything, floating tags
+      # included.
       [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
       echo "publishing: $DEST"
       /kaniko/executor \
