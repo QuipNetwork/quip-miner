@@ -97,6 +97,32 @@ curl -sS http://127.0.0.1:20050/health
 Node status: public host, miner info, hardware descriptor, peer count, latest
 block index, and uptime.
 
+Submission liveness fields (see gh-18 / gh-20 / gh-27). A node can report
+`is_mining: true` while landing zero extrinsics; these fields make that
+visible without waiting for `proofs_won` to stall:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `is_mining` | bool | The controller snapshot was refreshed recently, i.e. workers are producing solutions. Says nothing about whether submits land. |
+| `last_successful_submission` | ISO-8601 UTC string or `null` | Time of the last **accepted** submission (proof or mempool solution). `null` until the first one lands. Updated only on accepted submits, never on mined-but-unsubmitted solutions. Stale or `null` while `is_mining` is `true` means the submit path is broken. |
+| `last_successful_submission_epoch` | number or `null` | Same instant as epoch seconds, for consumers that compute staleness arithmetically. |
+| `consecutive_submit_failures` | int or `null` | Failed submits since the last accepted one; reset to 0 on success. |
+| `runtime_incompatible` | string or `null` | Set when this build is too old for the chain runtime (submits will keep failing until upgraded). |
+
+```json
+{
+  "success": true,
+  "data": {
+    "is_mining": true,
+    "last_successful_submission": "2026-09-07T18:42:11.503219+00:00",
+    "last_successful_submission_epoch": 1788806531.503219,
+    "consecutive_submit_failures": 0,
+    "runtime_incompatible": null,
+    "...": "..."
+  }
+}
+```
+
 ### GET /api/v1/system
 
 Hardware survey plus whitelisted config (same `descriptor` block returned by

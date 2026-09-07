@@ -123,6 +123,84 @@ def test_telemetry_status_passes_through_sync_state(tmp_path: Path):
             proc.join()
 
 
+def test_epoch_to_iso_renders_utc_or_none():
+    """Epoch floats become ISO-8601 UTC; missing/invalid values become None."""
+    from substrate.telemetry_process import _epoch_to_iso
+
+    assert _epoch_to_iso(0) == "1970-01-01T00:00:00+00:00"
+    assert _epoch_to_iso(1_700_000_000.5) == "2023-11-14T22:13:20.500000+00:00"
+    assert _epoch_to_iso(None) is None
+    assert _epoch_to_iso("1700000000") is None
+    assert _epoch_to_iso(True) is None
+    assert _epoch_to_iso(float("nan")) is None
+    assert _epoch_to_iso(1e20) is None
+
+
+def test_telemetry_status_reports_last_successful_submission_as_iso(tmp_path: Path):
+    """/api/v1/status renders last_successful_submission as ISO-8601 (gh-27).
+
+    The controller snapshot carries the raw ``time.time()`` value; the
+    endpoint must expose it as an ISO timestamp (None before the first
+    accepted submission) and keep the epoch alongside.
+    """
+    from substrate.telemetry_process import telemetry_main
+
+    epoch = 1_700_000_000.0
+    stats_path = tmp_path / "telemetry-stats.json"
+    stats_path.write_text(json.dumps({
+        "controller": {
+            "heads_observed": 1,
+            "last_successful_submission": epoch,
+        },
+    }))
+
+    port = _free_port()
+    shutdown_event = mp.Event()
+    proc = mp.Process(
+        target=telemetry_main,
+        kwargs={
+            "listen_host": "127.0.0.1",
+            "listen_port": port,
+            "stats_snapshot_path": str(stats_path),
+            "validator_urls": ["http://example.invalid"],
+            "shutdown_event": shutdown_event,
+        },
+    )
+    proc.start()
+    try:
+        import urllib.request
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                resp = urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/v1/status", timeout=0.5,
+                ).read()
+                break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("telemetry process did not start in 5s")
+
+        data = json.loads(resp)["data"]
+        assert data["last_successful_submission"] == "2023-11-14T22:13:20+00:00"
+        assert data["last_successful_submission_epoch"] == epoch
+
+        # Before the first accepted submission both fields are null.
+        stats_path.write_text(json.dumps({"controller": {"heads_observed": 1}}))
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/v1/status", timeout=2,
+        ).read()
+        data = json.loads(resp)["data"]
+        assert data["last_successful_submission"] is None
+        assert data["last_successful_submission_epoch"] is None
+    finally:
+        shutdown_event.set()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+
+
 def test_telemetry_process_returns_503_when_snapshot_missing(tmp_path: Path):
     """If the snapshot file doesn't exist yet, /api/v1/stats returns 503."""
     from substrate.telemetry_process import telemetry_main

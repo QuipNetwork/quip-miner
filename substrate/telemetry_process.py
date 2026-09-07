@@ -28,6 +28,7 @@ import multiprocessing as mp
 import multiprocessing.synchronize
 import signal
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -480,6 +481,22 @@ async def _handle_miner_survey(request: web.Request) -> web.Response:
     return _success(survey)
 
 
+def _epoch_to_iso(ts: Any) -> Optional[str]:
+    """Render an epoch-seconds value as an ISO-8601 UTC string, or None.
+
+    The controller snapshot stores ``last_successful_submission`` as a
+    ``time.time()`` float; gh-27 asks for an ISO timestamp on the status
+    endpoint. Anything that is not a finite number maps to None so a
+    corrupt or missing value never breaks the whole status response.
+    """
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 async def _handle_status(request: web.Request) -> web.Response:
     """Aggregate chain head + miner identity status.
 
@@ -528,19 +545,24 @@ async def _handle_status(request: web.Request) -> web.Response:
                 type(exc).__name__, exc,
             )
 
+    last_submit_epoch = snapshot.get("controller", {}).get(
+        "last_successful_submission"
+    )
+
     return _success(
         {
             "ss58_address": snapshot.get("ss58_address"),
             "account_id_hex": account_hex,
             "node_id": snapshot.get("node_id"),
             "is_mining": is_mining,
-            # Wall-clock (epoch seconds) of the last landed submit, or None
-            # if the node has never landed one. A node reporting is_mining
-            # True with a stale/None value here is mining but not winning
-            # (QUI-829 / gh-18) — the one field that makes that self-evident.
-            "last_successful_submission": snapshot.get("controller", {}).get(
-                "last_successful_submission"
-            ),
+            # ISO-8601 UTC timestamp of the last *accepted* submit, or None
+            # if the node has never landed one (gh-27). A node reporting
+            # is_mining True with a stale/None value here is mining but not
+            # winning (QUI-829 / gh-18) — the one field that makes that
+            # self-evident. The raw epoch value is kept alongside for
+            # consumers that compute staleness arithmetically.
+            "last_successful_submission": _epoch_to_iso(last_submit_epoch),
+            "last_successful_submission_epoch": last_submit_epoch,
             # Consecutive failed submits since the last landed proof, and a
             # reason string when this build is too old for the chain runtime.
             # A large counter or a non-null reason means "mining but landing
