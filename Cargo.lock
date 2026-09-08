@@ -2931,8 +2931,8 @@ dependencies = [
 
 [[package]]
 name = "quantum-validation"
-version = "0.3.0-rc1"
-source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=56a60660770714282f9678c80cd1afd5df3a92d7#56a60660770714282f9678c80cd1afd5df3a92d7"
+version = "0.3.0"
+source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=7754efa2bbc42cfcf60bb21af8d22b29bd30b67c#7754efa2bbc42cfcf60bb21af8d22b29bd30b67c"
 dependencies = [
  "blake3",
  "libm",
@@ -3002,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "quip-coordinator"
-version = "0.3.1-rc12"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -3143,8 +3143,8 @@ dependencies = [
 
 [[package]]
 name = "quip-transaction-crypto"
-version = "0.3.0-rc1"
-source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=56a60660770714282f9678c80cd1afd5df3a92d7#56a60660770714282f9678c80cd1afd5df3a92d7"
+version = "0.3.0"
+source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=7754efa2bbc42cfcf60bb21af8d22b29bd30b67c#7754efa2bbc42cfcf60bb21af8d22b29bd30b67c"
 dependencies = [
  "log",
  "parity-scale-codec",
@@ -3158,7 +3158,7 @@ dependencies = [
 [[package]]
 name = "quip-transaction-crypto-core"
 version = "0.1.0"
-source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=56a60660770714282f9678c80cd1afd5df3a92d7#56a60660770714282f9678c80cd1afd5df3a92d7"
+source = "git+https://gitlab.com/quip.network/quip-validator.git?rev=7754efa2bbc42cfcf60bb21af8d22b29bd30b67c#7754efa2bbc42cfcf60bb21af8d22b29bd30b67c"
 dependencies = [
  "bip39",
  "blake2",

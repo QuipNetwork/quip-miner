@@ -1,6 +1,6 @@
 [package]
 name = "quip-coordinator"
-version = "0.3.1-rc12"
+version = "0.3.1"
 edition = "2021"
 
 [[bin]]
@@ -16,8 +16,8 @@ rayon = "1.10"
 bytemuck = "1"
 quip-proto = "0.0.1"
 quip-protocol = "0.0.1"
-quantum-validation = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "56a60660770714282f9678c80cd1afd5df3a92d7", version = ">=0.3.0-rc1" }
-quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "56a60660770714282f9678c80cd1afd5df3a92d7", version = ">=0.3.0-rc1" }
+quantum-validation = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "7754efa2bbc42cfcf60bb21af8d22b29bd30b67c", version = ">=0.3.0" }
+quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "7754efa2bbc42cfcf60bb21af8d22b29bd30b67c", version = ">=0.3.0" }
 parity-scale-codec = { version = "3.7.5", default-features = false, features = ["derive", "std"] }
 sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", rev = "30810786a6610de8798594bbc5d4f00670744c6d", default-features = false, features = ["std"] }
 blake2 = "0.10"
@@ -69,9 +69,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
-quantum-validation = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "56a60660770714282f9678c80cd1afd5df3a92d7", version = ">=0.3.0-rc1" }
-quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "56a60660770714282f9678c80cd1afd5df3a92d7", version = ">=0.3.0-rc1" }
-quip-transaction-crypto-core = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "56a60660770714282f9678c80cd1afd5df3a92d7", version = ">=0.1.0" }
+quantum-validation = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "7754efa2bbc42cfcf60bb21af8d22b29bd30b67c", version = ">=0.3.0" }
+quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "7754efa2bbc42cfcf60bb21af8d22b29bd30b67c", version = ">=0.3.0" }
+quip-transaction-crypto-core = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "7754efa2bbc42cfcf60bb21af8d22b29bd30b67c", version = ">=0.1.0" }
 quip-protocol = "0.0.1"
 quip-proto = "0.0.1"
 sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", rev = "30810786a6610de8798594bbc5d4f00670744c6d", default-features = false, features = ["std"] }
