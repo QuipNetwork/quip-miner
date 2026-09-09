@@ -171,8 +171,8 @@ verify-fetch-miners:
 # directly in /lib, so ignoring /lib would break every RUN.
 # Two floating channels an operator can follow without naming a version:
 #
-#   :beta   the newest release candidate, and every release.
-#   :prod   released versions only. :latest is its long-standing alias.
+#   :beta    the newest release candidate, and every release.
+#   :stable  released versions only. :latest is its long-standing alias.
 #
 # A release moves all three, because a release is newer than every candidate
 # that came before it. A beta channel that stopped at the last rc would strand
@@ -180,7 +180,7 @@ verify-fetch-miners:
 # staleness this scheme exists to remove.
 #
 # Both gates match positively, so a tag nobody anticipated moves nothing. That
-# default-deny matters: :beta and :prod are what an operator gets by not
+# default-deny matters: :beta and :stable are what an operator gets by not
 # choosing. A suffixed tag such as v0.3.1-rc3-aglais-prerelease publishes under
 # its own name and claims no channel. This is stricter than release-binaries
 # below, which admits every -rcN because quip-node-manager offers candidates on
@@ -193,7 +193,7 @@ verify-fetch-miners:
   if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
   variables:
     MOVE_LATEST: "1"
-    MOVE_PROD: "1"
+    MOVE_STABLE: "1"
     MOVE_BETA: "1"
 
 .rc-tag-rule: &rc-tag-rule
@@ -287,7 +287,7 @@ image-quip-miner-manifest:
       # flag. POSIX sh only: the alpine image ships no bash.
       FLOATING=""
       [ "${MOVE_BETA:-0}" = 1 ] && FLOATING="${FLOATING:+$FLOATING,}beta"
-      [ "${MOVE_PROD:-0}" = 1 ] && FLOATING="${FLOATING:+$FLOATING,}prod"
+      [ "${MOVE_STABLE:-0}" = 1 ] && FLOATING="${FLOATING:+$FLOATING,}stable"
       [ "${MOVE_LATEST:-0}" = 1 ] && FLOATING="${FLOATING:+$FLOATING,}latest"
       if [ -n "$FLOATING" ]; then set -- --tags "$FLOATING"; else set --; fi
       echo "publishing $IMAGE:$REF${FLOATING:+ and floating tags: $FLOATING}"
@@ -311,7 +311,7 @@ image-quip-miner-cuda:
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       DEST="--destination $IMAGE:$REF"
       [ "${MOVE_BETA:-0}" = 1 ] && DEST="$DEST --destination $IMAGE:beta"
-      [ "${MOVE_PROD:-0}" = 1 ] && DEST="$DEST --destination $IMAGE:prod"
+      [ "${MOVE_STABLE:-0}" = 1 ] && DEST="$DEST --destination $IMAGE:stable"
       [ "${MOVE_LATEST:-0}" = 1 ] && DEST="$DEST --destination $IMAGE:latest"
       # Last, so a branch validation never pushes anything, floating tags
       # included.
