@@ -82,7 +82,7 @@ The coordinator binary embeds the `advantage2-system1` and `smoke` topology
 presets. `drive --topology-preset` and `seed-chain` read those presets from the
 binary.
 
-The config registers miners and their launch plan. Each backend section (`[cpu]`, `[cuda.0]`, `[metal]`, `[dwave]`) becomes one supervised subprocess; `binary` selects the executable — `quip-cpu-sa`, or the chromatic `quip-cpu-gibbs`. See `crates/quip-coordinator/config.toml.example`. Miner binaries are fetched per host by `crates/quip-coordinator/tools/fetch-miners.sh` from the standalone repos and resolved on `PATH` or by absolute path.
+The config registers miners and their launch plan. Each backend section (`[cpu]`, `[cuda.0]`, `[metal]`, `[dwave]`) becomes one supervised subprocess; `binary` selects the executable — `quip-cpu-sa`, the chromatic `quip-cpu-gibbs`, `quip-cpu-sb`, or one of quip-miner-cpu's experimental kernels when that release published it. See `crates/quip-coordinator/config.toml.example`. Miner binaries are fetched per host by `crates/quip-coordinator/tools/fetch-miners.sh` from the standalone repos and resolved on `PATH` or by absolute path.
 
 `signer_key` accepts a keystore path, a 32-byte hex master seed, or a `//DevUri`
 such as `//Alice`. It also accepts any substrate secret URI, including a BIP39

@@ -33,6 +33,10 @@
 # OS is part of the name because arch alone is ambiguous: the cpu miner ships
 # both a linux-arm64 and a darwin-arm64 build.
 #
+# The cpu miner's production binaries (sa, gibbs, sb) are required; its
+# experimental kernels are fetched too but tolerate absence — see
+# CPU_EXPERIMENTAL below.
+#
 # NOTE: every run resolves tags from the GitLab API, DRY_RUN included, because
 # the asset URL it prints contains the tag.
 set -euo pipefail
@@ -119,26 +123,60 @@ esac
 
 mkdir -p "$DEST"
 
-# fetch TAG PROJ NAME...  — download "<NAME>-<os>-<arch>" from PROJ's generic
-# package registry at TAG, saving it as "<NAME>" (suffix stripped) in DEST.
-# PROJ is the URL-encoded "group/repo". TAG is per call because the miners
-# version independently. DRY_RUN prints the plan and skips the download.
+# fetch MODE TAG PROJ NAME...  — download "<NAME>-<os>-<arch>" from PROJ's
+# generic package registry at TAG, saving it as "<NAME>" (suffix stripped) in
+# DEST. PROJ is the URL-encoded "group/repo". TAG is per call because the
+# miners version independently. DRY_RUN prints the plan and skips the download.
+#
+# MODE is `required` — a missing asset fails the run — or `optional`, where a
+# missing asset is reported and skipped. Optional exists for the experimental
+# CPU kernels below, which a release may or may not carry.
 fetch() {
-  local tag="$1" proj="$2"
-  shift 2
+  local mode="$1" tag="$2" proj="$3"
+  shift 3
   local name asset url
+  local -a curlopts
   for name in "$@"; do
     asset="${name}-${os_tag}-${arch}"
     url="${API}/projects/${proj}/packages/generic/${proj##*%2F}/${tag}/${asset}"
     if [ -n "${DRY_RUN:-}" ]; then
-      echo "would fetch: ${asset} -> ${DEST}/${name}  <- ${url}"
+      echo "would fetch (${mode}): ${asset} -> ${DEST}/${name}  <- ${url}"
       continue
     fi
     echo "fetch ${asset} -> ${DEST}/${name}"
-    curl --fail --location --silent --show-error --output "${DEST}/${name}" "$url"
-    chmod +x "${DEST}/${name}" || true
+    # `--show-error` only where a failure is news. An optional miss is the
+    # expected case today and prints its own one-line note below; curl's
+    # "curl: (22) ... 404" stacked on top of that is thirteen extra lines of
+    # noise in every image build log.
+    curlopts=(--fail --location --silent --output "${DEST}/${name}")
+    if [ "$mode" = required ]; then
+      curlopts+=(--show-error)
+    fi
+    if curl "${curlopts[@]}" "$url"; then
+      chmod +x "${DEST}/${name}" || true
+    elif [ "$mode" = optional ]; then
+      # curl opens the output file before it reads the status line, so a miss
+      # leaves a zero-byte file behind that the coordinator would then try to
+      # exec. Remove it so an absent asset is absent.
+      rm -f "${DEST}/${name}"
+      echo "note: ${asset} not in release ${tag}; skipping" >&2
+    else
+      return 1
+    fi
   done
 }
+
+# Experimental CPU kernels, fetched alongside the production three. These build
+# behind quip-miner-cpu's opt-in `experimental` cargo feature, and that repo has
+# not attached them to a release yet, so every name here is optional: the ones a
+# release carries land in DEST and the rest are skipped without failing an image
+# build. They are inert until a config.toml `[cpu] binary =` names one.
+# Source of truth for the list: the binaries table in quip-miner-cpu's README.
+CPU_EXPERIMENTAL=(
+  quip-cpu-bsb quip-cpu-hdsb quip-cpu-hbsb quip-cpu-gbsb quip-cpu-gdsb
+  quip-cpu-tedsb quip-cpu-sbqa quip-cpu-ggdsb quip-cpu-fsa quip-cpu-msa
+  quip-cpu-mps quip-cpu-mfa quip-cpu-flatiron
+)
 
 # Decide which backends this run wants.
 want_cpu=false
@@ -175,11 +213,13 @@ esac
 # needed can never fail the run.
 if [ "$want_metal" = true ]; then
   METAL_TAG="$(miner_tag metal)"
-  fetch "$METAL_TAG" "quip.network%2Fquip-miner-metal" "quip-metal-sa" "quip-metal-gibbs"
+  fetch required "$METAL_TAG" "quip.network%2Fquip-miner-metal" "quip-metal-sa" "quip-metal-gibbs"
 fi
 if [ "$want_cpu" = true ]; then
   CPU_TAG="$(miner_tag cpu)"
-  fetch "$CPU_TAG" "quip.network%2Fquip-miner-cpu" "quip-cpu-sa" "quip-cpu-gibbs"
+  fetch required "$CPU_TAG" "quip.network%2Fquip-miner-cpu" \
+    "quip-cpu-sa" "quip-cpu-gibbs" "quip-cpu-sb"
+  fetch optional "$CPU_TAG" "quip.network%2Fquip-miner-cpu" "${CPU_EXPERIMENTAL[@]}"
 fi
 if [ "$want_cuda" = true ]; then
   if [ "$arch" != amd64 ]; then
@@ -190,10 +230,10 @@ if [ "$want_cuda" = true ]; then
     fi
   elif [ "$cuda_required" = true ]; then
     CUDA_TAG="$(miner_tag cuda)"
-    fetch "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs"
+    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs"
   else
     CUDA_TAG="$(miner_tag cuda)"
-    fetch "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" ||
+    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" ||
       echo "note: cuda binaries optional (no GPU host)"
   fi
 fi
@@ -204,7 +244,7 @@ fi
 # is no published binary yet, so the container images keep installing from git.
 DWAVE_TAG="$(miner_tag dwave)"
 if [ "$os_tag" = darwin ]; then
-  fetch "$DWAVE_TAG" "quip.network%2Fquip-miner-dwave" "quip-dwave-qa"
+  fetch required "$DWAVE_TAG" "quip.network%2Fquip-miner-dwave" "quip-dwave-qa"
 else
   echo "dwave: pip install 'quip-miner-dwave @ git+https://gitlab.com/${GROUP}/quip-miner-dwave.git@${DWAVE_TAG}'"
 fi
