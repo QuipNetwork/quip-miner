@@ -26,7 +26,11 @@ max_submit_attempts = 5
 
 # CPU miner. Default binary: quip-cpu-sa. Use the chromatic Gibbs variant:
 [cpu]
-binary = "quip-cpu-sa"        # or "quip-cpu-gibbs"
+binary = "quip-cpu-sa"        # or quip-cpu-gibbs, quip-cpu-sb, or any
+# experimental kernel fetch-miners.sh found (quip-cpu-bsb, -hdsb, -hbsb, -gbsb,
+# -gdsb, -tedsb, -sbqa, -ggdsb, -fsa, -msa, -mps, -mfa, -flatiron). The
+# experimental set is present only when the quip-miner-cpu release published it;
+# `ls miners/quip-cpu-*` shows what this host has.
 queue_depth = 3
 idle_timeout_s = 300
 # Core budget for the sampler. Absent, the miner uses host parallelism.

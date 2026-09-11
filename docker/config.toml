@@ -46,9 +46,15 @@ public_host = "203.0.113.10"
 # not the dashboard port (9090). Zero is not a valid port.
 public_port = 20050
 
-# CPU miner (bundled: quip-cpu-sa, quip-cpu-gibbs).
+# CPU miner. Bundled production binaries: quip-cpu-sa (simulated annealing),
+# quip-cpu-gibbs (chromatic Gibbs), quip-cpu-sb (discrete Simulated
+# Bifurcation). The image also carries quip-miner-cpu's experimental kernels
+# when that release publishes them — bsb, hdsb, hbsb, gbsb, gdsb, tedsb, sbqa,
+# ggdsb, fsa, msa, mps, mfa, flatiron. Name one here to run it; `ls
+# /usr/local/bin/quip-cpu-*` in the container shows what this image actually
+# has. Experimental kernels are unbenchmarked against consensus scoring.
 [cpu]
-binary = "quip-cpu-sa"   # or "quip-cpu-gibbs"
+binary = "quip-cpu-sa"
 
 # D-Wave QPU miner (bundled Python entry point quip-dwave-qa). Needs a Leap
 # token (DWAVE_API_TOKEN) for real hardware; omit the section to disable.

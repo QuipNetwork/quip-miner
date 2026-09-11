@@ -42,6 +42,9 @@ edits:
 - **`crates/quip-coordinator/tools/fetch-miners.sh`** — add a `fetch` call for
   your repository's assets and handle the backend in the `MINER_SET`/`auto`
   logic. The container images call this script, so they need no separate change.
+  `fetch` takes the mode first: `required` fails the run when an asset is
+  missing, `optional` reports the miss and carries on. Use `optional` only for a
+  binary a release may legitimately not carry.
 
 ## Publishing releases
 

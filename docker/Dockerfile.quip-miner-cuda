@@ -90,6 +90,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
 # Released CPU + CUDA miner binaries (amd64 only for this image), via the shared
 # fetch-miners.sh — single source of truth. MINER_SET=cpu-cuda requires the cuda
 # assets (fails the build if missing), unlike the optional cuda in `auto` mode.
+# The cpu half brings the production kernels (sa, gibbs, sb) plus every
+# experimental kernel the cpu release carries; absent ones are skipped.
 RUN TARGETARCH=amd64 MINER_SET=cpu-cuda \
     bash /usr/local/bin/fetch-miners.sh /usr/local/bin
 

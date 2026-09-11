@@ -91,7 +91,22 @@ verify-fetch-miners:
       echo "$out"
       echo "$out" | grep -q 'quip-cpu-sa'
       echo "$out" | grep -q 'quip-cpu-gibbs'
+      echo "$out" | grep -q 'quip-cpu-sb-'
       if echo "$out" | grep -q 'quip-cuda'; then echo "ERROR: cpu set pulled cuda"; exit 1; fi
+      # The three production kernels must be required; a release that drops one
+      # has to fail the image build, not ship an image missing its default
+      # miner. Everything experimental must be optional, because quip-miner-cpu
+      # builds those behind a feature flag and does not attach them to every
+      # release.
+      echo "--- cpu: production required, experimental optional ---"
+      for b in sa gibbs sb; do
+        echo "$out" | grep -q "would fetch (required): quip-cpu-${b}-" ||
+          { echo "ERROR: quip-cpu-${b} is not required"; exit 1; }
+      done
+      for b in bsb hdsb hbsb gbsb gdsb tedsb sbqa ggdsb fsa msa mps mfa flatiron; do
+        echo "$out" | grep -q "would fetch (optional): quip-cpu-${b}-" ||
+          { echo "ERROR: experimental quip-cpu-${b} not selected as optional"; exit 1; }
+      done
       echo "--- MINER_SET=cpu-cuda ---"
       out=$(DRY_RUN=1 MINER_SET=cpu-cuda bash "$S")
       echo "$out"

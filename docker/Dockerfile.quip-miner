@@ -95,6 +95,9 @@ RUN python -m compileall -q -f --invalidation-mode unchecked-hash /opt/venv/lib 
 # Released CPU miner binaries for this arch, via the shared fetch-miners.sh —
 # single source of truth (the native/host install runs the same script). The
 # script derives arch from `uname` (correct on the per-arch kaniko runners).
+# This pulls the production kernels (sa, gibbs, sb) plus every experimental
+# kernel the cpu release carries; experimental ones that are absent are skipped
+# rather than failing the build.
 COPY crates/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
 RUN TARGETARCH="${TARGETARCH}" MINER_SET=cpu \
     bash /usr/local/bin/fetch-miners.sh /usr/local/bin
