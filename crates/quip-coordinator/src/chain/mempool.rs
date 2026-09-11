@@ -1,7 +1,7 @@
 //! Mempool job-order types.
 //!
 //! > **CONFIRM crate API:** order discovery via block events + storage
-//! > query through `quip-protocol-rs`. The decode of on-chain `JobOrder`
+//! > query through `quip-validator`. The decode of on-chain `JobOrder`
 //! > is the CONFIRM point; conversion to wire `Job` is groundable.
 
 /// A mempool job order ready for conversion to a wire `Job`.

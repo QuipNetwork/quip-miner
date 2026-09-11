@@ -1,9 +1,9 @@
-# quip-protocol
+# quip-miner
 
 > **Experimental software.** Use at your own risk. No production warranties.
 
 The v0.3 mining stack for the
-[quip-protocol-rs](https://gitlab.com/quip.network/quip-protocol-rs) Substrate
+[quip-validator](https://gitlab.com/quip.network/quip-validator) Substrate
 chain. A coordinator follows the chain head and stages Ising problems for the
 miner subprocesses; when a solution clears the difficulty gate, the coordinator
 submits a `QuantumPow.submit_proof` extrinsic. The miners run simulated
@@ -94,7 +94,7 @@ offline. Three milestones:
   `JobProposed` event, storage-reads `JobOrders(order_id)`, and builds a Job.
 
 Start a local devnet from the chain repo
-([quip-protocol-rs](https://gitlab.com/quip.network/quip-protocol-rs)) with
+([quip-validator](https://gitlab.com/quip.network/quip-validator)) with
 `make local-3-node` or `docker compose up`. Both publish node RPC on
 `ws://127.0.0.1:9944`. Then run:
 

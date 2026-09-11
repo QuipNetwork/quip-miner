@@ -2,7 +2,7 @@
 
 This is the canonical versioning standard for every Quip repository that
 publishes release tags, container images, or native binaries consumed by
-`quip-node-manager` — currently **quip-protocol**, **quip-protocol-rs**, and
+`quip-node-manager` — currently **quip-miner**, **quip-validator**, and
 **dashboard.quip.network**. Apply it identically in each.
 
 ## The rule
@@ -59,7 +59,7 @@ for the native binary.
    git tag -a v0.2.1-rc17 -m "v0.2.1-rc17"
    git push origin v0.2 && git push origin v0.2.1-rc17
    ```
-3. CI builds the image (`:v0.2` + `:v0.2.1-rc17`) and, for quip-protocol, the
+3. CI builds the image (`:v0.2` + `:v0.2.1-rc17`) and, for quip-miner, the
    `quip-miner-*` native binaries attached to the GitLab release. The release
    marker node-manager records is the git tag, so the hyphenated form flows
    through to the update check.
