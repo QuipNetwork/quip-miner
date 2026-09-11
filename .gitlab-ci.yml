@@ -167,7 +167,7 @@ verify-fetch-miners:
 # ---------------------------------------------------------------------------
 # v0.3 container images (separate v0.3/ namespace; see the stages note).
 # Bundle: from-source quip-coordinator + released CPU/CUDA miner binaries +
-# D-Wave Python miner. Built the org-standard way (see quip-protocol-rs's
+# D-Wave Python miner. Built the org-standard way (see quip-validator's
 # quip-network-node): kaniko, one job per native architecture, stitched by
 # manifest-tool. Build-only on branches (--no-push, manual), build + push on tags.
 # ---------------------------------------------------------------------------

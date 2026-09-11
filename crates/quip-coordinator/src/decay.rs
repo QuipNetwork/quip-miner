@@ -20,7 +20,7 @@ pub const MIN_ENERGY_DELTA_MILLI: i64 = 1000;
 
 // The pallet exposes these as constants/defaults, not via any runtime API, so
 // (per the independent-reads path) the coordinator mirrors them. They match
-// quip-protocol-rs @ v0.2 `QuantumPow`; a chain retune must be echoed here.
+// quip-validator @ v0.2 `QuantumPow`; a chain retune must be echoed here.
 /// Blocks per decay epoch (`QuantumPow::EpochLength`).
 pub const EPOCH_LENGTH_BLOCKS: u64 = 100;
 /// Default curve calibration c-triple (per-mille: 700 == 0.70), from the

@@ -1,7 +1,7 @@
 # Architecture
 
 This repository is the v0.3 mining stack for the
-[quip-protocol-rs](https://gitlab.com/quip.network/quip-protocol-rs) chain. It
+[quip-validator](https://gitlab.com/quip.network/quip-validator) chain. It
 holds the coordinator: it follows the chain, stages Ising problems, and
 submits proofs. The solver contract — the wire protocol, the consensus
 primitives, and the shared solver harness — lives in
@@ -162,7 +162,7 @@ exercises the defaults it expects to receive: `min_solutions = 5` and
 `min_diversity = 0.200` (`n = 5`, `n_milli = 200` in
 `tests/devnet_submit.rs`). For the difficulty energy target, the per-topology
 energy ranges, and the mempool section-election rules, read the pallet in
-quip-protocol-rs. This repository consumes those values across the `ChainClient`
+quip-validator. This repository consumes those values across the `ChainClient`
 seam and doesn't define them.
 
 ## Testing and the doubles

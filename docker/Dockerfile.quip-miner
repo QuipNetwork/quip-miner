@@ -62,7 +62,7 @@ RUN find crates -name '*.rs' -exec touch {} + \
 # --- runtime ---
 FROM python:3.12-slim-bookworm
 
-LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
+LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-miner"
 LABEL description="quip-miner v0.3 — coordinator + CPU + D-Wave"
 
 ARG TARGETARCH

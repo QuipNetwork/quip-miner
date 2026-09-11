@@ -34,7 +34,7 @@ RUN cargo build --release -p quip-coordinator
 # would never be opened.
 FROM nvidia/cuda:12.9.1-base-ubuntu24.04
 
-LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
+LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-miner"
 LABEL description="quip-miner-cuda v0.3 — coordinator + CPU + D-Wave + CUDA"
 
 ARG QUIP_DOCKER_IMAGE=""
