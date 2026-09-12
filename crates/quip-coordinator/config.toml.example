@@ -51,6 +51,10 @@ binary = "quip-cuda-sa"       # or "quip-cuda-gibbs"
 # binary = "quip-metal-sa"    # or "quip-metal-gibbs"
 
 # D-Wave QPU miner (pip package, entry point quip-dwave-qa). No sa/gibbs split.
+# Every key other than the coordinator-owned ones passes through to the miner
+# verbatim; docker/config.toml documents the budget and round-strategy keys.
 [dwave]
 binary = "quip-dwave-qa"
 daily_budget = "30s"
+# min_throughput_advantage = 0.25  # skip a round only when the bar sits more than 25% above its jobs
+# participation_chance = 0.10      # join this share of rounds regardless, so every slot keeps getting measured
