@@ -251,13 +251,13 @@ The states, in order:
    Later rounds skip the submit and log at `trace`. A missing required
    value, a pallet rejection, or three transient failures warn and advance.
    This state never holds mining.
-7. **Participation declared.** The coordinator submits
-   `MinerRegistry.participate` for the candidate qblock. The call already
-   deduplicates per qblock. Three transient failures warn and advance. This
-   state never holds mining.
-8. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
+7. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
    the new round, then stages jobs. A job of the new generation cannot leave
    before those two messages.
+
+Participation is not a walk step. The feeder submits
+`MinerRegistry.participate` for the candidate qblock on the first poll after
+a miner returns a `Result` for the round. See "Participation" below.
 
 ### Node descriptor
 
@@ -303,7 +303,14 @@ fits under that floor.
 
 The node manager reads `MinerRegistry::LatestParticipation` and compares it
 to `QuantumPow::QBlockCount`. The coordinator must call
-`MinerRegistry.participate` once per qblock or that check stays behind.
+`MinerRegistry.participate` once per mined qblock or that check stays behind.
+
+The coordinator declares participation only after a miner has mined the
+round. The evidence is the first `Result` for a job of the current
+generation. Staged work is not evidence: a QPU sits a round out by
+withholding credits and rejecting what the coordinator sends, and a miner
+that is down returns nothing. A `Reject` never counts. A late `Result` for a
+cancelled generation never counts. A round with no `Result` is not declared.
 
 The pallet accepts only the current candidate qblock. That id is one past
 `QuantumPowApi_latest_qblock_id`. The `new round` log line prints the last
@@ -321,7 +328,7 @@ Pallet outcomes:
 | success or `DuplicateParticipation` | treat as declared. Do not retry. |
 | `InvalidQBlockId` | log at `debug`. Declare the new candidate next round. |
 | `DescriptorRequired` | log at `warn` once, name the account, keep mining |
-| transient chain error | retry up to three times in this state, then warn and advance |
+| transient chain error | warn and retry on the next poll |
 
 A descriptor or participation failure never calls `process::exit` and never
 holds mining.
@@ -337,8 +344,7 @@ Transitions:
 | Validator is synced | Succeeded | Account is funded |
 | Account is funded | Succeeded | Requirements downloaded |
 | Requirements downloaded | Succeeded | Descriptor filed |
-| Descriptor filed | Succeeded | Participation declared |
-| Participation declared | Succeeded | Start mining |
+| Descriptor filed | Succeeded | Start mining |
 | Start mining | Succeeded | Start mining |
 
 The feeder does the I/O. The transition function is pure. The feeder logs the

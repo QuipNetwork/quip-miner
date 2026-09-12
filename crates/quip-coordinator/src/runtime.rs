@@ -15,7 +15,7 @@ use crate::logging::LogLevel;
 use crate::producer::derive_pow_job;
 use crate::readiness::{
     build_faucet, declare_round_participation, file_round_descriptor, register_round_miner,
-    ReadinessError, SUBMIT_ATTEMPTS,
+    ReadinessError,
 };
 use crate::round::{RoundEvent, RoundState};
 use crate::session::{coord, CoordinatorService, CoordinatorState};
@@ -317,10 +317,6 @@ async fn await_round_step<T>(
     clippy::too_many_lines,
     reason = "one match arm per round state plus retry"
 )]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "last_declared is walk-local state, not a sixth RoundState"
-)]
 async fn drive_to_mining<C, F>(
     mut machine: RoundState,
     chain: &C,
@@ -329,7 +325,6 @@ async fn drive_to_mining<C, F>(
     faucet: Option<&F>,
     generation: u64,
     stop: &mut watch::Receiver<bool>,
-    last_declared: &mut Option<u64>,
 ) -> Option<(MiningSnapshot, usize, usize)>
 where
     C: ChainClient + SyncSource + BalanceSource,
@@ -469,15 +464,6 @@ where
                 .await;
                 RoundEvent::Succeeded
             }
-            RoundState::ParticipationDeclared => {
-                for _ in 0..SUBMIT_ATTEMPTS {
-                    declare_round_participation(chain, last_declared, params.miner_account).await;
-                    if last_declared.is_some() {
-                        break;
-                    }
-                }
-                RoundEvent::Succeeded
-            }
             RoundState::StartMining => {
                 return snap.map(|s| (s, cancelled_jobs, miners_told));
             }
@@ -546,7 +532,11 @@ pub async fn feeder_loop<C>(
     let mut last_completed: HashMap<String, u64> = HashMap::new();
     let faucet = build_faucet(params.funding.faucet_url.as_deref());
     let mut round: Option<RoundState> = None;
+    // Participation bookkeeping. `last_declared` is the candidate qblock the
+    // chain has an answer for; `declared_generation` is the round that answer
+    // was obtained in, so the qblock id is read once per mined round.
     let mut last_declared: Option<u64> = None;
+    let mut declared_generation: Option<u64> = None;
     // Consecutive failed submits of one proof in one quantum block.
     let mut submit_ledger = crate::chain::SubmitLedger::new(params.max_submit_attempts);
 
@@ -639,7 +629,6 @@ pub async fn feeder_loop<C>(
                     faucet.as_ref(),
                     generation,
                     &mut stop,
-                    &mut last_declared,
                 )
                 .await
                 else {
@@ -736,6 +725,25 @@ pub async fn feeder_loop<C>(
                 broadcast_set_target(&state, target).await;
                 last_broadcast = Some(target_key);
                 current_head = Some(snap.last_proof_block_hash);
+            }
+
+            // Declare participation only once a miner has returned a Result
+            // for this round. Staged work is not evidence: a QPU sits a round
+            // out by withholding credits and rejecting what it is sent, and a
+            // miner that is down returns nothing. Declaring on the first
+            // Result records the rounds that were actually mined and nothing
+            // else. `declare_round_participation` deduplicates per candidate
+            // qblock, so a reseed of the same qblock does not submit again.
+            if declared_generation != Some(generation) && state.lock().await.round_mined() {
+                let settled = declare_round_participation(
+                    chain.as_ref(),
+                    &mut last_declared,
+                    params.miner_account,
+                )
+                .await;
+                if settled {
+                    declared_generation = Some(generation);
+                }
             }
 
             // Push the refreshed difficulty to live miners when it changed, so
