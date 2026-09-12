@@ -194,6 +194,10 @@ pub struct CoordinatorState {
     /// Feeder's current round; set on reseed. Compared against a miner's
     /// self-reported generation to detect stale-round mining.
     pub generation: u64,
+    /// Generation of the newest `Result` a miner returned for a live job.
+    /// Equal to `generation` once some miner has mined this round; the
+    /// feeder declares participation on that evidence and nothing weaker.
+    mined_generation: Option<u64>,
     /// Per-miner last-known self-reported liveness (mining/paused + round),
     /// updated from ping-reply `Status` messages.
     pub miner_liveness: HashMap<String, crate::liveness::MinerLiveness>,
@@ -225,6 +229,7 @@ impl CoordinatorState {
             wakeups: HashMap::new(),
             salts: HashMap::new(),
             current_best_milli: None,
+            mined_generation: None,
             results_validated: 0,
             last_abandoned_generation: 0,
             attempt_tx: None,
@@ -299,6 +304,24 @@ impl CoordinatorState {
     pub fn complete_inflight(&mut self, job_id: &[u8]) -> Option<quip_proto::v1::Job> {
         let _ = self.inflight_owner.remove(job_id);
         self.inflight.remove(job_id)
+    }
+
+    /// A miner returned a `Result` for a live job of `job_generation`.
+    ///
+    /// Only a Result for the current round counts: a late Result from a
+    /// cancelled generation is not this round's work. A `Reject` never
+    /// reaches here; a QPU that sits a round out answers every dispatch with
+    /// one, and that is exactly what must not read as participation.
+    pub fn note_result(&mut self, job_generation: u64) {
+        if job_generation == self.generation {
+            self.mined_generation = Some(job_generation);
+        }
+    }
+
+    /// Whether some miner has returned a Result for the current round.
+    #[must_use]
+    pub fn round_mined(&self) -> bool {
+        self.mined_generation == Some(self.generation)
     }
 
     /// Reclaim every job a miner owned — its in-flight jobs plus its staged
@@ -561,8 +584,9 @@ async fn run_session<C: ChainClient>(
                     let mut st = state.lock().await;
                     st.metrics.record_result_received(&miner_id);
                     let job = st.complete_inflight(&result.job_id);
-                    if job.is_some() {
+                    if let Some(job) = &job {
                         st.router.record_completion(&miner_id);
+                        st.note_result(job.generation);
                     } else {
                         // The job id is unknown or already completed: either the
                         // miner sent the same result twice, or the job was
@@ -1484,6 +1508,29 @@ mod tests {
             max_nodes: 0, // unlimited
             max_edges: 0,
         }
+    }
+
+    #[test]
+    fn result_for_the_current_generation_marks_the_round_mined() {
+        let mut st = CoordinatorState::new();
+        st.generation = 3;
+        assert!(!st.round_mined(), "no result yet");
+        st.note_result(2);
+        assert!(
+            !st.round_mined(),
+            "a stale-generation result is not this round's work"
+        );
+        st.note_result(3);
+        assert!(st.round_mined());
+    }
+
+    #[test]
+    fn reseed_clears_the_mined_mark() {
+        let mut st = CoordinatorState::new();
+        st.generation = 3;
+        st.note_result(3);
+        st.generation = 4;
+        assert!(!st.round_mined(), "a new round starts unmined");
     }
 
     #[test]

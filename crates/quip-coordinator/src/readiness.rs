@@ -2,9 +2,9 @@
 //!
 //! Process start has no miners to stop and does not stage work. This module
 //! drives [`crate::round::RoundState`] through validator-synced, account-funded,
-//! miner-registered, requirements-downloaded, descriptor-filed, and
-//! participation-declared. The feeder drives the same machine, including
-//! stop-mining and start-mining, on every later round.
+//! miner-registered, requirements-downloaded, and descriptor-filed. The feeder
+//! drives the same machine, including stop-mining and start-mining, on every
+//! later round, and declares participation once a miner has mined the round.
 //!
 //! A funding failure at startup is fatal. A missing snapshot is not: the
 //! caller warns and the feeder retries after miners connect.
@@ -76,10 +76,10 @@ pub fn build_faucet(url: Option<&str>) -> Option<HttpFaucet> {
 }
 
 /// Drive the round machine through validator-synced, account-funded,
-/// miner-registered, requirements-downloaded, descriptor-filed, and
-/// participation-declared. Used at process start. Registration, descriptor and
-/// participation never fail the walk. The feeder walks the same states, plus
-/// stop-mining and start-mining, on every later round.
+/// miner-registered, requirements-downloaded, and descriptor-filed. Used at
+/// process start. Registration and descriptor never fail the walk. The feeder
+/// walks the same states, plus stop-mining and start-mining, on every later
+/// round. Participation is not declared here: no miner has mined yet.
 ///
 /// `account` is the signing `AccountId32`, which is what pays fees, holds the
 /// balance, and keys the on-chain maps. The `PoW` miner identity derived from
@@ -168,21 +168,6 @@ where
     };
 
     file_round_descriptor(chain, latches.descriptor_filed, descriptor, account).await;
-    state = match state.transition(RoundEvent::Succeeded) {
-        Some(next) => {
-            next.log_entry(0);
-            next
-        }
-        None => state,
-    };
-
-    let mut last_declared = None;
-    for _ in 0..SUBMIT_ATTEMPTS {
-        declare_round_participation(chain, &mut last_declared, account).await;
-        if last_declared.is_some() {
-            break;
-        }
-    }
     let _ = state.transition(RoundEvent::Succeeded);
     Ok(snap)
 }
@@ -411,30 +396,36 @@ pub(crate) fn candidate_qblock_id(latest: Option<u64>) -> u64 {
 
 /// Submit `MinerRegistry.participate` for the current candidate qblock.
 ///
+/// The feeder calls this once a miner has returned a Result for the round.
 /// Mining does not wait on the result. A second call for the same qblock does
 /// not submit again. Pallet errors never become a readiness failure.
+///
+/// Returns whether the candidate is now settled (declared, or a pallet answer
+/// that will not change on retry). `false` means a transient chain error: the
+/// caller may try again.
 pub(crate) async fn declare_round_participation<C: ChainClient>(
     chain: &C,
     last_declared: &mut Option<u64>,
     account: [u8; 32],
-) {
+) -> bool {
     let latest = match chain.fetch_latest_qblock_id().await {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "cannot read qblock id; will retry participation next round"
+                "cannot read qblock id; will retry participation"
             );
-            return;
+            return false;
         }
     };
     let qblock_id = candidate_qblock_id(latest);
     if *last_declared == Some(qblock_id) {
-        return;
+        return true;
     }
     match chain.declare_participation(qblock_id).await {
         Ok(ParticipationOutcome::Declared | ParticipationOutcome::AlreadyDeclared) => {
             *last_declared = Some(qblock_id);
+            true
         }
         Ok(ParticipationOutcome::StaleQBlock) => {
             tracing::debug!(
@@ -442,6 +433,7 @@ pub(crate) async fn declare_round_participation<C: ChainClient>(
                 "candidate qblock moved; will declare the next one"
             );
             *last_declared = Some(qblock_id);
+            true
         }
         Ok(ParticipationOutcome::DescriptorMissing) => {
             tracing::warn!(
@@ -450,13 +442,15 @@ pub(crate) async fn declare_round_participation<C: ChainClient>(
                 "MinerRegistry has no descriptor for this account; participation cannot be recorded until one is set"
             );
             *last_declared = Some(qblock_id);
+            true
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 qblock_id,
-                "participation submit failed; will retry next round"
+                "participation submit failed; will retry"
             );
+            false
         }
     }
 }
@@ -525,8 +519,8 @@ mod tests {
         let chain = FakeChain::new(snap(), None);
         chain.set_qblock_id(Some(10));
         let mut last = None;
-        declare_round_participation(&chain, &mut last, account()).await;
-        declare_round_participation(&chain, &mut last, account()).await;
+        let _ = declare_round_participation(&chain, &mut last, account()).await;
+        let _ = declare_round_participation(&chain, &mut last, account()).await;
         assert_eq!(chain.participation_calls(), 1);
         assert_eq!(chain.take_participations(), vec![11]);
         assert_eq!(last, Some(11));
@@ -537,9 +531,9 @@ mod tests {
         let chain = FakeChain::new(snap(), None);
         let mut last = None;
         chain.set_qblock_id(Some(10));
-        declare_round_participation(&chain, &mut last, account()).await;
+        let _ = declare_round_participation(&chain, &mut last, account()).await;
         chain.set_qblock_id(Some(11));
-        declare_round_participation(&chain, &mut last, account()).await;
+        let _ = declare_round_participation(&chain, &mut last, account()).await;
         assert_eq!(chain.participation_calls(), 2);
         assert_eq!(chain.take_participations(), vec![11, 12]);
     }
@@ -677,8 +671,10 @@ token = "{SENTINEL}"
         );
     }
 
+    /// Participation is the feeder's to declare, after a miner has returned a
+    /// Result for the round. The process-start walk has no such evidence.
     #[tokio::test]
-    async fn prepare_round_declares_the_candidate() {
+    async fn prepare_round_does_not_declare_participation() {
         let chain = FakeChain::new(snap(), None);
         chain.set_qblock_id(Some(20));
         let _snap = prepare_round(
@@ -695,8 +691,7 @@ token = "{SENTINEL}"
         )
         .await
         .expect("prepare_round");
-        assert_eq!(chain.participation_calls(), 1);
-        assert_eq!(chain.take_participations(), vec![21]);
+        assert_eq!(chain.participation_calls(), 0);
         assert_eq!(chain.descriptor_calls(), 0);
     }
 
@@ -936,7 +931,7 @@ token = "{SENTINEL}"
 
         chain.set_participation_result(Ok(ParticipationOutcome::AlreadyDeclared));
         let mut last = None;
-        declare_round_participation(&chain, &mut last, account()).await;
+        let _ = declare_round_participation(&chain, &mut last, account()).await;
         let dup = drain(&buf);
         assert!(
             !dup.contains("WARN") && !dup.to_ascii_lowercase().contains("warn"),
@@ -945,7 +940,7 @@ token = "{SENTINEL}"
 
         chain.set_qblock_id(Some(5));
         chain.set_participation_result(Ok(ParticipationOutcome::StaleQBlock));
-        declare_round_participation(&chain, &mut last, account()).await;
+        let _ = declare_round_participation(&chain, &mut last, account()).await;
         let stale = drain(&buf);
         assert!(
             stale.is_empty(),
@@ -954,7 +949,7 @@ token = "{SENTINEL}"
 
         chain.set_qblock_id(Some(6));
         chain.set_participation_result(Ok(ParticipationOutcome::DescriptorMissing));
-        declare_round_participation(&chain, &mut last, account()).await;
+        let _ = declare_round_participation(&chain, &mut last, account()).await;
         let missing = drain(&buf);
         assert!(
             missing.contains("no descriptor"),
@@ -972,10 +967,10 @@ token = "{SENTINEL}"
         chain.set_qblock_id(Some(7));
         chain.set_participation_result(Err(ChainError::Unavailable("rpc down".into())));
         let mut last = None;
-        declare_round_participation(&chain, &mut last, account()).await;
+        let _ = declare_round_participation(&chain, &mut last, account()).await;
         assert_eq!(last, None);
         chain.set_participation_result(Ok(ParticipationOutcome::Declared));
-        declare_round_participation(&chain, &mut last, account()).await;
+        let _ = declare_round_participation(&chain, &mut last, account()).await;
         assert_eq!(chain.participation_calls(), 2);
         assert_eq!(last, Some(8));
     }

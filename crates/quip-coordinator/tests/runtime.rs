@@ -886,6 +886,86 @@ async fn wait_generation(state: &Arc<Mutex<CoordinatorState>>, generation: u64) 
     false
 }
 
+/// Play one Result for `generation` the way the session path does: dispatch a
+/// staged job to cpu-0 and complete it as this round's work. False when no job
+/// of that generation is staged in time.
+async fn return_one_result(state: &Arc<Mutex<CoordinatorState>>, generation: u64) -> bool {
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let mut st = state.lock().await;
+        if st.generation != generation || st.router.staged_len("cpu-0") == 0 {
+            continue;
+        }
+        st.router.grant_credits("cpu-0", 1);
+        let Some(job) = st.router.next_job("cpu-0") else {
+            continue;
+        };
+        let job_id = job.job_id.clone();
+        let job_generation = job.generation;
+        st.dispatch_inflight("cpu-0", job);
+        let _ = st.complete_inflight(&job_id);
+        st.note_result(job_generation);
+        return true;
+    }
+    false
+}
+
+/// Wait until the fake chain has seen `n` participate calls.
+async fn wait_participations(chain: &FakeChain, n: usize) -> bool {
+    for _ in 0..40 {
+        if chain.participation_calls() >= n {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    false
+}
+
+/// Staging work is not participating. The declaration waits for a miner to
+/// return a Result for the round: a QPU that sits a round out by withholding
+/// credits (or any miner that is down) must not be recorded as a participant.
+#[tokio::test]
+async fn feeder_declares_participation_only_after_a_result_for_the_round() {
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    chain.set_qblock_id(Some(10));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(1, 40),
+        stop_rx,
+    ));
+
+    assert!(wait_generation(&state, 1).await, "first round never staged");
+    // Several polls with work staged and nothing returned.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        chain.participation_calls(),
+        0,
+        "staged work alone must not declare participation"
+    );
+
+    assert!(return_one_result(&state, 1).await, "no job to complete");
+    assert!(
+        wait_participations(&chain, 1).await,
+        "a Result for the round must declare participation"
+    );
+    assert_eq!(chain.take_participations(), vec![11]);
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
 /// Two reseeds of the same minted qblock send one participate call.
 #[tokio::test]
 async fn feeder_declares_once_for_the_same_qblock() {
@@ -906,12 +986,20 @@ async fn feeder_declares_once_for_the_same_qblock() {
         stop_rx,
     ));
 
-    assert!(wait_generation(&state, 1).await, "first round never staged");
+    assert!(
+        return_one_result(&state, 1).await,
+        "first round never mined"
+    );
+    assert!(
+        wait_participations(&chain, 1).await,
+        "first round not declared"
+    );
     chain.set_snapshot(Some(snapshot_with_head([2u8; 32])));
     assert!(
-        wait_generation(&state, 2).await,
-        "second round never staged"
+        return_one_result(&state, 2).await,
+        "second round never mined"
     );
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         chain.participation_calls(),
         1,
@@ -946,12 +1034,23 @@ async fn feeder_declares_again_on_a_new_qblock() {
         stop_rx,
     ));
 
-    assert!(wait_generation(&state, 1).await, "first round never staged");
+    assert!(
+        return_one_result(&state, 1).await,
+        "first round never mined"
+    );
+    assert!(
+        wait_participations(&chain, 1).await,
+        "first round not declared"
+    );
     chain.set_qblock_id(Some(11));
     chain.set_snapshot(Some(snapshot_with_head([2u8; 32])));
     assert!(
-        wait_generation(&state, 2).await,
-        "second round never staged"
+        return_one_result(&state, 2).await,
+        "second round never mined"
+    );
+    assert!(
+        wait_participations(&chain, 2).await,
+        "second round not declared"
     );
     assert_eq!(chain.take_participations(), vec![11, 12]);
 
@@ -986,7 +1085,11 @@ async fn feeder_keeps_mining_when_participation_pallet_errors() {
     ));
 
     assert!(
-        wait_generation(&state, 1).await,
+        return_one_result(&state, 1).await,
+        "first round never mined"
+    );
+    assert!(
+        wait_participations(&chain, 1).await,
         "DuplicateParticipation must not block mining"
     );
 
@@ -994,7 +1097,11 @@ async fn feeder_keeps_mining_when_participation_pallet_errors() {
     chain.set_participation_result(Ok(ParticipationOutcome::StaleQBlock));
     chain.set_snapshot(Some(snapshot_with_head([2u8; 32])));
     assert!(
-        wait_generation(&state, 2).await,
+        return_one_result(&state, 2).await,
+        "second round never mined"
+    );
+    assert!(
+        wait_participations(&chain, 2).await,
         "InvalidQBlockId must not block mining"
     );
 
@@ -1002,7 +1109,11 @@ async fn feeder_keeps_mining_when_participation_pallet_errors() {
     chain.set_participation_result(Ok(ParticipationOutcome::DescriptorMissing));
     chain.set_snapshot(Some(snapshot_with_head([3u8; 32])));
     assert!(
-        wait_generation(&state, 3).await,
+        return_one_result(&state, 3).await,
+        "third round never mined"
+    );
+    assert!(
+        wait_participations(&chain, 3).await,
         "DescriptorRequired must not block mining"
     );
     assert_eq!(chain.participation_calls(), 3);
@@ -1109,7 +1220,14 @@ async fn feeder_reaches_mining_when_node_name_is_missing() {
         "missing node_name must not block mining"
     );
     assert_eq!(chain.descriptor_calls(), 0);
-    assert_eq!(chain.participation_calls(), 1);
+    assert!(
+        return_one_result(&state, 1).await,
+        "first round never mined"
+    );
+    assert!(
+        wait_participations(&chain, 1).await,
+        "a skipped descriptor must not stop participation"
+    );
 
     let _ = stop_tx.send(true);
     tokio::time::timeout(Duration::from_secs(2), feeder)
@@ -1149,7 +1267,20 @@ async fn feeder_keeps_mining_when_descriptor_or_participation_is_transient() {
         "transient errors must not block mining"
     );
     assert_eq!(chain.descriptor_calls(), 3);
-    assert_eq!(chain.participation_calls(), 3);
+    // Participation retries on later polls while the error persists, and
+    // mining carries on around it.
+    assert!(
+        return_one_result(&state, 1).await,
+        "first round never mined"
+    );
+    assert!(
+        wait_participations(&chain, 2).await,
+        "a transient participation error must be retried"
+    );
+    assert!(
+        state.lock().await.router.staged_len("cpu-0") >= 1,
+        "participation retries must not stop staging"
+    );
 
     let _ = stop_tx.send(true);
     tokio::time::timeout(Duration::from_secs(2), feeder)
@@ -1184,7 +1315,14 @@ async fn feeder_keeps_mining_when_descriptor_is_rejected() {
         "descriptor rejection must not block mining"
     );
     assert_eq!(chain.descriptor_calls(), 1);
-    assert_eq!(chain.participation_calls(), 1);
+    assert!(
+        return_one_result(&state, 1).await,
+        "first round never mined"
+    );
+    assert!(
+        wait_participations(&chain, 1).await,
+        "a rejected descriptor must not stop participation"
+    );
 
     let _ = stop_tx.send(true);
     tokio::time::timeout(Duration::from_secs(2), feeder)

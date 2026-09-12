@@ -19,9 +19,10 @@ pub(crate) enum RoundState {
     /// Download topology, target, minimum solutions, and diversity.
     RequirementsDownloaded,
     /// File a node descriptor. Submits only on the first walk after process start.
+    ///
+    /// Participation is not a walk step. The feeder declares it for the
+    /// candidate qblock once a miner has returned a Result for the round.
     DescriptorFiled,
-    /// File a participation marker for the candidate qblock.
-    ParticipationDeclared,
     /// Broadcast the requirements and stage jobs.
     StartMining,
 }
@@ -59,8 +60,7 @@ impl RoundState {
                 Self::AccountFunded => Some(Self::MinerRegistered),
                 Self::MinerRegistered => Some(Self::RequirementsDownloaded),
                 Self::RequirementsDownloaded => Some(Self::DescriptorFiled),
-                Self::DescriptorFiled => Some(Self::ParticipationDeclared),
-                Self::ParticipationDeclared => Some(Self::StartMining),
+                Self::DescriptorFiled => Some(Self::StartMining),
                 Self::StartMining => Some(self),
             },
         }
@@ -76,7 +76,6 @@ impl RoundState {
             Self::MinerRegistered => "miner_registered",
             Self::RequirementsDownloaded => "requirements_downloaded",
             Self::DescriptorFiled => "descriptor_filed",
-            Self::ParticipationDeclared => "participation_declared",
             Self::StartMining => "start_mining",
         }
     }
@@ -91,7 +90,6 @@ impl RoundState {
             Self::MinerRegistered => "registering the signing account as a miner on chain",
             Self::RequirementsDownloaded => "downloading the next qblock requirements",
             Self::DescriptorFiled => "filing the node descriptor",
-            Self::ParticipationDeclared => "declaring participation for the candidate qblock",
             Self::StartMining => "starting mining",
         }
     }
@@ -133,14 +131,13 @@ mod tests {
         }
     }
 
-    const ALL: [RoundState; 8] = [
+    const ALL: [RoundState; 7] = [
         RoundState::StopMining,
         RoundState::ValidatorSynced,
         RoundState::AccountFunded,
         RoundState::MinerRegistered,
         RoundState::RequirementsDownloaded,
         RoundState::DescriptorFiled,
-        RoundState::ParticipationDeclared,
         RoundState::StartMining,
     ];
 
@@ -148,7 +145,7 @@ mod tests {
     fn full_round_visits_each_state_in_order() {
         let mut state = RoundState::start();
         let mut seen = vec![state];
-        for _ in 0..7 {
+        for _ in 0..6 {
             state = step(state, RoundEvent::Succeeded);
             seen.push(state);
         }
@@ -182,17 +179,21 @@ mod tests {
     }
 
     #[test]
-    fn new_head_from_descriptor_or_participation_returns_to_stop_mining() {
-        for state in [
-            RoundState::DescriptorFiled,
-            RoundState::ParticipationDeclared,
-        ] {
-            assert_eq!(
-                state.transition(RoundEvent::NewHead),
-                Some(RoundState::StopMining),
-                "{state:?}"
-            );
-        }
+    fn new_head_from_descriptor_returns_to_stop_mining() {
+        assert_eq!(
+            RoundState::DescriptorFiled.transition(RoundEvent::NewHead),
+            Some(RoundState::StopMining)
+        );
+    }
+
+    #[test]
+    fn descriptor_filed_leads_straight_to_mining() {
+        // Participation is declared by the feeder once a miner returns a
+        // Result for the round, not by the pre-mining walk.
+        assert_eq!(
+            RoundState::DescriptorFiled.transition(RoundEvent::Succeeded),
+            Some(RoundState::StartMining)
+        );
     }
 
     #[test]
@@ -209,7 +210,7 @@ mod tests {
     #[test]
     fn a_win_during_mining_restarts_the_round() {
         let mut state = RoundState::start();
-        for _ in 0..7 {
+        for _ in 0..6 {
             state = step(state, RoundEvent::Succeeded);
         }
         assert_eq!(state, RoundState::StartMining);
