@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod presets;
 /// `PoW` and mempool job construction helpers.
 pub mod producer;
+pub mod pool_watch;
 pub mod readiness;
 pub mod round;
 pub mod router;
