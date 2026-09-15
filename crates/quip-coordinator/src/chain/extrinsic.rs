@@ -290,6 +290,16 @@ pub fn last_proof_block_storage_key() -> Vec<u8> {
     key
 }
 
+/// `QuantumPow::LastProofBlockHash` — plain `StorageValue` (hash of the last
+/// winning block, written one block after the win).
+#[must_use]
+pub fn last_proof_block_hash_storage_key() -> Vec<u8> {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(&twox128(b"QuantumPow"));
+    key.extend_from_slice(&twox128(b"LastProofBlockHash"));
+    key
+}
+
 /// Substrate storage key for the `QuantumPow.DefaultTopology` storage value.
 ///
 /// A `StorageValue` has no key hasher, so the key is the two twox128 name

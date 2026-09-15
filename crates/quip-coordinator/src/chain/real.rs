@@ -6,8 +6,9 @@
 
 use super::extrinsic::{
     build_hybrid_signed_extrinsic, default_topology_storage_key, difficulties_storage_key,
-    extrinsic_hash, hex_decode, hex_encode, job_orders_storage_key, last_proof_block_storage_key,
-    load_hybrid_pair, miner_identity_bytes, miners_storage_key, node_descriptors_storage_key,
+    extrinsic_hash, hex_decode, hex_encode, job_orders_storage_key,
+    last_proof_block_hash_storage_key, last_proof_block_storage_key, load_hybrid_pair,
+    miner_identity_bytes, miners_storage_key, node_descriptors_storage_key,
     order_solutions_storage_key, participants_by_qblock_storage_key, qblocks_storage_key,
     signer_account_bytes, solvers_storage_key, topology_curve_c_storage_key,
     SignedExtensionContext,
@@ -18,8 +19,8 @@ use super::scale_types::{
     encode_deregister_solver_call, encode_participate_call, encode_register_miner_call,
     encode_register_solver_call, encode_set_descriptor_call, encode_submit_proof_call,
     encode_submit_solution_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
-    JobSolutionScale, MinerInfoScale, MinerKind, MiningSnapshotScale, NodeDescriptorV2Input,
-    OrderStatus, OrderTiming, SolverInfoScale, SolverType,
+    JobSolutionScale, MinerInfoScale, MinerKind, NodeDescriptorV2Input, OrderStatus, OrderTiming,
+    SolverInfoScale, SolverType, TopologyMetaScale,
 };
 use super::submit::{
     classify_descriptor, classify_participation, classify_receipt, classify_registration,
@@ -50,6 +51,12 @@ use std::sync::{Arc, Mutex};
 /// one round trip while staying far below any node response limit.
 const ORDER_PAGE_SIZE: u32 = 200;
 
+/// A registered topology and the hash it was fetched under.
+struct CachedTopology {
+    hash: [u8; 32],
+    meta: TopologyMetaScale,
+}
+
 /// Production chain client (RPC + hybrid-signed submit).
 pub struct RealChainClient {
     /// Validator WebSocket / HTTP RPC URLs (primary first).
@@ -63,6 +70,11 @@ pub struct RealChainClient {
     last_snapshot: Mutex<Option<MiningSnapshot>>,
     /// Last `allowed_spin` spec (full `AllowedValueSpec`, not just Set values).
     last_spin_spec: Mutex<Option<AllowedValueSpec<Vec<i32>>>>,
+    /// The registered topology the last snapshot was built from, with its
+    /// hash. A topology never changes under its hash, so a poll on the same
+    /// hash reuses it and only the difficulty and root are read again. One
+    /// slot: a poll on another hash downloads that topology and replaces it.
+    topology: Mutex<Option<CachedTopology>>,
     /// How this client reaches the validator. Boxed so a WebAssembly build can
     /// supply a browser transport in place of the native one.
     transport: Arc<dyn RpcTransport>,
@@ -85,6 +97,7 @@ impl RealChainClient {
             pair: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             last_spin_spec: Mutex::new(None),
+            topology: Mutex::new(None),
             transport: Arc::new(JsonrpseeTransport),
             reachable: Mutex::new(None),
             participate_kind,
@@ -241,6 +254,87 @@ impl RealChainClient {
         T::decode(&mut &bytes[..])
             .map(Some)
             .map_err(|e| ChainError::Decode(e.to_string()))
+    }
+
+    /// `state_call` a `QuantumPowApi` method that takes one `H256` and returns
+    /// an `Option`. `Ok(None)` when the runtime answers `None` or null.
+    async fn quantum_pow_call_by_hash<T: Decode>(
+        &self,
+        method: &str,
+        hash: &[u8; 32],
+        at_hex: &str,
+    ) -> Result<Option<T>, ChainError> {
+        let result = self
+            .rpc_call(
+                "state_call",
+                Value::Array(vec![
+                    Value::String(method.to_string()),
+                    Value::String(hex_encode(hash)),
+                    Value::String(at_hex.to_string()),
+                ]),
+            )
+            .await?;
+        let Some(hex) = result.as_str() else {
+            return Ok(None);
+        };
+        let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+        Option::<T>::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))
+    }
+
+    /// The topology the snapshot mines on: the caller's choice, else the
+    /// chain's `DefaultTopology` at `at_hex`. `Ok(None)` when neither names one.
+    async fn snapshot_topology_hash(
+        &self,
+        chosen: Option<[u8; 32]>,
+        at_hex: &str,
+    ) -> Result<Option<[u8; 32]>, ChainError> {
+        match chosen {
+            Some(hash) => Ok(Some(hash)),
+            None => {
+                self.read_storage::<[u8; 32]>(&default_topology_storage_key(), at_hex)
+                    .await
+            }
+        }
+    }
+
+    /// The registered topology under `hash`: the cached one when the last
+    /// snapshot used the same hash, else `QuantumPowApi_topology_meta`, whose
+    /// answer replaces the cache. `Ok(None)` when the hash is not registered.
+    async fn topology_meta(
+        &self,
+        hash: [u8; 32],
+        at_hex: &str,
+    ) -> Result<Option<TopologyMetaScale>, ChainError> {
+        let cached = self.topology.lock().ok().and_then(|g| {
+            g.as_ref()
+                .filter(|c| c.hash == hash)
+                .map(|c| c.meta.clone())
+        });
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        let meta = self
+            .quantum_pow_call_by_hash::<TopologyMetaScale>(
+                "QuantumPowApi_topology_meta",
+                &hash,
+                at_hex,
+            )
+            .await?;
+        if let Some(meta) = &meta {
+            tracing::info!(
+                topology = %hex_encode(&hash),
+                nodes = meta.nodes.len(),
+                edges = meta.edges.len(),
+                "topology downloaded"
+            );
+            if let Ok(mut g) = self.topology.lock() {
+                *g = Some(CachedTopology {
+                    hash,
+                    meta: meta.clone(),
+                });
+            }
+        }
+        Ok(meta)
     }
 
     /// Read `QuantumPow.DefaultTopology` at the current head.
@@ -806,75 +900,66 @@ impl ChainClient for RealChainClient {
             h.copy_from_slice(&bytes);
             h
         };
+        let at_hex = hex_encode(&block_hash);
 
-        // Parameter: Option<H256> SCALE-encoded.
-        let param = match topology_hash {
-            None => vec![0u8],
-            Some(th) => {
-                let mut p = vec![1u8];
-                p.extend_from_slice(&th);
-                p
-            }
-        };
-
-        let result = self
-            .rpc_call(
-                "state_call",
-                Value::Array(vec![
-                    Value::String("QuantumPowApi_mining_snapshot".into()),
-                    Value::String(hex_encode(&param)),
-                    Value::String(hex_encode(&block_hash)),
-                ]),
-            )
-            .await?;
-
-        let Some(hex) = result.as_str() else {
-            // Null result → no topology / empty response.
-            return Ok(None);
-        };
-        let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
-        let decoded: Option<MiningSnapshotScale> =
-            Decode::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))?;
-        let Some(scale) = decoded else {
-            return Ok(None);
-        };
-
-        // Block number from header (snapshot has no block_number field).
-        let header = self
-            .rpc_call(
+        // Every read is pinned at `block_hash`, so the four round trips that
+        // only depend on it run together. The topology itself is not among
+        // them: it is fetched once per hash and cached (see `topology_meta`).
+        // `LastProofBlock` at the head names the winning block one block
+        // before `LastProofBlockHash` catches up. Both are ValueQuery: 0 and
+        // the zero hash when unset.
+        let last_proof_block_key = last_proof_block_storage_key();
+        let stored_root_key = last_proof_block_hash_storage_key();
+        let (header, topology_hash, last_proof_block, stored_root) = futures::try_join!(
+            self.rpc_call(
                 "chain_getHeader",
-                Value::Array(vec![Value::String(hex_encode(&block_hash))]),
-            )
-            .await?;
+                Value::Array(vec![Value::String(at_hex.clone())]),
+            ),
+            self.snapshot_topology_hash(topology_hash, &at_hex),
+            self.read_storage::<u32>(&last_proof_block_key, &at_hex),
+            self.read_storage::<[u8; 32]>(&stored_root_key, &at_hex),
+        )?;
+        let Some(topology_hash) = topology_hash else {
+            return Ok(None);
+        };
         let block_number = parse_block_number(&header)?;
 
-        // `LastProofBlock` at the head names the winning block one block
-        // before `LastProofBlockHash` catches up. ValueQuery: 0 when unset.
-        let last_proof_block: u32 = self
-            .read_storage(&last_proof_block_storage_key(), &hex_encode(&block_hash))
-            .await?
-            .unwrap_or(0);
+        // Decayed difficulty for this block. `None` means the hash is not
+        // registered, which is the same "nothing to mine" as no topology.
+        let difficulty = self
+            .quantum_pow_call_by_hash::<DifficultyConfig>(
+                "QuantumPowApi_difficulty_for",
+                &topology_hash,
+                &at_hex,
+            )
+            .await?;
+        let Some(difficulty) = difficulty else {
+            return Ok(None);
+        };
+        let Some(meta) = self.topology_meta(topology_hash, &at_hex).await? else {
+            return Ok(None);
+        };
 
         let snap = MiningSnapshot {
             head_hash: block_hash,
             last_proof_block_hash: super::snapshot::round_root(
                 block_hash,
                 block_number,
-                u64::from(last_proof_block),
-                scale.last_proof_block_hash.0,
+                u64::from(last_proof_block.unwrap_or(0)),
+                stored_root.unwrap_or([0u8; 32]),
             ),
-            topology_hash: scale.topology_hash.0.to_vec(),
-            nodes: scale.nodes,
-            edges: scale.edges,
-            allowed_h_milli: require_set_values(&scale.allowed_h_values)
+            topology_hash: topology_hash.to_vec(),
+            nodes: meta.nodes,
+            edges: meta.edges,
+            allowed_h_milli: require_set_values(&meta.allowed_h_values)
                 .map_err(ChainError::Decode)?,
-            allowed_j_milli: require_set_values(&scale.allowed_j_values)
+            allowed_j_milli: require_set_values(&meta.allowed_j_values)
                 .map_err(ChainError::Decode)?,
-            allowed_spin_milli: require_set_values(&scale.allowed_spin_values)
+            allowed_spin_milli: require_set_values(&meta.allowed_spin_values)
                 .map_err(ChainError::Decode)?,
-            min_solutions: scale.difficulty.min_solutions,
-            max_energy_milli: scale.difficulty.max_energy_milli,
-            min_diversity_milli: scale.difficulty.min_diversity_milli,
+            min_solutions: difficulty.min_solutions,
+            max_energy_milli: difficulty.max_energy_milli,
+            min_diversity_milli: difficulty.min_diversity_milli,
             block_number,
         };
 
@@ -882,7 +967,7 @@ impl ChainClient for RealChainClient {
             *g = Some(snap.clone());
         }
         if let Ok(mut g) = self.last_spin_spec.lock() {
-            *g = Some(scale.allowed_spin_values);
+            *g = Some(meta.allowed_spin_values);
         }
         Ok(Some(snap))
     }
@@ -1694,5 +1779,214 @@ mod tests {
             classify_state_outcome(false, true),
             StateOutcome::NotIncluded
         );
+    }
+
+    /// A validator scripted for the snapshot path: a fixed head at block 16,
+    /// one registered topology per hash, a `DefaultTopology` the test can
+    /// move, and a `LastProofBlock` the test can set. `None` answers null for
+    /// both `LastProofBlock` and `LastProofBlockHash`, which is genesis.
+    struct SnapshotValidator {
+        default_topology: std::sync::Mutex<[u8; 32]>,
+        last_proof_block: std::sync::Mutex<Option<u32>>,
+        topology_meta_calls: std::sync::Mutex<Vec<[u8; 32]>>,
+    }
+
+    const HEAD: [u8; 32] = [0xAA; 32];
+    const STORED_ROOT: [u8; 32] = [0xBB; 32];
+
+    fn topology_for(hash: [u8; 32]) -> crate::chain::scale_types::TopologyMetaScale {
+        use quantum_validation::AllowedValueSpec;
+        let n = u32::from(hash[0]);
+        crate::chain::scale_types::TopologyMetaScale {
+            nodes: vec![0, 1, n],
+            edges: vec![(0, 1), (1, n)],
+            allowed_h_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            allowed_j_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            allowed_spin_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            registered_at: 3,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::chain::transport::RpcTransport for SnapshotValidator {
+        async fn request(
+            &self,
+            _url: &str,
+            method: &str,
+            params: JsonValue,
+        ) -> Result<JsonValue, ChainError> {
+            use crate::chain::extrinsic::{
+                default_topology_storage_key, hex_decode, last_proof_block_hash_storage_key,
+                last_proof_block_storage_key,
+            };
+            use parity_scale_codec::Encode as _;
+            let arg = |i: usize| {
+                params
+                    .get(i)
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let hex = |bytes: &[u8]| JsonValue::String(hex_encode(bytes));
+            Ok(match method {
+                "chain_getBlockHash" => hex(&HEAD),
+                "chain_getHeader" => {
+                    assert_eq!(arg(0), hex_encode(&HEAD), "header read pinned at the head");
+                    serde_json::json!({ "number": "0x10" })
+                }
+                "state_getStorage" => {
+                    assert_eq!(arg(1), hex_encode(&HEAD), "storage read pinned at the head");
+                    let key = hex_decode(&arg(0)).expect("storage key hex");
+                    if key == default_topology_storage_key() {
+                        hex(&*self.default_topology.lock().unwrap())
+                    } else if key == last_proof_block_storage_key() {
+                        match *self.last_proof_block.lock().unwrap() {
+                            Some(n) => hex(&n.encode()),
+                            None => JsonValue::Null,
+                        }
+                    } else if key == last_proof_block_hash_storage_key() {
+                        match *self.last_proof_block.lock().unwrap() {
+                            Some(_) => hex(&STORED_ROOT),
+                            None => JsonValue::Null,
+                        }
+                    } else {
+                        panic!("unexpected storage key {}", arg(0))
+                    }
+                }
+                "state_call" => {
+                    assert_eq!(arg(2), hex_encode(&HEAD), "runtime call pinned at the head");
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&hex_decode(&arg(1)).expect("hash hex"));
+                    match arg(0).as_str() {
+                        "QuantumPowApi_difficulty_for" => {
+                            hex(&Some(crate::chain::scale_types::DifficultyConfig {
+                                min_solutions: 1,
+                                max_energy_milli: -5_000,
+                                min_diversity_milli: 0,
+                            })
+                            .encode())
+                        }
+                        "QuantumPowApi_topology_meta" => {
+                            self.topology_meta_calls.lock().unwrap().push(hash);
+                            hex(&Some(topology_for(hash)).encode())
+                        }
+                        other => panic!("unexpected runtime call {other}"),
+                    }
+                }
+                other => panic!("unexpected rpc method {other}"),
+            })
+        }
+
+        async fn subscribe(
+            &self,
+            _url: &str,
+            _sub: &str,
+            _params: JsonValue,
+            _unsub: &str,
+        ) -> Result<
+            crate::chain::transport::BoxStream<'static, Result<JsonValue, ChainError>>,
+            ChainError,
+        > {
+            Err(ChainError::Unavailable(
+                "no subscriptions in this test".into(),
+            ))
+        }
+    }
+
+    /// The topology is the one payload that never changes under its hash, so
+    /// polling the same hash must not download it again. A new default
+    /// topology is a new hash and is downloaded when it first appears. The
+    /// root and the difficulty are read on every poll.
+    #[tokio::test]
+    async fn the_topology_is_downloaded_only_when_the_hash_changes() {
+        use crate::chain::ChainClient as _;
+        let first = [0x11; 32];
+        let second = [0x22; 32];
+        let validator = std::sync::Arc::new(SnapshotValidator {
+            default_topology: std::sync::Mutex::new(first),
+            last_proof_block: std::sync::Mutex::new(Some(10)),
+            topology_meta_calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let client = RealChainClient::with_transport(
+            vec!["ws://scripted".to_string()],
+            "//Alice".to_string(),
+            MinerKind::Cpu,
+            validator.clone(),
+        );
+
+        let snap = client
+            .fetch_mining_snapshot(None, [0u8; 32], None)
+            .await
+            .expect("first snapshot")
+            .expect("a topology is registered");
+        assert_eq!(snap.head_hash, HEAD);
+        assert_eq!(
+            snap.last_proof_block_hash, STORED_ROOT,
+            "the win was at block 10, so the stored hash is the root"
+        );
+        assert_eq!(snap.block_number, 16);
+        assert_eq!(snap.topology_hash, first.to_vec());
+        assert_eq!(snap.nodes, vec![0, 1, 0x11]);
+        assert_eq!(snap.edges, vec![(0, 1), (1, 0x11)]);
+        assert_eq!(snap.allowed_spin_milli, vec![-1000, 1000]);
+        assert_eq!(snap.min_solutions, 1);
+        assert_eq!(snap.max_energy_milli, -5_000);
+
+        *validator.last_proof_block.lock().unwrap() = Some(16);
+        let won = client
+            .fetch_mining_snapshot(None, [0u8; 32], None)
+            .await
+            .expect("snapshot at the winning block")
+            .expect("still registered");
+        assert_eq!(
+            won.last_proof_block_hash, HEAD,
+            "LastProofBlock equals the head number, so the head is the root"
+        );
+
+        *validator.last_proof_block.lock().unwrap() = None;
+        let genesis = client
+            .fetch_mining_snapshot(None, [0u8; 32], None)
+            .await
+            .expect("snapshot before any win")
+            .expect("still registered");
+        assert_eq!(
+            genesis.last_proof_block_hash, [0u8; 32],
+            "unset storage reads as the ValueQuery defaults: block 0, zero hash"
+        );
+
+        let again = client
+            .fetch_mining_snapshot(None, [0u8; 32], None)
+            .await
+            .expect("second snapshot")
+            .expect("still registered");
+        assert_eq!(again.nodes, snap.nodes);
+        assert_eq!(
+            validator.topology_meta_calls.lock().unwrap().as_slice(),
+            &[first],
+            "the second poll on the same hash reuses the cached topology"
+        );
+
+        *validator.default_topology.lock().unwrap() = second;
+        let moved = client
+            .fetch_mining_snapshot(None, [0u8; 32], None)
+            .await
+            .expect("third snapshot")
+            .expect("the new default is registered");
+        assert_eq!(moved.topology_hash, second.to_vec());
+        assert_eq!(moved.nodes, vec![0, 1, 0x22]);
+        assert_eq!(
+            validator.topology_meta_calls.lock().unwrap().as_slice(),
+            &[first, second],
+            "a new hash is downloaded when it first appears"
+        );
+
+        // The caller's own choice bypasses `DefaultTopology` and hits the cache.
+        let chosen = client
+            .fetch_mining_snapshot(None, [0u8; 32], Some(second))
+            .await
+            .expect("chosen snapshot")
+            .expect("registered");
+        assert_eq!(chosen.nodes, moved.nodes);
+        assert_eq!(validator.topology_meta_calls.lock().unwrap().len(), 2);
     }
 }

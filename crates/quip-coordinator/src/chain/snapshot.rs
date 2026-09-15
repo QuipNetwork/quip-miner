@@ -185,7 +185,8 @@ mod tests {
     #[test]
     fn quantum_pow_storage_keys_have_expected_shape() {
         use crate::chain::extrinsic::{
-            difficulties_storage_key, last_proof_block_storage_key, topology_curve_c_storage_key,
+            difficulties_storage_key, last_proof_block_hash_storage_key,
+            last_proof_block_storage_key, topology_curve_c_storage_key,
         };
         let hash = [9u8; 32];
         let diff = difficulties_storage_key(&hash);
@@ -205,6 +206,12 @@ mod tests {
             // Plain StorageValue: pallet + item, no key suffix.
             assert_eq!(last_proof_block_storage_key().len(), 32);
             assert_eq!(last_proof_block_storage_key()[..16], diff[..16]);
+            assert_eq!(last_proof_block_hash_storage_key().len(), 32);
+            assert_eq!(last_proof_block_hash_storage_key()[..16], diff[..16]);
+            assert_ne!(
+                last_proof_block_hash_storage_key()[16..],
+                last_proof_block_storage_key()[16..]
+            );
         }
     }
 

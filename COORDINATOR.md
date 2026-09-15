@@ -67,8 +67,8 @@ seconds warns once.
   v0.2 `quip-miner` format when it sees that format's keys, because the two
   configs are not interchangeable.
 - **An incompatible validator.** `chain::preflight` reads the runtime version
-  and checks `QuantumPowApi`. The coordinator drives version 2 or newer, which
-  is the first version whose `mining_snapshot` takes a topology selector.
+  and checks `QuantumPowApi`. The coordinator drives version 2 or newer, the
+  version that added `difficulty_for`, which every poll calls.
 - **An unfunded miner account.** `funding.rs` reads the account balance and,
   when the balance is below `min_balance_plancks` (2 UNIT), requests a top up
   from `faucet_url`. It retries with backoff for `funding_timeout_s` (10
@@ -145,7 +145,12 @@ All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
 - `fetch_mining_snapshot` — the mining inputs at a block: topology
   (nodes/edges, allowed h/J/spin ranges), difficulty gates
   (`max_energy_milli`, `min_solutions`, `min_diversity_milli`), and the round
-  anchor (`last_proof_block_hash`).
+  anchor (`last_proof_block_hash`). The client pins every read at one head
+  hash. Each poll reads the difficulty and the root: `difficulty_for`, the
+  `LastProofBlock` and `LastProofBlockHash` values, the header, and
+  `DefaultTopology` when the caller names no topology. The client keeps the
+  last topology it read through `topology_meta` and reads again only when the
+  hash changes, because a topology never changes under its hash.
 - `fetch_mempool_orders` — open mempool orders eligible for this miner.
 - `submit_proof` — hybrid-sign and submit a proof extrinsic, then classify the
   receipt.

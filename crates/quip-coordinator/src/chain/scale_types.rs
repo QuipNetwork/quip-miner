@@ -62,6 +62,27 @@ pub struct MiningSnapshotScale {
     pub allowed_spin_values: AllowedValueSpec<Vec<i32>>,
 }
 
+/// Runtime-API registered topology (matches pallet `TopologyMeta`).
+///
+/// Returned by `QuantumPowApi_topology_meta(hash)`. The hash is the content
+/// hash of every field but `registered_at`, so one hash names one topology
+/// for the life of the chain and the client caches it by hash.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct TopologyMetaScale {
+    /// Topology node ids.
+    pub nodes: Vec<u32>,
+    /// Topology undirected edges as `(u, v)` node-id pairs.
+    pub edges: Vec<(u32, u32)>,
+    /// Allowed linear-field values.
+    pub allowed_h_values: AllowedValueSpec<Vec<i32>>,
+    /// Allowed coupling values.
+    pub allowed_j_values: AllowedValueSpec<Vec<i32>>,
+    /// Allowed spin values.
+    pub allowed_spin_values: AllowedValueSpec<Vec<i32>>,
+    /// Block number the topology was registered at.
+    pub registered_at: u32,
+}
+
 /// Proof payload for `QuantumPow.submit_proof` (pallet index 10, call index 4).
 ///
 /// Energies / diversity are **not** sent — the chain recomputes them.
@@ -761,6 +782,21 @@ mod tests {
         let decoded: Option<MiningSnapshotScale> =
             Decode::decode(&mut &encoded[..]).expect("decode");
         assert_eq!(decoded, Some(snap));
+    }
+
+    #[test]
+    fn topology_meta_scale_roundtrip() {
+        let meta = TopologyMetaScale {
+            nodes: vec![0, 1, 2],
+            edges: vec![(0, 1), (1, 2)],
+            allowed_h_values: AllowedValueSpec::Set(vec![-1000, 0, 1000]),
+            allowed_j_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            allowed_spin_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            registered_at: 7,
+        };
+        let encoded = Some(meta.clone()).encode();
+        let decoded: Option<TopologyMetaScale> = Decode::decode(&mut &encoded[..]).expect("decode");
+        assert_eq!(decoded, Some(meta));
     }
 
     #[test]
