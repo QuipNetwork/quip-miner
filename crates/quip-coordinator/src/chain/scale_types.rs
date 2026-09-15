@@ -241,6 +241,19 @@ pub const SET_DESCRIPTOR_CALL_INDEX: u8 = 0;
 /// Call index of `participate` within `MinerRegistry`.
 pub const PARTICIPATE_CALL_INDEX: u8 = 2;
 
+/// Pallet index of `QuantumComputeMempool` in the runtime construct.
+pub const QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX: u8 = 9;
+/// `QuantumComputeMempool::register_solver(solver_type)` call index. Not
+/// idempotent: a second call fails with `SolverAlreadyRegistered`.
+pub const REGISTER_SOLVER_CALL_INDEX: u8 = 0;
+/// `QuantumComputeMempool::deregister_solver()` call index.
+pub const DEREGISTER_SOLVER_CALL_INDEX: u8 = 1;
+/// `QuantumComputeMempool::submit_solution(order_id, solutions)` call index.
+pub const SUBMIT_SOLUTION_CALL_INDEX: u8 = 4;
+/// Runtime `QuantumMaxSolutions`: the most rows one `submit_solution` carries.
+/// Smaller than the `PoW` bound, and checked before any energy filtering.
+pub const MAX_ORDER_SOLUTIONS: usize = 20;
+
 /// Pallet `MaxNodeIdBytes`.
 pub const MAX_NODE_ID_BYTES: usize = 64;
 /// Pallet `MaxNodeNameBytes`.
@@ -304,6 +317,78 @@ pub enum MinerKind {
     Asic,
     /// Apple Metal GPU. Last so the earlier tags stay stable.
     Metal,
+}
+
+/// SCALE tag order must match `pallet_quantum_compute_mempool::MinerType`.
+///
+/// Not [`MinerKind`]: the mempool pallet has no `Metal` tag, so encoding a
+/// `MinerKind::Metal` here would fail to decode on chain.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub enum SolverType {
+    /// CPU sampler.
+    Cpu,
+    /// GPU sampler, discrete or Apple Metal.
+    Gpu,
+    /// D-Wave QPU.
+    QpuDwave,
+    /// IBM QPU.
+    QpuIbm,
+    /// `IonQ` QPU.
+    QpuIonq,
+    /// Pasqal QPU.
+    QpuPasqal,
+    /// ASIC sampler.
+    Asic,
+}
+
+impl From<MinerKind> for SolverType {
+    fn from(kind: MinerKind) -> Self {
+        match kind {
+            MinerKind::Cpu => Self::Cpu,
+            MinerKind::Gpu | MinerKind::Metal => Self::Gpu,
+            MinerKind::QpuDwave => Self::QpuDwave,
+            MinerKind::QpuIbm => Self::QpuIbm,
+            MinerKind::QpuIonq => Self::QpuIonq,
+            MinerKind::QpuPasqal => Self::QpuPasqal,
+            MinerKind::Asic => Self::Asic,
+        }
+    }
+}
+
+/// SCALE mirror of `QuantumComputeMempool.Solvers[account]`
+/// (`SolverInfo<AccountId32, u128, u32>`). Field order is the pallet's.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct SolverInfoScale {
+    /// The registered account.
+    pub account: [u8; 32],
+    /// Type the account registered as. Bid orders filter on it.
+    pub solver_type: SolverType,
+    /// Block the account registered at.
+    pub registered_at: u32,
+    /// Lifetime accepted solutions.
+    pub solutions_submitted: u64,
+    /// Lifetime rewards, in plancks.
+    pub rewards_earned: u128,
+}
+
+/// SCALE mirror of `QuantumComputeMempool.OrderSolutions[order_id][account]`
+/// (`JobSolution<AccountId32, u32, BoundedVec<BoundedVec<i8>>>`).
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct JobSolutionScale {
+    /// The solving account.
+    pub solver: [u8; 32],
+    /// The solver's registered type.
+    pub solver_type: SolverType,
+    /// The diverse subset the pallet kept, as `±1` spins.
+    pub solutions: Vec<Vec<i8>>,
+    /// Best kept energy in milli units.
+    pub best_energy_milli: i64,
+    /// Diversity of the kept subset in milli units.
+    pub diversity_milli: u32,
+    /// Number of kept rows.
+    pub num_valid: u32,
+    /// Block that accepted this submission. A resubmission overwrites it.
+    pub submitted_at: u32,
 }
 
 /// SCALE tag order must match `pallet_miner_registry::LogLevel`.
@@ -446,6 +531,42 @@ pub fn encode_register_miner_call() -> Vec<u8> {
     vec![QUANTUM_POW_PALLET_INDEX, REGISTER_MINER_CALL_INDEX]
 }
 
+/// SCALE-encode `QuantumComputeMempool.register_solver(solver_type)`.
+#[must_use]
+pub fn encode_register_solver_call(solver_type: SolverType) -> Vec<u8> {
+    let mut out = vec![
+        QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+        REGISTER_SOLVER_CALL_INDEX,
+    ];
+    out.extend(solver_type.encode());
+    out
+}
+
+/// SCALE-encode `QuantumComputeMempool.deregister_solver()`.
+#[must_use]
+pub fn encode_deregister_solver_call() -> Vec<u8> {
+    vec![
+        QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+        DEREGISTER_SOLVER_CALL_INDEX,
+    ]
+}
+
+/// SCALE-encode `QuantumComputeMempool.submit_solution(order_id, solutions)`.
+///
+/// Each row is one `±1` spin per node, in node order. A `BoundedVec` encodes
+/// like a `Vec`, so the bounds are the caller's to respect
+/// ([`MAX_ORDER_SOLUTIONS`] rows).
+#[must_use]
+pub fn encode_submit_solution_call(order_id: u64, solutions: &[Vec<i8>]) -> Vec<u8> {
+    let mut out = vec![
+        QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+        SUBMIT_SOLUTION_CALL_INDEX,
+    ];
+    out.extend(order_id.encode());
+    out.extend(solutions.encode());
+    out
+}
+
 /// SCALE-encode `MinerRegistry.participate(qblock_id, kind, budget_seconds)`.
 #[must_use]
 pub fn encode_participate_call(
@@ -508,6 +629,79 @@ pub fn require_set_values(spec: &AllowedValueSpec<Vec<i32>>) -> Result<Vec<i32>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_solver_call_is_the_dispatch_indices_and_the_type_tag() {
+        assert_eq!(
+            encode_register_solver_call(SolverType::QpuDwave),
+            [
+                QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+                REGISTER_SOLVER_CALL_INDEX,
+                2
+            ]
+        );
+        assert_eq!(
+            encode_deregister_solver_call(),
+            [
+                QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+                DEREGISTER_SOLVER_CALL_INDEX
+            ]
+        );
+    }
+
+    /// The mempool pallet has no `Metal` tag. `MinerKind::Metal` is tag 7,
+    /// which the pallet cannot decode, so it must map onto `Gpu` (tag 1).
+    #[test]
+    fn metal_registers_as_a_gpu_solver() {
+        assert_eq!(SolverType::from(MinerKind::Metal), SolverType::Gpu);
+        assert_eq!(SolverType::from(MinerKind::Metal).encode(), [1]);
+        assert_eq!(SolverType::from(MinerKind::Asic).encode(), [6]);
+    }
+
+    #[test]
+    fn submit_solution_call_encodes_order_id_then_nested_spin_rows() {
+        let call = encode_submit_solution_call(0x0102, &[vec![1, -1], vec![-1, 1]]);
+        let mut expected = vec![
+            QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+            SUBMIT_SOLUTION_CALL_INDEX,
+        ];
+        expected.extend_from_slice(&0x0102u64.to_le_bytes());
+        // Compact lengths: 2 rows, then 2 spins per row; -1 is 0xFF.
+        expected.extend_from_slice(&[0x08, 0x08, 0x01, 0xFF, 0x08, 0xFF, 0x01]);
+        assert_eq!(call, expected);
+    }
+
+    #[test]
+    fn solver_info_decodes_the_pallet_field_order() {
+        let mut blob = vec![0xAB; 32];
+        blob.push(1); // Gpu
+        blob.extend_from_slice(&7u32.to_le_bytes());
+        blob.extend_from_slice(&3u64.to_le_bytes());
+        blob.extend_from_slice(&9u128.to_le_bytes());
+        let info = SolverInfoScale::decode(&mut blob.as_slice()).unwrap();
+        assert_eq!(info.account, [0xAB; 32]);
+        assert_eq!(info.solver_type, SolverType::Gpu);
+        assert_eq!(info.registered_at, 7);
+        assert_eq!(info.solutions_submitted, 3);
+        assert_eq!(info.rewards_earned, 9);
+    }
+
+    #[test]
+    fn job_solution_decodes_the_pallet_field_order() {
+        let mut blob = vec![0x11; 32];
+        blob.push(0); // Cpu
+        blob.extend_from_slice(&[0x04, 0x08, 0x01, 0xFF]); // one row: [1, -1]
+        blob.extend_from_slice(&(-5i64).to_le_bytes());
+        blob.extend_from_slice(&250u32.to_le_bytes());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&188_000u32.to_le_bytes());
+        let sol = JobSolutionScale::decode(&mut blob.as_slice()).unwrap();
+        assert_eq!(sol.solutions, vec![vec![1, -1]]);
+        assert_eq!(sol.best_energy_milli, -5);
+        assert_eq!(sol.diversity_milli, 250);
+        assert_eq!(sol.num_valid, 1);
+        assert_eq!(sol.submitted_at, 188_000);
+    }
 
     #[test]
     fn require_set_values_accepts_nonempty_set() {

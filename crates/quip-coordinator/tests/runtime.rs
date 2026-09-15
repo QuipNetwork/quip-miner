@@ -105,6 +105,7 @@ async fn runtime_serves_supervises_and_shuts_down_clean() {
         descriptor: quip_coordinator::config::DescriptorParams::default(),
         descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        solver_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         identity: quip_coordinator::metrics::Identity::default(),
     };
     let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
@@ -208,6 +209,7 @@ async fn feeder_tops_up_to_buffer_depth_records_salts_and_sets_target() {
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            solver_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics: Arc::new(quip_coordinator::metrics::CoordinatorMetrics::new(&[])),
         },
         stop_rx,
@@ -274,6 +276,7 @@ async fn feeder_funds_the_account_and_derives_jobs_from_the_identity() {
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            solver_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics: Arc::new(quip_coordinator::metrics::CoordinatorMetrics::new(&[])),
         },
         stop_rx,
@@ -409,6 +412,7 @@ async fn feeder_grows_window_for_drainer_and_holds_floor_for_idle() {
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            solver_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics: Arc::new(quip_coordinator::metrics::CoordinatorMetrics::new(&[])),
         },
         stop_rx,
@@ -476,6 +480,7 @@ async fn feeder_broadcasts_set_target_once_per_difficulty() {
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            solver_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics: Arc::new(quip_coordinator::metrics::CoordinatorMetrics::new(&[])),
         },
         stop_rx,
@@ -525,6 +530,197 @@ async fn feeder_broadcasts_set_target_once_per_difficulty() {
         .expect("feeder task panicked");
 }
 
+/// An open order on the `ising_snapshot` graph with no energy gate, so any
+/// sample the mock miner returns clears it.
+fn mempool_order() -> quip_coordinator::chain::JobOrder {
+    quip_coordinator::chain::JobOrder {
+        order_id: 7u64.to_le_bytes().to_vec(),
+        nodes: vec![0, 1, 2, 3],
+        edges: vec![(0, 1), (1, 2), (2, 3), (0, 3)],
+        h_milli: vec![0; 4],
+        j_milli: vec![-1000; 4],
+        min_energy_milli: None,
+        min_diversity_milli: None,
+        min_solutions: Some(1),
+        deadline_ms: 0,
+    }
+}
+
+async fn wait_for(mut check: impl FnMut() -> bool) -> bool {
+    for _ in 0..100 {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    false
+}
+
+/// The feeder registers the account as a solver once, then stages an open
+/// order exactly once as a generation-0 job, however many blocks it sees.
+#[tokio::test]
+async fn feeder_registers_as_solver_and_stages_each_open_order_once() {
+    let chain = Arc::new(FakeChain::new(ising_snapshot(), Some(mempool_order())));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(2, 30),
+        stop_rx,
+    ));
+
+    let mut staged = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if !state.lock().await.mempool_orders.is_empty() {
+            staged = true;
+            break;
+        }
+    }
+    assert!(staged, "the open order was never staged");
+
+    // Later blocks re-read the order map; the order must not be staged again.
+    let mut next = ising_snapshot();
+    next.block_number = 43;
+    chain.set_snapshot(Some(next));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+
+    assert_eq!(chain.solver_registration_submits(), 1);
+    let jobs = state.lock().await.router.reclaim("cpu-0");
+    let orders: Vec<_> = jobs.iter().filter(|j| j.generation == 0).collect();
+    assert_eq!(orders.len(), 1, "the order must be staged exactly once");
+    assert_eq!(
+        orders.first().map(|j| j.job_id.clone()),
+        Some(mempool_order().order_id)
+    );
+}
+
+/// `PoW` does not wait on solver registration, and no order is staged while it
+/// keeps failing. A failure is retried once per round, not once per poll.
+#[tokio::test]
+async fn feeder_mines_pow_but_stages_no_order_while_solver_registration_fails() {
+    let chain = Arc::new(FakeChain::new(ising_snapshot(), Some(mempool_order())));
+    chain.set_solver_registration_result(Err(quip_coordinator::chain::ChainError::Unavailable(
+        "rpc down".into(),
+    )));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(2, 30),
+        stop_rx,
+    ));
+
+    let mut mining = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if state.lock().await.router.staged_len("cpu-0") >= 2 {
+            mining = true;
+            break;
+        }
+    }
+    assert!(mining, "PoW must mine while solver registration fails");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+
+    assert!(state.lock().await.mempool_orders.is_empty());
+    assert_eq!(
+        chain.solver_registration_submits(),
+        1,
+        "one attempt per round, not one per poll"
+    );
+}
+
+/// Through the real session path: a mock miner samples a staged order, and
+/// the coordinator answers it with `submit_solution`, never `submit_proof`.
+#[tokio::test]
+async fn runtime_answers_a_mempool_order_with_submit_solution() {
+    let miner = mock_miner();
+    let sock = format!("/tmp/quip-rt-mempool-{}.sock", std::process::id());
+    let chain = Arc::new(FakeChain::new(ising_snapshot(), Some(mempool_order())));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let params = RuntimeParams {
+        max_submit_attempts: 5,
+        sock_path: sock,
+        grace_ms: 500,
+        backoff: BackoffPolicy::default(),
+        miner_identity: [0u8; 32],
+        miner_account: [0u8; 32],
+        buffer_depth: 1,
+        poll_interval_ms: 50,
+        dashboard: None,
+        log_level: quip_coordinator::logging::LogLevel::Info,
+        funding: quip_coordinator::funding::FundingParams::default(),
+        descriptor: quip_coordinator::config::DescriptorParams::default(),
+        descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        solver_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        identity: quip_coordinator::metrics::Identity::default(),
+    };
+    let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
+    let run = tokio::spawn(run_runtime(
+        vec![cpu_entry(miner)],
+        Arc::clone(&chain),
+        state,
+        params,
+        async move {
+            let _ = trigger_rx.await;
+        },
+    ));
+
+    let answered = wait_for(|| !chain.solutions.lock().expect("solutions lock").is_empty()).await;
+
+    trigger_tx.send(()).expect("send shutdown trigger");
+    tokio::time::timeout(Duration::from_secs(6), run)
+        .await
+        .expect("run_runtime did not return after shutdown")
+        .expect("run_runtime task panicked")
+        .expect("run_runtime returned an error");
+
+    assert!(
+        answered,
+        "the order was never answered with submit_solution"
+    );
+    let solutions = chain.take_solutions();
+    let order_id = mempool_order().order_id;
+    let first = solutions.first().expect("one captured solution");
+    assert_eq!(first.order_id, order_id);
+    assert!(!first.is_pow);
+    assert!(!first.solutions.is_empty());
+    assert!(
+        chain
+            .take_submitted()
+            .iter()
+            .all(|p| p.order_id != order_id),
+        "a mempool result must never reach submit_proof"
+    );
+}
+
 fn feeder_params(buffer_depth: usize, poll_ms: u64) -> FeederParams {
     FeederParams {
         max_submit_attempts: 5,
@@ -536,6 +732,7 @@ fn feeder_params(buffer_depth: usize, poll_ms: u64) -> FeederParams {
         descriptor: quip_coordinator::config::DescriptorParams::default(),
         descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        solver_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         metrics: Arc::new(quip_coordinator::metrics::CoordinatorMetrics::new(&[])),
     }
 }

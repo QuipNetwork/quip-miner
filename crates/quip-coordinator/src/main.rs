@@ -305,6 +305,10 @@ fn load_coordinator_config(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear startup: config, chain client, readiness, then runtime params"
+)]
 fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode {
     // --help is handled by clap (exit 0). Missing/invalid config → exit 64.
     let (config_path, cfg) = match load_coordinator_config(config) {
@@ -407,6 +411,7 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
         descriptor,
         descriptor_filed,
         miner_registered,
+        solver_registered: Arc::new(AtomicBool::new(false)),
         identity,
     };
     tracing::info!(

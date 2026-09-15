@@ -8,14 +8,17 @@ use super::extrinsic::{
     build_hybrid_signed_extrinsic, default_topology_storage_key, difficulties_storage_key,
     extrinsic_hash, hex_decode, hex_encode, job_orders_storage_key, last_proof_block_storage_key,
     load_hybrid_pair, miner_identity_bytes, miners_storage_key, node_descriptors_storage_key,
-    participants_by_qblock_storage_key, qblocks_storage_key, signer_account_bytes,
-    topology_curve_c_storage_key, SignedExtensionContext,
+    order_solutions_storage_key, participants_by_qblock_storage_key, qblocks_storage_key,
+    signer_account_bytes, solvers_storage_key, topology_curve_c_storage_key,
+    SignedExtensionContext,
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
-    encode_participate_call, encode_register_miner_call, encode_set_descriptor_call,
-    encode_submit_proof_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
-    MinerInfoScale, MinerKind, MiningSnapshotScale, NodeDescriptorV2Input, OrderStatus,
+    encode_deregister_solver_call, encode_participate_call, encode_register_miner_call,
+    encode_register_solver_call, encode_set_descriptor_call, encode_submit_proof_call,
+    encode_submit_solution_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
+    JobSolutionScale, MinerInfoScale, MinerKind, MiningSnapshotScale, NodeDescriptorV2Input,
+    OrderStatus, OrderTiming, SolverInfoScale, SolverType,
 };
 use super::submit::{
     classify_descriptor, classify_participation, classify_receipt, classify_registration,
@@ -485,6 +488,29 @@ impl RealChainClient {
                 self.storage_value_present(&difficulties_storage_key(&topology_hash), block_hex)
                     .await
             }
+            Confirmation::SolverRegistered { account } => {
+                self.storage_value_present(&solvers_storage_key(&account), block_hex)
+                    .await
+            }
+            Confirmation::SolverDeregistered { account } => Ok(!self
+                .storage_value_present(&solvers_storage_key(&account), block_hex)
+                .await?),
+            Confirmation::SolutionAccepted { order_id, account } => {
+                let header = self
+                    .rpc_call(
+                        "chain_getHeader",
+                        Value::Array(vec![Value::String(block_hex.to_string())]),
+                    )
+                    .await?;
+                let number = parse_block_number(&header)?;
+                let stored = self
+                    .read_storage::<JobSolutionScale>(
+                        &order_solutions_storage_key(order_id, &account),
+                        block_hex,
+                    )
+                    .await?;
+                Ok(stored.is_some_and(|s| u64::from(s.submitted_at) == number))
+            }
         }
     }
 
@@ -621,6 +647,19 @@ impl RealChainClient {
                 "dispatch failed and QuantumPow.Difficulties has no entry for this topology"
                     .to_string()
             }
+            Confirmation::SolverRegistered { .. } => {
+                "dispatch failed and QuantumComputeMempool.Solvers still has no entry for this \
+                 account"
+                    .to_string()
+            }
+            Confirmation::SolverDeregistered { .. } => {
+                "dispatch failed and QuantumComputeMempool.Solvers still holds this account"
+                    .to_string()
+            }
+            Confirmation::SolutionAccepted { order_id, .. } => format!(
+                "dispatch failed and OrderSolutions for order {order_id} holds no submission from \
+                 this block; the order may have closed, or the solutions missed its gates"
+            ),
         };
         (text, false)
     }
@@ -675,6 +714,14 @@ pub(crate) enum Confirmation {
     DefaultTopology,
     /// `QuantumPow.Difficulties[topology_hash]` is present. Used by seed-chain.
     Difficulty { topology_hash: [u8; 32] },
+    /// `QuantumComputeMempool.Solvers[account]` is present.
+    SolverRegistered { account: [u8; 32] },
+    /// `QuantumComputeMempool.Solvers[account]` is absent.
+    SolverDeregistered { account: [u8; 32] },
+    /// `QuantumComputeMempool.OrderSolutions[order_id][account]` was written by
+    /// this block. Presence alone is not enough: an earlier submission for the
+    /// same order would already be there.
+    SolutionAccepted { order_id: u64, account: [u8; 32] },
 }
 
 /// On-chain result of a hybrid-signed extrinsic, before pallet-specific classify.
@@ -918,6 +965,10 @@ impl ChainClient for RealChainClient {
         }))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one order walk: enumerate keys, read each order, drop closed and expired ones"
+    )]
     async fn fetch_mempool_orders(
         &self,
         _miner_account: [u8; 32],
@@ -983,6 +1034,17 @@ impl ChainClient for RealChainClient {
             }
         }
 
+        let header = self
+            .rpc_call(
+                "chain_getHeader",
+                Value::Array(vec![Value::String(head_hex.to_string())]),
+            )
+            .await?;
+        let head_number = parse_block_number(&header)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+
         let mut orders = Vec::new();
         for oid in order_ids {
             let key = job_orders_storage_key(oid);
@@ -1004,6 +1066,17 @@ impl ChainClient for RealChainClient {
             if scale.status != OrderStatus::Opened {
                 continue;
             }
+            // The pallet expires orders lazily, so an `Opened` status can
+            // outlive the order. Skip one already past its expiry.
+            let Some(deadline_ms) = order_deadline_ms(
+                scale.created_at,
+                scale.first_solution_at,
+                &scale.timing,
+                head_number,
+                now_ms,
+            ) else {
+                continue;
+            };
             orders.push(JobOrder {
                 order_id: oid.to_le_bytes().to_vec(),
                 nodes: scale.ising_params.nodes,
@@ -1013,10 +1086,7 @@ impl ChainClient for RealChainClient {
                 min_energy_milli: scale.ising_params.min_energy_milli,
                 min_diversity_milli: scale.ising_params.min_diversity_milli,
                 min_solutions: scale.ising_params.min_solutions,
-                // Convert deadline_blocks → a soft ms deadline using a 6s
-                // block time estimate. Callers that need exact expiry should
-                // re-query chain head.
-                deadline_ms: u64::from(scale.timing.deadline_blocks).saturating_mul(6_000),
+                deadline_ms,
             });
         }
         Ok(orders)
@@ -1142,6 +1212,116 @@ impl ChainClient for RealChainClient {
         }
     }
 
+    async fn ensure_solver_registered(&self) -> Result<RegistrationOutcome, ChainError> {
+        let account = signer_account_bytes(&self.pair()?);
+        let want = SolverType::from(self.participate_kind);
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+        match self
+            .read_storage::<SolverInfoScale>(&solvers_storage_key(&account), at)
+            .await?
+        {
+            Some(info) if info.solver_type == want => {
+                return Ok(RegistrationOutcome::AlreadyRegistered)
+            }
+            Some(info) => {
+                // `register_solver` refuses an existing entry, so a type change
+                // (a GPU added to a CPU node, say) needs a deregister first.
+                tracing::info!(
+                    registered = ?info.solver_type,
+                    configured = ?want,
+                    "mempool solver type changed; deregistering before re-registering"
+                );
+                let (outcome, _) = self
+                    .submit_signed_call(
+                        &encode_deregister_solver_call(),
+                        Confirmation::SolverDeregistered { account },
+                    )
+                    .await?;
+                match outcome {
+                    SignedCallOutcome::Success { .. } => {}
+                    SignedCallOutcome::DispatchFailed { error, .. }
+                    | SignedCallOutcome::Invalid { message: error }
+                    | SignedCallOutcome::Dropped { message: error } => {
+                        return Err(ChainError::Submit(format!("deregister_solver: {error}")))
+                    }
+                }
+            }
+            None => {}
+        }
+        let (outcome, _) = self
+            .submit_signed_call(
+                &encode_register_solver_call(want),
+                Confirmation::SolverRegistered { account },
+            )
+            .await?;
+        match outcome {
+            SignedCallOutcome::Success { .. } => Ok(RegistrationOutcome::Registered),
+            SignedCallOutcome::DispatchFailed { error, .. }
+            | SignedCallOutcome::Invalid { message: error } => {
+                classify_registration(Some(&error)).ok_or(ChainError::Submit(error))
+            }
+            SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
+        }
+    }
+
+    async fn submit_solution(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError> {
+        let order_id = <[u8; 8]>::try_from(proof.order_id.as_slice())
+            .map(u64::from_le_bytes)
+            .map_err(|_| {
+                ChainError::Submit(format!(
+                    "mempool order id is {} bytes, expected 8",
+                    proof.order_id.len()
+                ))
+            })?;
+        // Wire spins are 0x01 / 0xFF, which read as +1 / -1 when taken as i8.
+        let rows: Vec<Vec<i8>> = proof
+            .solutions
+            .iter()
+            .map(|s| bytemuck::cast_slice::<u8, i8>(&s.spins_bytes).to_vec())
+            .collect();
+        let account = signer_account_bytes(&self.pair()?);
+        let call = encode_submit_solution_call(order_id, &rows);
+        let (outcome, extrinsic_hash) = self
+            .submit_signed_call(&call, Confirmation::SolutionAccepted { order_id, account })
+            .await?;
+        let action = match &outcome {
+            SignedCallOutcome::Success { block, number } => {
+                tracing::info!(order_id, block = %block, number, rows = rows.len(), "mempool solution accepted");
+                let block_hash = hex_decode(block)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+                return Ok(SubmitReceipt {
+                    action: SubmitAction::Success,
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash,
+                    block_number: Some(*number),
+                });
+            }
+            // The failure text explains state; it carries no pallet error name
+            // to classify, and a rejected solution is not worth resending.
+            SignedCallOutcome::DispatchFailed { error: reason, .. }
+            | SignedCallOutcome::Invalid { message: reason } => {
+                tracing::warn!(order_id, reason = %reason, "mempool solution rejected");
+                SubmitAction::StopFatal
+            }
+            SignedCallOutcome::Dropped { message } => {
+                tracing::warn!(order_id, reason = %message, "mempool solution dropped before inclusion");
+                SubmitAction::Retry
+            }
+        };
+        Ok(SubmitReceipt {
+            action,
+            extrinsic_hash: Some(extrinsic_hash),
+            block_hash: None,
+            block_number: None,
+        })
+    }
+
     async fn file_descriptor(
         &self,
         descriptor: &NodeDescriptorV2Input,
@@ -1179,6 +1359,30 @@ impl ChainClient for RealChainClient {
             SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
         }
     }
+}
+
+/// Block time assumed when turning a block count into wall-clock time.
+const BLOCK_TIME_ESTIMATE_MS: u64 = 6_000;
+
+/// Absolute deadline, in Unix milliseconds, for a mempool order seen at `head`.
+///
+/// Miners compare `deadline_ms` with their own clock, so it must be absolute.
+/// Mirrors the pallet's `effective_expiry`: the hard deadline, cut short by
+/// `block_wait` once a first solution lands. `None` once `head` has reached
+/// that expiry, when `submit_solution` would find the order closed.
+fn order_deadline_ms(
+    created_at: u32,
+    first_solution_at: Option<u32>,
+    timing: &OrderTiming,
+    head: u64,
+    now_ms: u64,
+) -> Option<u64> {
+    let hard = created_at.saturating_add(timing.deadline_blocks);
+    let expiry = first_solution_at.map_or(hard, |first| {
+        hard.min(first.saturating_add(timing.block_wait))
+    });
+    let remaining = u64::from(expiry).checked_sub(head).filter(|&b| b > 0)?;
+    Some(now_ms.saturating_add(remaining.saturating_mul(BLOCK_TIME_ESTIMATE_MS)))
 }
 
 fn extract_salt(proof: &Proof) -> Option<[u8; 32]> {
@@ -1240,6 +1444,32 @@ mod tests {
 
     /// Losing the qblock to another miner is the one included-but-failed case
     /// that must not be reported as a rejection: the proof itself was sound.
+    #[test]
+    fn an_order_deadline_is_absolute_and_honours_block_wait() {
+        let timing = super::OrderTiming {
+            deadline_blocks: 50,
+            block_wait: 5,
+        };
+        assert_eq!(
+            super::order_deadline_ms(100, None, &timing, 120, 1_000),
+            Some(1_000 + 30 * 6_000)
+        );
+        assert_eq!(
+            super::order_deadline_ms(100, Some(110), &timing, 112, 0),
+            Some(3 * 6_000)
+        );
+        assert_eq!(
+            super::order_deadline_ms(100, Some(110), &timing, 115, 0),
+            None,
+            "block_wait has elapsed since the first solution"
+        );
+        assert_eq!(
+            super::order_deadline_ms(100, None, &timing, 150, 0),
+            None,
+            "the hard deadline has been reached"
+        );
+    }
+
     #[test]
     fn only_a_rival_winner_counts_as_a_lost_race() {
         let ours = [1u8; 32];

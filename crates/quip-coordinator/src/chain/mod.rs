@@ -28,7 +28,8 @@ pub use orders::{job_orders_prefix, order_id_from_key};
 pub use outcome::{SubmitLedger, QBLOCK_RETENTION};
 pub use real::RealChainClient;
 pub use scale_types::{
-    MinerInfoScale, MinerKind, MinerSpecScale, NodeDescriptorV2Input, NodeLogLevel,
+    MinerInfoScale, MinerKind, MinerSpecScale, NodeDescriptorV2Input, NodeLogLevel, SolverType,
+    MAX_ORDER_SOLUTIONS,
 };
 pub use seed::{
     encode_register_topology, encode_set_difficulty, seed_chain, SeedParams, SeedReport,
@@ -114,6 +115,21 @@ pub trait ChainClient: Send + Sync {
     /// from it. Until this succeeds, every `submit_proof` fails with
     /// `MinerNotRegistered`.
     async fn ensure_miner_registered(&self) -> Result<RegistrationOutcome, ChainError>;
+
+    /// Register the signing account with `QuantumComputeMempool.register_solver`,
+    /// unless `Solvers` already holds it with the configured type.
+    ///
+    /// A registration under a different type is deregistered first, because
+    /// `register_solver` cannot overwrite one. Until this succeeds, every
+    /// `submit_solution` fails with `SolverNotRegistered`.
+    async fn ensure_solver_registered(&self) -> Result<RegistrationOutcome, ChainError>;
+
+    /// Hybrid-sign and submit `QuantumComputeMempool.submit_solution` for the
+    /// order named by `proof.order_id` (8 bytes, little-endian).
+    ///
+    /// `proof.solutions` must already respect the pallet bound
+    /// ([`MAX_ORDER_SOLUTIONS`] rows).
+    async fn submit_solution(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError>;
 
     /// Hybrid-sign and submit `MinerRegistry.set_descriptor`.
     async fn file_descriptor(

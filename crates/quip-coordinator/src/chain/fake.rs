@@ -49,6 +49,14 @@ pub struct FakeChain {
     balance_accounts: Mutex<Vec<[u8; 32]>>,
     /// Scripted `QuantumPow.Miners[account]` value (default `None`).
     miner_info: Mutex<Option<MinerInfo>>,
+    /// Captured proofs from [`ChainClient::submit_solution`].
+    pub solutions: Mutex<Vec<Proof>>,
+    /// Scripted `QuantumComputeMempool.Solvers` presence for the signing account.
+    solver_registered: Mutex<bool>,
+    /// Scripted `register_solver` result (default `Registered`).
+    solver_registration_result: Mutex<Result<RegistrationOutcome, ChainError>>,
+    /// Calls that reached the `register_solver` submit path.
+    solver_registration_submits: Mutex<usize>,
 }
 
 impl FakeChain {
@@ -82,6 +90,54 @@ impl FakeChain {
             registration_submits: Mutex::new(0),
             balance_accounts: Mutex::new(Vec::new()),
             miner_info: Mutex::new(None),
+            solutions: Mutex::new(Vec::new()),
+            solver_registered: Mutex::new(false),
+            solver_registration_result: Mutex::new(Ok(RegistrationOutcome::Registered)),
+            solver_registration_submits: Mutex::new(0),
+        }
+    }
+
+    /// Script the next `ensure_solver_registered` submit result.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_solver_registration_result(&self, result: Result<RegistrationOutcome, ChainError>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.solver_registration_result.lock().unwrap() = result;
+        }
+    }
+
+    /// How many `register_solver` extrinsics the fake chain was asked to submit.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn solver_registration_submits(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.solver_registration_submits.lock().unwrap()
+        }
+    }
+
+    /// Drain and return captured `submit_solution` proofs.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn take_solutions(&self) -> Vec<Proof> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            std::mem::take(&mut *self.solutions.lock().unwrap())
         }
     }
 
@@ -500,6 +556,39 @@ impl ChainClient for FakeChain {
                 Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
                 Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
             }
+        }
+    }
+
+    async fn ensure_solver_registered(&self) -> Result<RegistrationOutcome, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            if *self.solver_registered.lock().unwrap() {
+                return Ok(RegistrationOutcome::AlreadyRegistered);
+            }
+            *self.solver_registration_submits.lock().unwrap() += 1;
+            match &*self.solver_registration_result.lock().unwrap() {
+                Ok(o) => {
+                    *self.solver_registered.lock().unwrap() = true;
+                    Ok(*o)
+                }
+                Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
+                Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
+                Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
+            }
+        }
+    }
+
+    async fn submit_solution(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.solutions.lock().unwrap().push(proof.clone());
+            Ok(SubmitReceipt::action_only(SubmitAction::Success))
         }
     }
 

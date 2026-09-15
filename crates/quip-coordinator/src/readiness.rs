@@ -217,6 +217,40 @@ pub(crate) async fn register_round_miner<C: ChainClient>(
     false
 }
 
+/// Register the signing account as a `QuantumComputeMempool` solver.
+///
+/// Returns whether the account is known to be registered, and latches that
+/// answer in `solver_registered`. Unlike [`register_round_miner`], this makes
+/// one attempt and never holds off mining: `PoW` does not need it. The feeder
+/// stages mempool orders only once the latch is set, and calls this again on
+/// the next round until it is.
+pub(crate) async fn register_round_solver<C: ChainClient>(
+    chain: &C,
+    solver_registered: &AtomicBool,
+) -> bool {
+    if solver_registered.load(Ordering::Relaxed) {
+        return true;
+    }
+    match chain.ensure_solver_registered().await {
+        Ok(RegistrationOutcome::Registered) => {
+            tracing::info!("registered this account as a mempool solver on chain");
+        }
+        Ok(RegistrationOutcome::AlreadyRegistered) => {
+            tracing::debug!("this account is already a registered mempool solver");
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cannot register this account as a mempool solver; PoW mining continues, \
+                 mempool orders wait until this succeeds"
+            );
+            return false;
+        }
+    }
+    solver_registered.store(true, Ordering::Relaxed);
+    true
+}
+
 /// Default `node_id`: 64-char lowercase hex of the miner account, with no
 /// `0x` prefix. Fits `MaxNodeIdBytes`.
 #[must_use]

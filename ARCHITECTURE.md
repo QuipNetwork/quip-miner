@@ -47,8 +47,10 @@ each one.
 ### 1. One blockchain touchpoint
 
 Every chain interaction sits in `crates/quip-coordinator/src/chain/` behind the
-`ChainClient` trait (`chain/mod.rs:43`). The trait has three methods:
-`fetch_mining_snapshot`, `fetch_mempool_orders`, and `submit_proof`. Two types
+`ChainClient` trait (`chain/mod.rs:43`). Its core methods are
+`fetch_mining_snapshot` and `submit_proof` for proof-of-work, and
+`ensure_solver_registered`, `fetch_mempool_orders`, and `submit_solution` for
+mempool orders. Two types
 provide it: `RealChainClient` over subxt and JSON-RPC (`chain/real.rs:103`)
 and `FakeChain` for tests (`chain/fake.rs:44`). `subxt` appears in one source
 file, `chain/real.rs`. The module owns everything downstream of the seam:
@@ -124,17 +126,24 @@ A proof-of-work job flows through the system in one pass:
 2. On a new block hash, the feeder bumps the generation and cancels the prior
    one, so miners stop working on stale problems.
 3. `producer::derive_pow_job` builds the job from the snapshot. Mempool orders
-   take a parallel path through `job_order_to_job` and carry `generation = 0`,
-   since a chain reorg doesn't cancel a user-submitted order.
+   take a parallel path. The feeder registers the signing account in
+   `QuantumComputeMempool.Solvers` once per round until the call succeeds, and
+   proof-of-work mining does not wait for it. After registration, the feeder
+   reads the open orders once per block and stages each order one time through
+   `job_order_to_job`. An order job carries `generation = 0`, so a round
+   turnover does not cancel it.
 4. The feeder stages jobs on each miner's queue up to the adaptive depth. The
    router dispatches them and tracks a dispatch-to-completion credit.
 5. The miner samples and streams results back over the session.
 6. `validate.rs` scores the returned set. A solution is energy-valid when its
    milli-energy is strictly below the gate floor. The coordinator accepts the
    set when `n_valid >= min_solutions` and `diversity_milli >= min_diversity_milli`
-   (`validate.rs:143`).
-7. On an accepted set, `chain/submit.rs` encodes and submits the
-   `QuantumPow.submit_proof` extrinsic through `ChainClient`.
+   (`validate.rs:143`). A mempool result uses the gates of its own order, not
+   the round target.
+7. On an accepted proof-of-work set, the coordinator submits the
+   `QuantumPow.submit_proof` extrinsic through `ChainClient`. An accepted
+   mempool set goes to `QuantumComputeMempool.submit_solution` with its
+   `order_id`, and never touches the round best energy or the win-time stash.
 
 Jobs carry a `job_id`, a `generation`, an optional `deadline_ms`, the Ising
 problem (edge list or CSR, plus little-endian `h` and `j` fields), and a
