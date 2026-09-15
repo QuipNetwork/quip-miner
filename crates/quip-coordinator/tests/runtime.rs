@@ -1070,6 +1070,15 @@ async fn feeder_resumes_when_the_pending_proof_leaves_the_pool_without_a_qblock(
         "resume keeps the root"
     );
 
+    let mut resubmitted = clearing_pending_proof(&snapshot_with_head([1u8; 32]), [5u8; 32]);
+    resubmitted.extrinsic_hash = [9u8; 32];
+    chain.set_pending_proofs(vec![resubmitted]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "a resubmitted proof must not stop the resumed round"
+    );
+
     let _ = stop_tx.send(true);
     tokio::time::timeout(Duration::from_secs(2), feeder)
         .await

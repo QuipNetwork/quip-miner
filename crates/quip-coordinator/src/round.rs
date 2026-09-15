@@ -101,7 +101,7 @@ impl RoundState {
     #[must_use]
     pub(crate) const fn reason(self) -> &'static str {
         match self {
-            Self::StopMining => "stopping miners; a new qblock ended the round",
+            Self::StopMining => "stopping miners for a new round",
             Self::ValidatorSynced => "waiting until the validator is synced",
             Self::AccountFunded => "confirming the miner account can pay submit fees",
             Self::MinerRegistered => "registering the signing account as a miner on chain",

@@ -277,6 +277,8 @@ The states, in order:
    raises the generation and cancels the miners. It then enters this state. It
    stages nothing here. It leaves on a new root, or it resumes on the same
    root when no clearing proof is pending for two polls or two blocks pass.
+   A proof that held the miners and produced no qblock is ignored, by signer
+   and nonce, for the rest of the root. A failed pool read counts toward neither exit.
    The pool is one node's view, so this stop is best effort.
 
 Participation is not a walk step. The feeder submits

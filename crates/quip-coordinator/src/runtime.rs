@@ -12,7 +12,7 @@ use crate::config::{DescriptorParams, LaunchEntry};
 use crate::decay::{build_decay_schedule, EnergyCurve};
 use crate::funding::{ensure_funded, BalanceSource, Faucet};
 use crate::logging::LogLevel;
-use crate::pool_watch::{PoolObservation, ResumeReason};
+use crate::pool_watch::PoolObservation;
 use crate::producer::{derive_pow_job, job_order_to_job};
 use crate::readiness::{
     build_faucet, declare_round_participation, file_round_descriptor, register_round_miner,
@@ -586,8 +586,10 @@ async fn stage_mempool_orders<C: ChainClient>(
 /// mining, wait until the validator is synced, confirm the miner account can
 /// pay fees, download the next qblock's requirements, file a node descriptor
 /// on the first walk, declare participation, then start mining under the new
-/// seed. Runs until `stop` flips. `pub` so it can be exercised directly in
-/// tests without a gRPC server.
+/// seed. While mining, it also reads the transaction pool. When a pending proof
+/// clears the round, it stops the miners and waits for the block that includes it.
+/// Runs until `stop` flips. `pub` so it can be exercised directly in tests without
+/// a gRPC server.
 #[expect(
     clippy::too_many_lines,
     reason = "single feeder loop: reseed, top-up, win-time submit"
@@ -738,10 +740,8 @@ pub async fn feeder_loop<C>(
                 pool_watch
                     .resume_reason(observed, snap.block_number)
                     .map(|reason| {
-                        if reason == ResumeReason::BlocksElapsed {
-                            pool_watch.expire_clearing();
-                            clearing = None;
-                        }
+                        pool_watch.expire_clearing();
+                        clearing = None;
                         tracing::info!(
                             generation,
                             block = snap.block_number,

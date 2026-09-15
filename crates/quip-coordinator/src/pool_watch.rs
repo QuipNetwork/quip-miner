@@ -43,8 +43,10 @@ impl Verdict {
 /// Replay the pallet's `submit_proof` checks against `snap`.
 ///
 /// Registration of the signer is not checked. The pool already ran the signed
-/// extensions, and a proof from an unregistered account is rare enough that
-/// the feeder's resume path covers it.
+/// extensions. A clearing proof from an unregistered account is included, fails,
+/// and leaves the pool without a qblock. The feeder then resumes and ignores
+/// that proof, by signer and nonce, for the rest of the root, so a resubmission
+/// cannot stop the miners again.
 #[must_use]
 pub fn judge_pending_proof(pending: &PendingProof, snap: &MiningSnapshot) -> Verdict {
     if pending.proof.topology_hash.as_bytes() != snap.topology_hash.as_slice() {
@@ -131,6 +133,8 @@ pub const AWAIT_QBLOCK_MAX_BLOCKS: u64 = 2;
 pub struct Clearing {
     /// Signing account of the proof.
     pub account: [u8; 32],
+    /// The proof's `PoW` nonce. With the account it names the proof across resubmissions.
+    pub nonce: sp_core::U256,
     /// Its best energy, in milli-units.
     pub best_energy_milli: i64,
 }
@@ -171,8 +175,10 @@ pub struct PoolWatch {
     root: Option<[u8; 32]>,
     /// Extrinsic hash to the clearing verdict, if it clears.
     verdicts: HashMap<[u8; 32], Option<Clearing>>,
-    /// Proofs that stayed pending past the block ceiling. They cannot stop this root again.
-    ignored: HashSet<[u8; 32]>,
+    /// Proofs that stopped the miners and then left the pool without a qblock,
+    /// or stayed pending past the block ceiling, by signer and `PoW` nonce.
+    /// A resubmission under a new extrinsic hash is ignored too. Cleared with the root.
+    ignored: HashSet<([u8; 32], sp_core::U256)>,
     /// Block the miners were stopped at.
     stopped_at: Option<u64>,
     /// Consecutive polls since the stop with no clearing proof.
@@ -197,7 +203,7 @@ impl PoolWatch {
         }
         let mut best: Option<Clearing> = None;
         for p in pending {
-            if self.ignored.contains(&p.extrinsic_hash) {
+            if self.ignored.contains(&(p.account, p.proof.nonce)) {
                 continue;
             }
             let verdict = if let Some(verdict) = self.verdicts.get(&p.extrinsic_hash) {
@@ -206,6 +212,7 @@ impl PoolWatch {
                 let verdict = match judge_pending_proof(p, snap) {
                     Verdict::Clears { best_energy_milli } => Some(Clearing {
                         account: p.account,
+                        nonce: p.proof.nonce,
                         best_energy_milli,
                     }),
                     Verdict::OtherRound => None,
@@ -231,12 +238,12 @@ impl PoolWatch {
         best
     }
 
-    /// Called after a `BlocksElapsed` resume: the proofs that held the miners
-    /// never landed, so they cannot hold them again on this root.
+    /// Called on every same-root resume: the proofs that held the miners
+    /// produced no qblock, so they cannot hold them again on this root.
     pub fn expire_clearing(&mut self) {
-        self.verdicts.retain(|hash, verdict| {
-            if verdict.is_some() {
-                let _ = self.ignored.insert(*hash);
+        self.verdicts.retain(|_, verdict| {
+            if let Some(c) = verdict {
+                let _ = self.ignored.insert((c.account, c.nonce));
                 false
             } else {
                 true
@@ -299,17 +306,17 @@ mod tests {
     const ACCOUNT: [u8; 32] = [5u8; 32];
     const SALT: [u8; 32] = [3u8; 32];
 
-    fn nonce_for(snap: &MiningSnapshot) -> sp_core::U256 {
+    fn nonce_for(snap: &MiningSnapshot, salt: [u8; 32]) -> sp_core::U256 {
         let identity = account_identity_bytes(&ACCOUNT);
-        derive_nonce(&snap.last_proof_block_hash, &identity, &SALT)
+        derive_nonce(&snap.last_proof_block_hash, &identity, &salt)
     }
 
     /// Brute-force the ground state of the drawn model over all 16 spin
     /// assignments, so the test needs no golden value.
-    fn ground_state(snap: &MiningSnapshot) -> (i64, Vec<i8>) {
+    fn ground_state(snap: &MiningSnapshot, salt: [u8; 32]) -> (i64, Vec<i8>) {
         let index = TopologyIndex::new(&snap.nodes, &snap.edges).expect("index");
         let (h, j) = generate_ising_model_indexed(
-            nonce_for(snap),
+            nonce_for(snap, salt),
             &snap.nodes,
             &snap.edges,
             &AllowedValueSpec::Set(snap.allowed_h_milli.as_slice()),
@@ -331,7 +338,7 @@ mod tests {
         best.expect("one assignment")
     }
 
-    fn pending_with(snap: &MiningSnapshot, rows: &[Vec<i8>]) -> PendingProof {
+    fn pending_with(snap: &MiningSnapshot, rows: &[Vec<i8>], salt: [u8; 32]) -> PendingProof {
         let spec = AllowedValueSpec::Set(snap.allowed_spin_milli.as_slice());
         let solutions = rows
             .iter()
@@ -345,8 +352,8 @@ mod tests {
             account: ACCOUNT,
             proof: QuantumProof {
                 topology_hash: H256::from_slice(&snap.topology_hash),
-                nonce: nonce_for(snap),
-                salt: SALT,
+                nonce: nonce_for(snap, salt),
+                salt,
                 solutions,
                 device_access_time_us: 0,
             },
@@ -356,9 +363,9 @@ mod tests {
     #[test]
     fn a_ground_state_clears_when_the_ceiling_is_one_milli_above_it() {
         let mut snap = ring();
-        let (energy, spins) = ground_state(&snap);
+        let (energy, spins) = ground_state(&snap, SALT);
         snap.max_energy_milli = energy + 1;
-        let pending = pending_with(&snap, &[spins]);
+        let pending = pending_with(&snap, &[spins], SALT);
         assert_eq!(
             judge_pending_proof(&pending, &snap),
             Verdict::Clears {
@@ -371,18 +378,18 @@ mod tests {
     #[test]
     fn a_ground_state_at_the_ceiling_is_below_gates() {
         let mut snap = ring();
-        let (energy, spins) = ground_state(&snap);
+        let (energy, spins) = ground_state(&snap, SALT);
         snap.max_energy_milli = energy;
-        let pending = pending_with(&snap, &[spins]);
+        let pending = pending_with(&snap, &[spins], SALT);
         assert_eq!(judge_pending_proof(&pending, &snap), Verdict::BelowGates);
     }
 
     #[test]
     fn a_nonce_from_another_root_is_another_round() {
         let mut snap = ring();
-        let (energy, spins) = ground_state(&snap);
+        let (energy, spins) = ground_state(&snap, SALT);
         snap.max_energy_milli = energy + 1;
-        let pending = pending_with(&snap, &[spins]);
+        let pending = pending_with(&snap, &[spins], SALT);
         snap.last_proof_block_hash = [8u8; 32];
         assert_eq!(judge_pending_proof(&pending, &snap), Verdict::OtherRound);
     }
@@ -390,9 +397,9 @@ mod tests {
     #[test]
     fn another_topology_is_another_round() {
         let mut snap = ring();
-        let (energy, spins) = ground_state(&snap);
+        let (energy, spins) = ground_state(&snap, SALT);
         snap.max_energy_milli = energy + 1;
-        let pending = pending_with(&snap, &[spins]);
+        let pending = pending_with(&snap, &[spins], SALT);
         snap.topology_hash = vec![10u8; 32];
         assert_eq!(judge_pending_proof(&pending, &snap), Verdict::OtherRound);
     }
@@ -400,17 +407,17 @@ mod tests {
     #[test]
     fn too_few_valid_rows_is_below_gates() {
         let mut snap = ring();
-        let (energy, spins) = ground_state(&snap);
+        let (energy, spins) = ground_state(&snap, SALT);
         snap.max_energy_milli = energy + 1;
         snap.min_solutions = 2;
-        let pending = pending_with(&snap, &[spins]);
+        let pending = pending_with(&snap, &[spins], SALT);
         assert_eq!(judge_pending_proof(&pending, &snap), Verdict::BelowGates);
     }
 
     #[test]
     fn a_bad_packed_row_is_malformed() {
         let snap = ring();
-        let mut pending = pending_with(&snap, &[]);
+        let mut pending = pending_with(&snap, &[], SALT);
         pending.proof.solutions = vec![Vec::new()];
         assert!(matches!(
             judge_pending_proof(&pending, &snap),
@@ -431,9 +438,9 @@ mod tests {
     #[test]
     fn scan_reports_the_best_clearing_proof_and_caches_by_hash() {
         let mut snap = ring();
-        let (energy, spins) = ground_state(&snap);
+        let (energy, spins) = ground_state(&snap, SALT);
         snap.max_energy_milli = energy + 1;
-        let pending = pending_with(&snap, &[spins]);
+        let pending = pending_with(&snap, &[spins], SALT);
         let mut watch = PoolWatch::new();
         let first = watch
             .scan(std::slice::from_ref(&pending), &snap)
@@ -450,9 +457,9 @@ mod tests {
     #[test]
     fn scan_forgets_verdicts_when_the_root_changes() {
         let mut snap = ring();
-        let (energy, spins) = ground_state(&snap);
+        let (energy, spins) = ground_state(&snap, SALT);
         snap.max_energy_milli = energy + 1;
-        let pending = pending_with(&snap, &[spins]);
+        let pending = pending_with(&snap, &[spins], SALT);
         let mut watch = PoolWatch::new();
         assert!(watch.scan(std::slice::from_ref(&pending), &snap).is_some());
         snap.last_proof_block_hash = [8u8; 32];
@@ -462,9 +469,9 @@ mod tests {
     #[test]
     fn a_below_gates_proof_is_judged_again_when_the_ceiling_eases() {
         let mut snap = ring();
-        let (energy, spins) = ground_state(&snap);
+        let (energy, spins) = ground_state(&snap, SALT);
         snap.max_energy_milli = energy;
-        let pending = pending_with(&snap, &[spins]);
+        let pending = pending_with(&snap, &[spins], SALT);
         let mut watch = PoolWatch::new();
         assert!(watch.scan(std::slice::from_ref(&pending), &snap).is_none());
         snap.max_energy_milli = energy + 1;
@@ -474,9 +481,9 @@ mod tests {
     #[test]
     fn a_timed_out_proof_cannot_stop_the_same_root_again() {
         let mut snap = ring();
-        let (energy, spins) = ground_state(&snap);
+        let (energy, spins) = ground_state(&snap, SALT);
         snap.max_energy_milli = energy + 1;
-        let pending = pending_with(&snap, &[spins]);
+        let pending = pending_with(&snap, &[spins], SALT);
         let mut watch = PoolWatch::new();
         assert!(watch.scan(std::slice::from_ref(&pending), &snap).is_some());
         watch.stopped(100);
@@ -485,13 +492,66 @@ mod tests {
             Some(ResumeReason::BlocksElapsed)
         );
         watch.expire_clearing();
-        assert!(watch.scan(&[pending], &snap).is_none());
+        assert!(watch.scan(std::slice::from_ref(&pending), &snap).is_none());
+        let mut resubmitted = pending;
+        resubmitted.extrinsic_hash = [2u8; 32];
+        assert!(watch.scan(&[resubmitted], &snap).is_none());
 
         snap.last_proof_block_hash = [8u8; 32];
-        let (energy, spins) = ground_state(&snap);
+        let (energy, spins) = ground_state(&snap, SALT);
         snap.max_energy_milli = energy + 1;
-        let pending = pending_with(&snap, &[spins]);
+        let pending = pending_with(&snap, &[spins], SALT);
         assert!(watch.scan(&[pending], &snap).is_some());
+    }
+
+    #[test]
+    fn a_proof_that_left_the_pool_without_a_qblock_cannot_stop_the_same_root_again() {
+        let mut snap = ring();
+        let (energy, spins) = ground_state(&snap, SALT);
+        snap.max_energy_milli = energy + 1;
+        let mut pending = pending_with(&snap, &[spins], SALT);
+        let mut watch = PoolWatch::new();
+        assert!(watch.scan(std::slice::from_ref(&pending), &snap).is_some());
+        watch.stopped(100);
+        assert_eq!(watch.resume_reason(PoolObservation::Clear, 100), None);
+        assert_eq!(
+            watch.resume_reason(PoolObservation::Clear, 100),
+            Some(ResumeReason::PoolClear)
+        );
+        watch.expire_clearing();
+        pending.extrinsic_hash = [2u8; 32];
+        assert!(watch.scan(&[pending], &snap).is_none());
+
+        let salt = [4u8; 32];
+        let (energy, spins) = ground_state(&snap, salt);
+        snap.max_energy_milli = energy + 1;
+        let pending = pending_with(&snap, &[spins], salt);
+        assert!(watch.scan(&[pending], &snap).is_some());
+    }
+
+    #[test]
+    fn scan_picks_the_lowest_energy_among_clearing_proofs() {
+        let mut snap = ring();
+        let (first_energy, first_spins) = ground_state(&snap, SALT);
+        let salt = [4u8; 32];
+        let (second_energy, second_spins) = ground_state(&snap, salt);
+        assert_ne!(
+            first_energy, second_energy,
+            "fixtures need different energies"
+        );
+        snap.max_energy_milli = first_energy.max(second_energy) + 1;
+        let first = pending_with(&snap, &[first_spins], SALT);
+        let mut second = pending_with(&snap, &[second_spins], salt);
+        second.extrinsic_hash = [2u8; 32];
+        let mut watch = PoolWatch::new();
+        let mut pending = [first, second];
+        let best = watch.scan(&pending, &snap).expect("both proofs clear");
+        assert_eq!(best.best_energy_milli, first_energy.min(second_energy));
+        pending.reverse();
+        let best = watch
+            .scan(&pending, &snap)
+            .expect("both proofs still clear");
+        assert_eq!(best.best_energy_milli, first_energy.min(second_energy));
     }
 
     #[test]
