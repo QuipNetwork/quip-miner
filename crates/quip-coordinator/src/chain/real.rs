@@ -847,9 +847,21 @@ impl ChainClient for RealChainClient {
             .await?;
         let block_number = parse_block_number(&header)?;
 
+        // `LastProofBlock` at the head names the winning block one block
+        // before `LastProofBlockHash` catches up. ValueQuery: 0 when unset.
+        let last_proof_block: u32 = self
+            .read_storage(&last_proof_block_storage_key(), &hex_encode(&block_hash))
+            .await?
+            .unwrap_or(0);
+
         let snap = MiningSnapshot {
             head_hash: block_hash,
-            last_proof_block_hash: scale.last_proof_block_hash.0,
+            last_proof_block_hash: super::snapshot::round_root(
+                block_hash,
+                block_number,
+                u64::from(last_proof_block),
+                scale.last_proof_block_hash.0,
+            ),
             topology_hash: scale.topology_hash.0.to_vec(),
             nodes: scale.nodes,
             edges: scale.edges,

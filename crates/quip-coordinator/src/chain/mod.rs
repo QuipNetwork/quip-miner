@@ -35,7 +35,7 @@ pub use seed::{
     encode_register_topology, encode_set_difficulty, seed_chain, SeedParams, SeedReport,
     SeedTopology, DEFAULT_SEED_DIFFICULTY,
 };
-pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
+pub use snapshot::{head_state_key, round_root, DecayParams, MiningSnapshot};
 pub use submit::{
     classify_descriptor, classify_participation, classify_receipt, classify_registration,
     DescriptorOutcome, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,

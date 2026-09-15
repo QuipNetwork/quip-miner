@@ -9,7 +9,9 @@ pub struct MiningSnapshot {
     /// of the chain head, distinct from [`Self::last_proof_block_hash`], which
     /// changes only when a proof wins.
     pub head_hash: [u8; 32],
-    /// Hash of the block that contained the last winning proof.
+    /// Hash of the block that contained the last winning proof. At that block
+    /// itself this is the head hash, one block before the pallet stores it.
+    /// See [`round_root`].
     pub last_proof_block_hash: [u8; 32],
     /// Topology identity bytes (32-byte hash when provided by the chain).
     pub topology_hash: Vec<u8>,
@@ -67,6 +69,28 @@ impl DecayParams {
             c_knee_milli: crate::decay::DEFAULT_C_KNEE_MILLI,
             c_hard_milli: crate::decay::DEFAULT_C_HARD_MILLI,
         }
+    }
+}
+
+/// The block hash the next `PoW` nonce derives from.
+///
+/// The pallet writes `LastProofBlockHash` in `on_initialize` of the block
+/// after a win, because a block cannot store its own hash. At the winning
+/// block itself `LastProofBlock` already equals the head number, and the head
+/// hash is the value the pallet stores next block. Returning it here starts
+/// the next round one block early. A proof derived from it is valid from the
+/// next block on, which is the first block that can include it.
+#[must_use]
+pub fn round_root(
+    head_hash: [u8; 32],
+    block_number: u64,
+    last_proof_block: u64,
+    stored_hash: [u8; 32],
+) -> [u8; 32] {
+    if last_proof_block == block_number {
+        head_hash
+    } else {
+        stored_hash
     }
 }
 
@@ -195,5 +219,29 @@ mod tests {
         };
         let bytes = c.encode();
         assert_eq!(CurveCScale::decode(&mut &bytes[..]).unwrap(), c);
+    }
+
+    /// The pallet writes `LastProofBlockHash` one block after the win. At the
+    /// winning block, `LastProofBlock` already names the head, and the head
+    /// hash is the value the pallet will store next block.
+    #[test]
+    fn root_is_the_head_hash_at_the_winning_block() {
+        let head = [1u8; 32];
+        let stored = [2u8; 32];
+        assert_eq!(round_root(head, 100, 100, stored), head);
+    }
+
+    #[test]
+    fn root_is_the_stored_hash_after_the_winning_block() {
+        let head = [1u8; 32];
+        let stored = [2u8; 32];
+        assert_eq!(round_root(head, 101, 100, stored), stored);
+    }
+
+    #[test]
+    fn root_is_the_stored_hash_before_any_win() {
+        let head = [1u8; 32];
+        let stored = [2u8; 32];
+        assert_eq!(round_root(head, 5, 0, stored), stored);
     }
 }
