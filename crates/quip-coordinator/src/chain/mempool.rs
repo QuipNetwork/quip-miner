@@ -23,6 +23,7 @@ pub struct JobOrder {
     pub min_diversity_milli: Option<u32>,
     /// Optional minimum valid-solution count.
     pub min_solutions: Option<u32>,
-    /// Soft deadline in milliseconds from a block-time estimate.
+    /// Soft deadline as absolute Unix milliseconds, projected from the blocks
+    /// left before the order expires. Miners compare it with their own clock.
     pub deadline_ms: u64,
 }

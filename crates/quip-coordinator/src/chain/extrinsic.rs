@@ -215,6 +215,34 @@ pub fn job_orders_storage_key(order_id: u64) -> Vec<u8> {
     key
 }
 
+/// `QuantumComputeMempool::Solvers[account]` — the account's solver
+/// registration. `submit_solution` rejects any account without one.
+#[must_use]
+pub fn solvers_storage_key(account: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 32);
+    key.extend_from_slice(&twox128(b"QuantumComputeMempool"));
+    key.extend_from_slice(&twox128(b"Solvers"));
+    key.extend_from_slice(&blake2_128(account));
+    key.extend_from_slice(account);
+    key
+}
+
+/// `QuantumComputeMempool::OrderSolutions[order_id][account]` — the account's
+/// latest accepted submission for one order. Both hashers are
+/// `Blake2_128Concat`.
+#[must_use]
+pub fn order_solutions_storage_key(order_id: u64, account: &[u8; 32]) -> Vec<u8> {
+    let encoded_id = order_id.encode();
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 8 + 16 + 32);
+    key.extend_from_slice(&twox128(b"QuantumComputeMempool"));
+    key.extend_from_slice(&twox128(b"OrderSolutions"));
+    key.extend_from_slice(&blake2_128(&encoded_id));
+    key.extend_from_slice(&encoded_id);
+    key.extend_from_slice(&blake2_128(account));
+    key.extend_from_slice(account);
+    key
+}
+
 /// `QuantumPow` `Blake2_128Concat` storage-map key for any 32-byte map key.
 /// Both `H256` and `AccountId32` encode as their raw 32 bytes, with no length
 /// prefix.

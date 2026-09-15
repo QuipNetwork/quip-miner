@@ -7,12 +7,12 @@
 //! this alone serves sessions and supervises miners but stages no work yet.
 
 use crate::chain::sync::{wait_until_synced, SyncOutcome, SyncSource};
-use crate::chain::{ChainClient, MiningSnapshot};
+use crate::chain::{ChainClient, JobOrder, MiningSnapshot};
 use crate::config::{DescriptorParams, LaunchEntry};
 use crate::decay::{build_decay_schedule, EnergyCurve};
 use crate::funding::{ensure_funded, BalanceSource, Faucet};
 use crate::logging::LogLevel;
-use crate::producer::derive_pow_job;
+use crate::producer::{derive_pow_job, job_order_to_job};
 use crate::readiness::{
     build_faucet, declare_round_participation, file_round_descriptor, register_round_miner,
     ReadinessError,
@@ -21,12 +21,13 @@ use crate::round::{RoundEvent, RoundState};
 use crate::session::{coord, CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
 use crate::topology::Topology;
+use crate::validate::QualityGates;
 use quip_proto::v1::miner_service_server::MinerServiceServer;
 use quip_proto::v1::{coord_msg, SetTarget};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
@@ -72,6 +73,9 @@ pub struct RuntimeParams {
     pub descriptor_filed: Arc<AtomicBool>,
     /// Set once `QuantumPow.Miners` is known to hold the signing account.
     pub miner_registered: Arc<AtomicBool>,
+    /// Set once `QuantumComputeMempool.Solvers` holds the signing account with
+    /// the configured type. Mempool orders are staged only after this.
+    pub solver_registered: Arc<AtomicBool>,
     /// Chain identity advertised on `/api/v1/status`. Empty when the process
     /// holds no usable signer key.
     pub identity: crate::metrics::Identity,
@@ -97,6 +101,9 @@ pub struct FeederParams {
     pub descriptor_filed: Arc<AtomicBool>,
     /// Set once `QuantumPow.Miners` is known to hold the signing account.
     pub miner_registered: Arc<AtomicBool>,
+    /// Set once `QuantumComputeMempool.Solvers` holds the signing account with
+    /// the configured type. Mempool orders are staged only after this.
+    pub solver_registered: Arc<AtomicBool>,
     /// Consecutive failed submissions of one proof, inside one quantum block,
     /// before the coordinator stops retrying it.
     pub max_submit_attempts: u32,
@@ -489,6 +496,73 @@ where
     }
 }
 
+/// Validation gates for results on `order`.
+///
+/// The pallet keeps a row when `energy <= min_energy_milli`, but
+/// [`crate::validate::validate_result`] admits only `energy < min_energy_milli`,
+/// so the ceiling moves up one milli. An order without `min_solutions` keeps
+/// every submitted row; asking for two keeps a diversity gate reachable, since
+/// a single row scores zero diversity.
+fn order_gates(order: &JobOrder) -> QualityGates {
+    let min_diversity_milli = order.min_diversity_milli.unwrap_or(0);
+    QualityGates {
+        min_energy_milli: order
+            .min_energy_milli
+            .map_or(i64::MAX, |e| e.saturating_add(1)),
+        min_diversity_milli,
+        min_solutions: order
+            .min_solutions
+            .unwrap_or(if min_diversity_milli > 0 { 2 } else { 1 }),
+    }
+}
+
+/// Stage each open mempool order this process has not staged before.
+///
+/// Every order goes to one capable miner as a generation-0 job, which a round
+/// turnover never cancels. Its gates are remembered by order id for the session
+/// that validates the result.
+///
+/// Returns whether the orders were read. With no miner connected, nothing is
+/// read: routing would drop every order for good.
+async fn stage_mempool_orders<C: ChainClient>(
+    chain: &C,
+    state: &Arc<Mutex<CoordinatorState>>,
+    miner_account: [u8; 32],
+) -> bool {
+    if state.lock().await.router.miner_ids().is_empty() {
+        return false;
+    }
+    let orders = match chain.fetch_mempool_orders(miner_account).await {
+        Ok(orders) => orders,
+        Err(e) => {
+            tracing::debug!(error = %e, "feeder: mempool order read failed");
+            return false;
+        }
+    };
+    let mut st = state.lock().await;
+    for order in orders {
+        if st.mempool_orders.contains_key(&order.order_id) {
+            continue;
+        }
+        let _ = st
+            .mempool_orders
+            .insert(order.order_id.clone(), order_gates(&order));
+        let id = crate::chain::extrinsic::hex_encode(&order.order_id);
+        if let Some(miner) = st.router.route(job_order_to_job(&order)) {
+            tracing::info!(order = %id, miner = %miner, nodes = order.nodes.len(), "feeder: staged mempool order");
+            st.wake_dispatcher(&miner);
+        } else {
+            tracing::warn!(
+                order = %id,
+                nodes = order.nodes.len(),
+                edges = order.edges.len(),
+                "feeder: no connected miner can take this mempool order; skipping it"
+            );
+        }
+    }
+    true
+}
+
 /// The replenished `PoW` feeder: follow the chain head, and keep each registered
 /// miner's staged queue topped up to `buffer_depth` with fresh-salt jobs.
 ///
@@ -539,6 +613,10 @@ pub async fn feeder_loop<C>(
     let mut declared_generation: Option<u64> = None;
     // Consecutive failed submits of one proof in one quantum block.
     let mut submit_ledger = crate::chain::SubmitLedger::new(params.max_submit_attempts);
+    // Round of the last solver-registration attempt, and the block the open
+    // mempool orders were last read at.
+    let mut solver_attempted: Option<u64> = None;
+    let mut orders_read_at: u64 = 0;
 
     loop {
         let (snap, state_now) = match chain
@@ -869,6 +947,24 @@ pub async fn feeder_loop<C>(
             let validated = st.results_validated;
             drop(st);
 
+            // Mempool work rides alongside `PoW`. Solver registration is tried
+            // once per round and never holds mining off. Orders are read once
+            // per block after it succeeds: `submit_solution` refuses anyone else.
+            if solver_attempted != Some(generation) {
+                solver_attempted = Some(generation);
+                let _ = crate::readiness::register_round_solver(
+                    chain.as_ref(),
+                    params.solver_registered.as_ref(),
+                )
+                .await;
+            }
+            if params.solver_registered.load(Ordering::Relaxed)
+                && snap.block_number > orders_read_at
+                && stage_mempool_orders(chain.as_ref(), &state, params.miner_account).await
+            {
+                orders_read_at = snap.block_number;
+            }
+
             // Steady-state narration. Every poll at debug for diagnosis; once a
             // minute at info so an operator watching the log sees the
             // coordinator is alive and how fast each miner is draining work.
@@ -1138,6 +1234,7 @@ where
             descriptor: params.descriptor,
             descriptor_filed: params.descriptor_filed,
             miner_registered: params.miner_registered,
+            solver_registered: params.solver_registered,
             max_submit_attempts: params.max_submit_attempts,
             metrics: Arc::clone(&metrics),
         },
@@ -1172,7 +1269,42 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{adaptive_depth, stage_ceiling, MAX_STAGE_BYTES_PER_MINER, WINDOW_HEADROOM};
+    use super::{
+        adaptive_depth, order_gates, stage_ceiling, MAX_STAGE_BYTES_PER_MINER, WINDOW_HEADROOM,
+    };
+    use crate::chain::JobOrder;
+
+    fn order(min_energy: Option<i64>, min_diversity: Option<u32>) -> JobOrder {
+        JobOrder {
+            order_id: 5u64.to_le_bytes().to_vec(),
+            nodes: vec![0, 1],
+            edges: vec![(0, 1)],
+            h_milli: vec![0, 0],
+            j_milli: vec![1000],
+            min_energy_milli: min_energy,
+            min_diversity_milli: min_diversity,
+            min_solutions: None,
+            deadline_ms: 0,
+        }
+    }
+
+    /// The pallet keeps `energy == min_energy`; the local gate is strict.
+    #[test]
+    fn order_gates_admit_the_pallets_inclusive_energy_bound() {
+        let gates = order_gates(&order(Some(-1000), None));
+        assert_eq!(gates.min_energy_milli, -999);
+        assert_eq!(gates.min_solutions, 1);
+        assert_eq!(order_gates(&order(None, None)).min_energy_milli, i64::MAX);
+    }
+
+    /// One row scores zero diversity, so an order with a diversity gate and
+    /// no `min_solutions` needs at least two rows to pass.
+    #[test]
+    fn order_gates_ask_for_two_rows_when_diversity_is_gated() {
+        let gates = order_gates(&order(None, Some(300)));
+        assert_eq!(gates.min_diversity_milli, 300);
+        assert_eq!(gates.min_solutions, 2);
+    }
 
     #[test]
     fn adaptive_depth_holds_floor_when_idle() {

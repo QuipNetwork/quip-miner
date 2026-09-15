@@ -1,6 +1,8 @@
 //! tonic `MinerService` server: token verify, handshake, job dispatch, results.
 
-use crate::chain::{ChainClient, ChainError, Proof, SubmitAction, SubmitReceipt};
+use crate::chain::{
+    ChainClient, ChainError, Proof, SubmitAction, SubmitReceipt, MAX_ORDER_SOLUTIONS,
+};
 use crate::config::LaunchEntry;
 use crate::router::{MinerCaps, Router};
 use crate::topology::Topology;
@@ -210,6 +212,10 @@ pub struct CoordinatorState {
     /// `miner_id` to its backend label (`CPU`, `GPU-CUDA`). Seeded from the
     /// launch plan so the session can stamp every attempt.
     pub miner_types: HashMap<String, String>,
+    /// Mempool order id to the gates its result must clear. The feeder stages
+    /// an order only while its id is absent, so each order is answered once;
+    /// a transient submit failure removes the id to stage it again.
+    pub mempool_orders: HashMap<Vec<u8>, crate::validate::QualityGates>,
 }
 
 impl CoordinatorState {
@@ -241,6 +247,7 @@ impl CoordinatorState {
             metrics: Arc::new(crate::metrics::CoordinatorMetrics::new(&[])),
             last_proof_block_hash: String::new(),
             miner_types: HashMap::new(),
+            mempool_orders: HashMap::new(),
         }
     }
 
@@ -599,6 +606,23 @@ async fn run_session<C: ChainClient>(
                     let gates = crate::validate::gates_from_target(st.target.as_ref());
                     (job, salt, topo, best, gates, st.generation)
                 };
+                let job = match job {
+                    // A mempool order is judged by its own gates and answered
+                    // with `submit_solution`. None of the `PoW` handling below
+                    // applies to it.
+                    Some(job) if job.provenance.as_ref().is_some_and(|p| !p.is_pow) => {
+                        submit_mempool_result(
+                            chain.as_ref(),
+                            &state,
+                            &job,
+                            &result.solutions,
+                            result.meta.as_ref().map_or(0, |m| m.device_access_time_us),
+                        )
+                        .await;
+                        None
+                    }
+                    other => other,
+                };
                 if let Some(job) = job {
                     if job.generation < generation {
                         st_metrics_stale(&state, &miner_id).await;
@@ -901,6 +925,80 @@ pub async fn send_cancel(
         max_generation,
     }))))
     .await
+}
+
+/// Validate a mempool result against its order's gates and answer the order
+/// with `submit_solution`.
+///
+/// Mempool results stay out of the `PoW` round: they never move the best
+/// energy, enter the win-time stash, or count as stale. A result that misses
+/// the gates, or a solution the chain refuses, leaves the order answered. Only
+/// a delivery failure forgets it, so the feeder stages it again while it is
+/// still open.
+async fn submit_mempool_result<C: ChainClient>(
+    chain: &C,
+    state: &Arc<Mutex<CoordinatorState>>,
+    job: &quip_proto::v1::Job,
+    solutions: &[quip_proto::v1::Solution],
+    device_access_time_us: u64,
+) {
+    let order = crate::chain::extrinsic::hex_encode(&job.job_id);
+    let gates = state.lock().await.mempool_orders.get(&job.job_id).copied();
+    let (Some(ising), Some(gates)) = (job.ising.as_ref(), gates) else {
+        tracing::warn!(order = %order, "mempool result has no problem or no staged order; dropping");
+        return;
+    };
+    let validated = validate_result(ising, solutions, &gates, &ResolvedTopo::default());
+    if !validated.accepted {
+        tracing::info!(
+            order = %order,
+            n_valid = validated.n_valid,
+            diversity_milli = validated.diversity_milli,
+            min_solutions = gates.min_solutions,
+            min_diversity_milli = gates.min_diversity_milli,
+            "mempool result misses the order's gates; not submitting"
+        );
+        return;
+    }
+    let proof = Proof {
+        job_id: job.job_id.clone(),
+        best_energy_milli: validated.best_energy_milli,
+        diversity_milli: validated.diversity_milli,
+        n_valid: validated.n_valid,
+        solutions: validated
+            .selected_solutions
+            .into_iter()
+            .take(MAX_ORDER_SOLUTIONS)
+            .collect(),
+        is_pow: false,
+        order_id: job
+            .provenance
+            .as_ref()
+            .map(|p| p.order_id.clone())
+            .unwrap_or_default(),
+        generation: 0,
+        salt: Vec::new(),
+        device_access_time_us,
+    };
+    match chain.submit_solution(&proof).await.map(|r| r.action) {
+        Ok(SubmitAction::Success) => tracing::info!(
+            order = %order,
+            best_energy_milli = proof.best_energy_milli,
+            rows = proof.solutions.len(),
+            "mempool solution submitted"
+        ),
+        Ok(SubmitAction::StopRoundStale | SubmitAction::StopFatal) => {
+            tracing::warn!(order = %order, "mempool solution refused; not retrying this order");
+        }
+        Ok(SubmitAction::Retry) => {
+            tracing::warn!(order = %order, "mempool solution not delivered; staging the order again");
+            let _ = state.lock().await.mempool_orders.remove(&job.job_id);
+        }
+        Err(e) => {
+            tracing::warn!(order = %order, error = %e, "mempool solution not delivered; staging the order again");
+            let _ = state.lock().await.mempool_orders.remove(&job.job_id);
+        }
+    }
 }
 
 /// Result of a one-shot handshake harness run.

@@ -150,16 +150,18 @@ pub fn classify_participation(error: Option<&str>) -> Option<ParticipationOutcom
     None
 }
 
-/// Outcome of a `QuantumPow.register_miner` submission.
+/// Outcome of a `QuantumPow.register_miner` or
+/// `QuantumComputeMempool.register_solver` submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationOutcome {
-    /// The registration landed and the deposit is reserved.
+    /// The registration landed (for a miner, the deposit is reserved).
     Registered,
-    /// This account was already in `QuantumPow.Miners`. Treat as success.
+    /// This account was already registered. Treat as success.
     AlreadyRegistered,
 }
 
-/// Classify a `register_miner` pallet error. `None` is a successful dispatch.
+/// Classify a `register_miner` or `register_solver` pallet error. `None` is a
+/// successful dispatch.
 ///
 /// Only the already-registered race is benign. Everything else — a deposit the
 /// account cannot cover above all — stays `None` so the caller reports it and
@@ -169,7 +171,7 @@ pub fn classify_registration(error: Option<&str>) -> Option<RegistrationOutcome>
     let Some(e) = error else {
         return Some(RegistrationOutcome::Registered);
     };
-    if e.contains("MinerAlreadyRegistered") {
+    if e.contains("MinerAlreadyRegistered") || e.contains("SolverAlreadyRegistered") {
         return Some(RegistrationOutcome::AlreadyRegistered);
     }
     None

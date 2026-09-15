@@ -158,6 +158,13 @@ All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
 - `ensure_miner_registered` — read `QuantumPow.Miners` for the signing
   account and, when the account is absent, submit
   `QuantumPow.register_miner`.
+- `ensure_solver_registered` — read `QuantumComputeMempool.Solvers` for the
+  signing account. When the account is absent, submit `register_solver`. When
+  the stored type differs from the configured type, submit `deregister_solver`
+  first.
+- `submit_solution` — hybrid-sign and submit
+  `QuantumComputeMempool.submit_solution` for one order, then confirm that
+  `OrderSolutions` holds a submission from the inclusion block.
 
 One key produces two different 32-byte values, and they are not
 interchangeable. The **account** is `blake2b_256(domain ++ public_key)`: it
