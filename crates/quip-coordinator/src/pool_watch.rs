@@ -6,7 +6,7 @@
 //! mining. Difficulty eases every block until a win, so a proof that clears
 //! now also clears at its inclusion block.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::chain::extrinsic::account_identity_bytes;
 use crate::chain::scale_types::QuantumProof;
@@ -135,6 +135,17 @@ pub struct Clearing {
     pub best_energy_milli: i64,
 }
 
+/// What the latest pool read observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolObservation {
+    /// A clearing proof was seen.
+    Clearing,
+    /// The pool was read and holds no clearing proof.
+    Clear,
+    /// The pool could not be read.
+    Unknown,
+}
+
 /// Why the feeder leaves `AwaitingQBlock` without a new root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResumeReason {
@@ -160,6 +171,8 @@ pub struct PoolWatch {
     root: Option<[u8; 32]>,
     /// Extrinsic hash to the clearing verdict, if it clears.
     verdicts: HashMap<[u8; 32], Option<Clearing>>,
+    /// Proofs that stayed pending past the block ceiling. They cannot stop this root again.
+    ignored: HashSet<[u8; 32]>,
     /// Block the miners were stopped at.
     stopped_at: Option<u64>,
     /// Consecutive polls since the stop with no clearing proof.
@@ -175,32 +188,40 @@ impl PoolWatch {
 
     /// Judge every pending proof against `snap`. Returns the clearing proof
     /// with the lowest energy, if any clears. Verdicts are cached by
-    /// extrinsic hash for the life of the root.
+    /// extrinsic hash for the life of the root, except `BelowGates`.
     pub fn scan(&mut self, pending: &[PendingProof], snap: &MiningSnapshot) -> Option<Clearing> {
         if self.root != Some(snap.last_proof_block_hash) {
             self.root = Some(snap.last_proof_block_hash);
             self.verdicts.clear();
+            self.ignored.clear();
         }
         let mut best: Option<Clearing> = None;
         for p in pending {
-            let verdict =
-                *self.verdicts.entry(p.extrinsic_hash).or_insert_with(
-                    || match judge_pending_proof(p, snap) {
-                        Verdict::Clears { best_energy_milli } => Some(Clearing {
-                            account: p.account,
-                            best_energy_milli,
-                        }),
-                        Verdict::OtherRound | Verdict::BelowGates => None,
-                        Verdict::Malformed(reason) => {
-                            tracing::debug!(
-                                extrinsic = %crate::chain::extrinsic::hex_encode(&p.extrinsic_hash),
-                                reason,
-                                "pool: pending proof is malformed"
-                            );
-                            None
-                        }
-                    },
-                );
+            if self.ignored.contains(&p.extrinsic_hash) {
+                continue;
+            }
+            let verdict = if let Some(verdict) = self.verdicts.get(&p.extrinsic_hash) {
+                *verdict
+            } else {
+                let verdict = match judge_pending_proof(p, snap) {
+                    Verdict::Clears { best_energy_milli } => Some(Clearing {
+                        account: p.account,
+                        best_energy_milli,
+                    }),
+                    Verdict::OtherRound => None,
+                    Verdict::BelowGates => continue,
+                    Verdict::Malformed(reason) => {
+                        tracing::debug!(
+                            extrinsic = %crate::chain::extrinsic::hex_encode(&p.extrinsic_hash),
+                            reason,
+                            "pool: pending proof is malformed"
+                        );
+                        None
+                    }
+                };
+                let _ = self.verdicts.insert(p.extrinsic_hash, verdict);
+                verdict
+            };
             if let Some(c) = verdict {
                 if best.is_none_or(|b| c.best_energy_milli < b.best_energy_milli) {
                     best = Some(c);
@@ -210,6 +231,19 @@ impl PoolWatch {
         best
     }
 
+    /// Called after a `BlocksElapsed` resume: the proofs that held the miners
+    /// never landed, so they cannot hold them again on this root.
+    pub fn expire_clearing(&mut self) {
+        self.verdicts.retain(|hash, verdict| {
+            if verdict.is_some() {
+                let _ = self.ignored.insert(*hash);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// The miners were stopped at `block`.
     pub fn stopped(&mut self, block: u64) {
         self.stopped_at = Some(block);
@@ -217,13 +251,13 @@ impl PoolWatch {
     }
 
     /// After one poll in `AwaitingQBlock`: whether to resume the round on the
-    /// same root, and why. `clearing` is whether this poll saw a clearing
-    /// proof. `block` is the poll's head number.
-    pub fn resume_reason(&mut self, clearing: bool, block: u64) -> Option<ResumeReason> {
-        if clearing {
-            self.clear_polls = 0;
-        } else {
-            self.clear_polls = self.clear_polls.saturating_add(1);
+    /// same root, and why. `observed` records the pool read outcome.
+    /// `block` is the poll's head number.
+    pub fn resume_reason(&mut self, observed: PoolObservation, block: u64) -> Option<ResumeReason> {
+        match observed {
+            PoolObservation::Clearing => self.clear_polls = 0,
+            PoolObservation::Clear => self.clear_polls = self.clear_polls.saturating_add(1),
+            PoolObservation::Unknown => {}
         }
         if self.clear_polls >= AWAIT_CLEAR_POLLS {
             return Some(ResumeReason::PoolClear);
@@ -426,13 +460,80 @@ mod tests {
     }
 
     #[test]
+    fn a_below_gates_proof_is_judged_again_when_the_ceiling_eases() {
+        let mut snap = ring();
+        let (energy, spins) = ground_state(&snap);
+        snap.max_energy_milli = energy;
+        let pending = pending_with(&snap, &[spins]);
+        let mut watch = PoolWatch::new();
+        assert!(watch.scan(std::slice::from_ref(&pending), &snap).is_none());
+        snap.max_energy_milli = energy + 1;
+        assert!(watch.scan(&[pending], &snap).is_some());
+    }
+
+    #[test]
+    fn a_timed_out_proof_cannot_stop_the_same_root_again() {
+        let mut snap = ring();
+        let (energy, spins) = ground_state(&snap);
+        snap.max_energy_milli = energy + 1;
+        let pending = pending_with(&snap, &[spins]);
+        let mut watch = PoolWatch::new();
+        assert!(watch.scan(std::slice::from_ref(&pending), &snap).is_some());
+        watch.stopped(100);
+        assert_eq!(
+            watch.resume_reason(PoolObservation::Clearing, 102),
+            Some(ResumeReason::BlocksElapsed)
+        );
+        watch.expire_clearing();
+        assert!(watch.scan(&[pending], &snap).is_none());
+
+        snap.last_proof_block_hash = [8u8; 32];
+        let (energy, spins) = ground_state(&snap);
+        snap.max_energy_milli = energy + 1;
+        let pending = pending_with(&snap, &[spins]);
+        assert!(watch.scan(&[pending], &snap).is_some());
+    }
+
+    #[test]
+    fn an_unreadable_pool_does_not_count_as_clear() {
+        let mut watch = PoolWatch::new();
+        watch.stopped(100);
+        assert_eq!(watch.resume_reason(PoolObservation::Unknown, 100), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Unknown, 100), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Clear, 100), None);
+        assert_eq!(
+            watch.resume_reason(PoolObservation::Clear, 100),
+            Some(ResumeReason::PoolClear)
+        );
+
+        // An unreadable poll preserves a clear observation and the block ceiling.
+        watch.stopped(100);
+        assert_eq!(watch.resume_reason(PoolObservation::Clear, 100), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Unknown, 101), None);
+        assert_eq!(
+            watch.resume_reason(PoolObservation::Clear, 101),
+            Some(ResumeReason::PoolClear)
+        );
+        watch.stopped(100);
+        assert_eq!(
+            watch.resume_reason(PoolObservation::Unknown, 102),
+            Some(ResumeReason::BlocksElapsed)
+        );
+        watch.stopped(100);
+        assert_eq!(
+            watch.resume_reason(PoolObservation::Clear, 102),
+            Some(ResumeReason::BlocksElapsed)
+        );
+    }
+
+    #[test]
     fn resume_after_two_clear_polls() {
         let mut watch = PoolWatch::new();
         watch.stopped(100);
-        assert_eq!(watch.resume_reason(true, 100), None);
-        assert_eq!(watch.resume_reason(false, 100), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Clearing, 100), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Clear, 100), None);
         assert_eq!(
-            watch.resume_reason(false, 100),
+            watch.resume_reason(PoolObservation::Clear, 100),
             Some(ResumeReason::PoolClear)
         );
     }
@@ -441,11 +542,11 @@ mod tests {
     fn a_clearing_poll_resets_the_clear_count() {
         let mut watch = PoolWatch::new();
         watch.stopped(100);
-        assert_eq!(watch.resume_reason(false, 100), None);
-        assert_eq!(watch.resume_reason(true, 100), None);
-        assert_eq!(watch.resume_reason(false, 100), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Clear, 100), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Clearing, 100), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Clear, 100), None);
         assert_eq!(
-            watch.resume_reason(false, 100),
+            watch.resume_reason(PoolObservation::Clear, 100),
             Some(ResumeReason::PoolClear)
         );
     }
@@ -454,9 +555,9 @@ mod tests {
     fn resume_after_two_blocks_even_while_the_proof_is_pending() {
         let mut watch = PoolWatch::new();
         watch.stopped(100);
-        assert_eq!(watch.resume_reason(true, 101), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Clearing, 101), None);
         assert_eq!(
-            watch.resume_reason(true, 102),
+            watch.resume_reason(PoolObservation::Clearing, 102),
             Some(ResumeReason::BlocksElapsed)
         );
     }
@@ -465,12 +566,12 @@ mod tests {
     fn stopped_resets_the_wait() {
         let mut watch = PoolWatch::new();
         watch.stopped(100);
-        assert_eq!(watch.resume_reason(false, 100), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Clear, 100), None);
         watch.stopped(105);
-        assert_eq!(watch.resume_reason(false, 105), None);
-        assert_eq!(watch.resume_reason(true, 106), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Clear, 105), None);
+        assert_eq!(watch.resume_reason(PoolObservation::Clearing, 106), None);
         assert_eq!(
-            watch.resume_reason(true, 107),
+            watch.resume_reason(PoolObservation::Clearing, 107),
             Some(ResumeReason::BlocksElapsed)
         );
     }

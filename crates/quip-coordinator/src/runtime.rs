@@ -12,6 +12,7 @@ use crate::config::{DescriptorParams, LaunchEntry};
 use crate::decay::{build_decay_schedule, EnergyCurve};
 use crate::funding::{ensure_funded, BalanceSource, Faucet};
 use crate::logging::LogLevel;
+use crate::pool_watch::{PoolObservation, ResumeReason};
 use crate::producer::{derive_pow_job, job_order_to_job};
 use crate::readiness::{
     build_faucet, declare_round_participation, file_round_descriptor, register_round_miner,
@@ -708,27 +709,39 @@ pub async fn feeder_loop<C>(
             // Pool scan. A proof that clears the round means the next block
             // mints a qblock. Scanned only on an unchanged root, in the two
             // states that care: mining (to stop) and awaiting (to resume).
-            let clearing = if current_head == Some(head)
+            let (mut clearing, observed) = if current_head == Some(head)
                 && matches!(
                     round,
                     Some(RoundState::StartMining | RoundState::AwaitingQBlock)
                 ) {
                 match chain.fetch_pending_proofs().await {
-                    Ok(pending) => pool_watch.scan(&pending, &snap),
+                    Ok(pending) => {
+                        let clearing = pool_watch.scan(&pending, &snap);
+                        let observed = if clearing.is_some() {
+                            PoolObservation::Clearing
+                        } else {
+                            PoolObservation::Clear
+                        };
+                        (clearing, observed)
+                    }
                     Err(e) => {
                         tracing::debug!(error = %e, "feeder: pool read failed");
-                        None
+                        (None, PoolObservation::Unknown)
                     }
                 }
             } else {
-                None
+                (None, PoolObservation::Unknown)
             };
             let event = if current_head != Some(head) {
                 Some(RoundEvent::NewHead)
             } else if round == Some(RoundState::AwaitingQBlock) {
                 pool_watch
-                    .resume_reason(clearing.is_some(), snap.block_number)
+                    .resume_reason(observed, snap.block_number)
                     .map(|reason| {
+                        if reason == ResumeReason::BlocksElapsed {
+                            pool_watch.expire_clearing();
+                            clearing = None;
+                        }
                         tracing::info!(
                             generation,
                             block = snap.block_number,
