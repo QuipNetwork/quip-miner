@@ -474,6 +474,11 @@ where
             RoundState::StartMining => {
                 return snap.map(|s| (s, cancelled_jobs, miners_told));
             }
+            RoundState::AwaitingQBlock => {
+                // The feeder holds this state itself and never starts a walk
+                // here. If one does start here, restart the round.
+                RoundEvent::Resume
+            }
         };
 
         if event == RoundEvent::Failed {
