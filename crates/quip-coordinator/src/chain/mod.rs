@@ -8,6 +8,7 @@ pub mod fake;
 pub mod mempool;
 pub mod orders;
 pub mod outcome;
+pub mod pool;
 pub mod preflight;
 pub mod proof_encode;
 pub mod real;
@@ -26,6 +27,7 @@ pub use fake::FakeChain;
 pub use mempool::JobOrder;
 pub use orders::{job_orders_prefix, order_id_from_key};
 pub use outcome::{SubmitLedger, QBLOCK_RETENTION};
+pub use pool::{decode_pending_proof, PendingProof};
 pub use real::RealChainClient;
 pub use scale_types::{
     MinerInfoScale, MinerKind, MinerSpecScale, NodeDescriptorV2Input, NodeLogLevel, SolverType,
@@ -35,7 +37,7 @@ pub use seed::{
     encode_register_topology, encode_set_difficulty, seed_chain, SeedParams, SeedReport,
     SeedTopology, DEFAULT_SEED_DIFFICULTY,
 };
-pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
+pub use snapshot::{head_state_key, round_root, DecayParams, MiningSnapshot};
 pub use submit::{
     classify_descriptor, classify_participation, classify_receipt, classify_registration,
     DescriptorOutcome, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
@@ -104,6 +106,10 @@ pub trait ChainClient: Send + Sync {
         &self,
         miner_account: [u8; 32],
     ) -> Result<Vec<JobOrder>, ChainError>;
+
+    /// Every `QuantumPow.submit_proof` waiting in the connected node's
+    /// transaction pool. Other pool entries are skipped.
+    async fn fetch_pending_proofs(&self) -> Result<Vec<PendingProof>, ChainError>;
 
     /// Hybrid-sign and submit a proof extrinsic; classify the receipt.
     async fn submit_proof(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError>;

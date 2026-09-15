@@ -124,7 +124,10 @@ A proof-of-work job flows through the system in one pass:
 1. `feeder_loop` calls `ChainClient::fetch_mining_snapshot` and reads the
    difficulty target, topology, and the last proof block hash.
 2. On a new block hash, the feeder bumps the generation and cancels the prior
-   one, so miners stop working on stale problems.
+   one, so miners stop working on stale problems. The hash is taken from the
+   block that includes the winning proof, one block before the pallet stores
+   it. A proof pending in the pool that clears the round also stops the
+   miners, until the block that includes it arrives.
 3. `producer::derive_pow_job` builds the job from the snapshot. Mempool orders
    take a parallel path. The feeder registers the signing account in
    `QuantumComputeMempool.Solvers` once per round until the call succeeds, and

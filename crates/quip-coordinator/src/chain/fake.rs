@@ -3,8 +3,8 @@
 use super::sync::{SyncSource, SyncStatus};
 use super::{
     ChainClient, ChainError, DecayParams, DescriptorOutcome, JobOrder, MinerInfo, MiningSnapshot,
-    NodeDescriptorV2Input, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
-    SubmitReceipt,
+    NodeDescriptorV2Input, ParticipationOutcome, PendingProof, Proof, RegistrationOutcome,
+    SubmitAction, SubmitReceipt,
 };
 use crate::funding::BalanceSource;
 use async_trait::async_trait;
@@ -14,6 +14,8 @@ use std::sync::Mutex;
 pub struct FakeChain {
     snapshot: Mutex<Option<MiningSnapshot>>,
     orders: Mutex<Vec<JobOrder>>,
+    /// Scripted transaction-pool `submit_proof` entries (default empty).
+    pending_proofs: Mutex<Vec<PendingProof>>,
     /// Captured proofs from [`ChainClient::submit_proof`].
     pub submitted: Mutex<Vec<Proof>>,
     /// Optional scripted submit receipt (default `Success`, no chain detail).
@@ -66,6 +68,7 @@ impl FakeChain {
         Self {
             snapshot: Mutex::new(Some(snapshot)),
             orders: Mutex::new(order.into_iter().collect()),
+            pending_proofs: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
             submit_result: Mutex::new(Ok(SubmitReceipt::action_only(SubmitAction::Success))),
             qblock_id: Mutex::new(None),
@@ -195,6 +198,18 @@ impl FakeChain {
         {
             *self.orders.lock().unwrap() = orders;
         }
+    }
+
+    /// Replace the scripted pool contents.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test double; Mutex poison is a test failure"
+    )]
+    pub fn set_pending_proofs(&self, proofs: Vec<PendingProof>) {
+        *self.pending_proofs.lock().unwrap() = proofs;
     }
 
     /// Number of proofs captured via `submit_proof`.
@@ -513,6 +528,16 @@ impl ChainClient for FakeChain {
         )]
         {
             Ok(self.orders.lock().unwrap().clone())
+        }
+    }
+
+    async fn fetch_pending_proofs(&self) -> Result<Vec<PendingProof>, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(self.pending_proofs.lock().unwrap().clone())
         }
     }
 

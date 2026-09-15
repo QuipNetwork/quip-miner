@@ -25,6 +25,9 @@ pub(crate) enum RoundState {
     DescriptorFiled,
     /// Broadcast the requirements and stage jobs.
     StartMining,
+    /// Miners are stopped. A proof that clears this round is pending in the
+    /// pool. Wait for the block that includes it, then mine from that block.
+    AwaitingQBlock,
 }
 
 /// What happened in the current state.
@@ -38,6 +41,11 @@ pub(crate) enum RoundEvent {
     NewHead,
     /// The process is stopping. The machine ends.
     Shutdown,
+    /// A proof that clears the round is pending in the transaction pool.
+    /// Stop the miners and wait for the block that includes it.
+    WinPending,
+    /// The pending proof did not land. Restart the round on the same root.
+    Resume,
 }
 
 impl RoundState {
@@ -54,6 +62,14 @@ impl RoundState {
             RoundEvent::Shutdown => None,
             RoundEvent::NewHead => Some(Self::StopMining),
             RoundEvent::Failed => Some(self),
+            RoundEvent::WinPending => Some(match self {
+                Self::StartMining => Self::AwaitingQBlock,
+                other => other,
+            }),
+            RoundEvent::Resume => Some(match self {
+                Self::AwaitingQBlock => Self::StopMining,
+                other => other,
+            }),
             RoundEvent::Succeeded => match self {
                 Self::StopMining => Some(Self::ValidatorSynced),
                 Self::ValidatorSynced => Some(Self::AccountFunded),
@@ -61,7 +77,7 @@ impl RoundState {
                 Self::MinerRegistered => Some(Self::RequirementsDownloaded),
                 Self::RequirementsDownloaded => Some(Self::DescriptorFiled),
                 Self::DescriptorFiled => Some(Self::StartMining),
-                Self::StartMining => Some(self),
+                Self::StartMining | Self::AwaitingQBlock => Some(self),
             },
         }
     }
@@ -77,6 +93,7 @@ impl RoundState {
             Self::RequirementsDownloaded => "requirements_downloaded",
             Self::DescriptorFiled => "descriptor_filed",
             Self::StartMining => "start_mining",
+            Self::AwaitingQBlock => "awaiting_qblock",
         }
     }
 
@@ -84,13 +101,16 @@ impl RoundState {
     #[must_use]
     pub(crate) const fn reason(self) -> &'static str {
         match self {
-            Self::StopMining => "stopping miners; a new qblock ended the round",
+            Self::StopMining => "stopping miners for a new round",
             Self::ValidatorSynced => "waiting until the validator is synced",
             Self::AccountFunded => "confirming the miner account can pay submit fees",
             Self::MinerRegistered => "registering the signing account as a miner on chain",
             Self::RequirementsDownloaded => "downloading the next qblock requirements",
             Self::DescriptorFiled => "filing the node descriptor",
             Self::StartMining => "starting mining",
+            Self::AwaitingQBlock => {
+                "miners stopped; a pending proof clears this round, waiting for the block that includes it"
+            }
         }
     }
 
@@ -131,7 +151,10 @@ mod tests {
         }
     }
 
-    const ALL: [RoundState; 7] = [
+    /// The pre-mining walk, in order. `AwaitingQBlock` is off the walk: the
+    /// feeder enters it from `StartMining` and leaves it through
+    /// `StopMining`.
+    const WALK: [RoundState; 7] = [
         RoundState::StopMining,
         RoundState::ValidatorSynced,
         RoundState::AccountFunded,
@@ -139,6 +162,17 @@ mod tests {
         RoundState::RequirementsDownloaded,
         RoundState::DescriptorFiled,
         RoundState::StartMining,
+    ];
+
+    const ALL: [RoundState; 8] = [
+        RoundState::StopMining,
+        RoundState::ValidatorSynced,
+        RoundState::AccountFunded,
+        RoundState::MinerRegistered,
+        RoundState::RequirementsDownloaded,
+        RoundState::DescriptorFiled,
+        RoundState::StartMining,
+        RoundState::AwaitingQBlock,
     ];
 
     #[test]
@@ -149,7 +183,58 @@ mod tests {
             state = step(state, RoundEvent::Succeeded);
             seen.push(state);
         }
-        assert_eq!(seen, ALL);
+        assert_eq!(seen, WALK);
+    }
+
+    #[test]
+    fn win_pending_moves_only_start_mining_to_awaiting_qblock() {
+        assert_eq!(
+            RoundState::StartMining.transition(RoundEvent::WinPending),
+            Some(RoundState::AwaitingQBlock)
+        );
+        for state in ALL {
+            if state == RoundState::StartMining {
+                continue;
+            }
+            assert_eq!(
+                state.transition(RoundEvent::WinPending),
+                Some(state),
+                "{state:?} must ignore WinPending"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_moves_only_awaiting_qblock_to_stop_mining() {
+        assert_eq!(
+            RoundState::AwaitingQBlock.transition(RoundEvent::Resume),
+            Some(RoundState::StopMining)
+        );
+        for state in WALK {
+            assert_eq!(
+                state.transition(RoundEvent::Resume),
+                Some(state),
+                "{state:?} must ignore Resume"
+            );
+        }
+    }
+
+    #[test]
+    fn awaiting_qblock_holds_on_succeeded_and_failed() {
+        assert_eq!(
+            RoundState::AwaitingQBlock.transition(RoundEvent::Succeeded),
+            Some(RoundState::AwaitingQBlock)
+        );
+        assert_eq!(
+            RoundState::AwaitingQBlock.transition(RoundEvent::Failed),
+            Some(RoundState::AwaitingQBlock)
+        );
+    }
+
+    #[test]
+    fn awaiting_qblock_has_a_name_and_a_reason() {
+        assert_eq!(RoundState::AwaitingQBlock.as_str(), "awaiting_qblock");
+        assert!(RoundState::AwaitingQBlock.reason().contains("pending"));
     }
 
     #[test]

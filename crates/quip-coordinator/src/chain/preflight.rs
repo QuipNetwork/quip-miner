@@ -19,11 +19,12 @@ const QUANTUM_POW_API: &str = "QuantumPowApi";
 
 /// Minimum `QuantumPowApi` version the coordinator can drive.
 ///
-/// Version 2 is the first that takes a topology selector on `mining_snapshot`
-/// (`Option<H256>`), which is the shape [`RealChainClient::fetch_mining_snapshot`]
-/// encodes. A v1 runtime declares the same method name with a different
-/// argument list, so the call would not decode — feature-detecting on the
-/// reported version is exactly what the pallet's `#[api_version(2)]` is for.
+/// Version 2 added `difficulty_for(H256)`, which
+/// [`RealChainClient::fetch_mining_snapshot`] calls on every poll.
+/// `topology_meta(H256)` is older and already has this shape in v1. A v1 node
+/// has no `difficulty_for`, so the poll would fail as a missing method —
+/// feature-detecting on the reported version is exactly what the pallet's
+/// `#[api_version(2)]` is for.
 const MIN_QUANTUM_POW_API: u32 = 2;
 
 /// What the connected validator reports about itself.

@@ -67,8 +67,8 @@ seconds warns once.
   v0.2 `quip-miner` format when it sees that format's keys, because the two
   configs are not interchangeable.
 - **An incompatible validator.** `chain::preflight` reads the runtime version
-  and checks `QuantumPowApi`. The coordinator drives version 2 or newer, which
-  is the first version whose `mining_snapshot` takes a topology selector.
+  and checks `QuantumPowApi`. The coordinator drives version 2 or newer, the
+  version that added `difficulty_for`, which every poll calls.
 - **An unfunded miner account.** `funding.rs` reads the account balance and,
   when the balance is below `min_balance_plancks` (2 UNIT), requests a top up
   from `faucet_url`. It retries with backoff for `funding_timeout_s` (10
@@ -145,7 +145,12 @@ All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
 - `fetch_mining_snapshot` — the mining inputs at a block: topology
   (nodes/edges, allowed h/J/spin ranges), difficulty gates
   (`max_energy_milli`, `min_solutions`, `min_diversity_milli`), and the round
-  anchor (`last_proof_block_hash`).
+  anchor (`last_proof_block_hash`). The client pins every read at one head
+  hash. Each poll reads the difficulty and the root: `difficulty_for`, the
+  `LastProofBlock` and `LastProofBlockHash` values, the header, and
+  `DefaultTopology` when the caller names no topology. The client keeps the
+  last topology it read through `topology_meta` and reads again only when the
+  hash changes, because a topology never changes under its hash.
 - `fetch_mempool_orders` — open mempool orders eligible for this miner.
 - `submit_proof` — hybrid-sign and submit a proof extrinsic, then classify the
   receipt.
@@ -225,8 +230,17 @@ plus `proof_encode` and `scale_types` for SCALE codec. Nothing outside
 ## Job production — the feeder
 
 `feeder_loop` (in `runtime.rs`) runs one poll every `poll_interval_ms`
-(1000 ms in production). A win is visible on the next poll, so the worst-case
-delay before `Cancel` is one poll interval plus the snapshot RPC.
+(1000 ms in production). The poll runs every 250 ms when the miners are
+stopped for a pending win. A win is visible on the next poll, so the
+worst-case delay before `Cancel` is one poll interval plus the snapshot RPC.
+
+The round key is `last_proof_block_hash`. `fetch_mining_snapshot` computes it
+from `LastProofBlock` at the head. At the block that includes the winning
+proof, the key is that block's hash. The pallet stores the same value one
+block later. The coordinator starts the next round one block early. A proof
+built on it is valid from the next block on. If a reorg replaces the winning
+block, the key changes again and the feeder restarts the round on the
+replacement.
 
 When `last_proof_block_hash` changes, the feeder drives the round state
 machine. Startup drives the same machine. Mining is the last state. A new
@@ -261,6 +275,16 @@ The states, in order:
 7. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
    the new round, then stages jobs. A job of the new generation cannot leave
    before those two messages.
+8. **Awaiting qblock.** Off the walk. On each poll in state 7 the feeder
+   reads `author_pendingExtrinsics`, decodes every signed
+   `QuantumPow.submit_proof`, and replays the pallet gates against the
+   snapshot (`pool_watch::judge_pending_proof`). If one clears, the feeder
+   raises the generation and cancels the miners. It then enters this state. It
+   stages nothing here. It leaves on a new root, or it resumes on the same
+   root when no clearing proof is pending for two polls or two blocks pass.
+   A proof that held the miners and produced no qblock is ignored, by signer
+   and nonce, for the rest of the root. A failed pool read counts toward neither exit.
+   The pool is one node's view, so this stop is best effort.
 
 Participation is not a walk step. The feeder submits
 `MinerRegistry.participate` for the candidate qblock on the first poll after
@@ -349,10 +373,15 @@ Transitions:
 | any | Failed | same state (retry) |
 | Stop mining | Succeeded | Validator is synced |
 | Validator is synced | Succeeded | Account is funded |
-| Account is funded | Succeeded | Requirements downloaded |
+| Account is funded | Succeeded | Miner registered |
+| Miner registered | Succeeded | Requirements downloaded |
 | Requirements downloaded | Succeeded | Descriptor filed |
 | Descriptor filed | Succeeded | Start mining |
 | Start mining | Succeeded | Start mining |
+| Start mining | WinPending | Awaiting qblock |
+| Awaiting qblock | Succeeded | Awaiting qblock |
+| Awaiting qblock | Resume | Stop mining |
+| other | WinPending or Resume | same state |
 
 The feeder does the I/O. The transition function is pure. The feeder logs the
 state at `trace` on each entry, once per transition, with the generation. A

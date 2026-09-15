@@ -189,6 +189,13 @@ pub fn signer_account_bytes(pair: &HybridPair) -> [u8; 32] {
     *AsRef::<[u8; 32]>::as_ref(&account_id_from_public(&pair.public()))
 }
 
+/// The pallet's `account_to_bytes` for any signing account: `blake2_256` of
+/// the SCALE-encoded `AccountId32`, which is the raw 32 bytes.
+#[must_use]
+pub fn account_identity_bytes(account: &[u8; 32]) -> [u8; 32] {
+    blake2_256(account)
+}
+
 /// Derive the 32-byte miner identity used in `derive_nonce`.
 ///
 /// Matches the pallet: `blake2_256(account.encode())` where account is the
@@ -198,8 +205,7 @@ pub fn signer_account_bytes(pair: &HybridPair) -> [u8; 32] {
 #[must_use]
 pub fn miner_identity_bytes(pair: &HybridPair) -> [u8; 32] {
     let account = account_id_from_public(&pair.public());
-    // AccountId32 SCALE-encodes as the raw 32 bytes.
-    blake2_256(account.encode().as_slice())
+    account_identity_bytes(AsRef::<[u8; 32]>::as_ref(&account))
 }
 
 /// Substrate storage key for `QuantumComputeMempool.JobOrders(order_id)`.
@@ -281,6 +287,16 @@ pub fn last_proof_block_storage_key() -> Vec<u8> {
     let mut key = Vec::with_capacity(32);
     key.extend_from_slice(&twox128(b"QuantumPow"));
     key.extend_from_slice(&twox128(b"LastProofBlock"));
+    key
+}
+
+/// `QuantumPow::LastProofBlockHash` — plain `StorageValue` (hash of the last
+/// winning block, written one block after the win).
+#[must_use]
+pub fn last_proof_block_hash_storage_key() -> Vec<u8> {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(&twox128(b"QuantumPow"));
+    key.extend_from_slice(&twox128(b"LastProofBlockHash"));
     key
 }
 
@@ -653,6 +669,16 @@ mod tests {
         assert_ne!(
             participants_by_qblock_storage_key(1, &account),
             participants_by_qblock_storage_key(2, &account)
+        );
+    }
+
+    #[test]
+    fn account_identity_matches_the_pair_identity() {
+        let pair = HybridPair::from_string("//Alice", None).expect("alice");
+        let account = signer_account_bytes(&pair);
+        assert_eq!(
+            account_identity_bytes(&account),
+            miner_identity_bytes(&pair)
         );
     }
 }
