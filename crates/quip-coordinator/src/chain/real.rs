@@ -12,6 +12,7 @@ use super::extrinsic::{
     signer_account_bytes, solvers_storage_key, topology_curve_c_storage_key,
     SignedExtensionContext,
 };
+use super::pool::{decode_pending_proof, PendingProof};
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
     encode_deregister_solver_call, encode_participate_call, encode_register_miner_call,
@@ -1102,6 +1103,26 @@ impl ChainClient for RealChainClient {
             });
         }
         Ok(orders)
+    }
+
+    async fn fetch_pending_proofs(&self) -> Result<Vec<PendingProof>, ChainError> {
+        let raw = self
+            .rpc_call("author_pendingExtrinsics", Value::Array(vec![]))
+            .await?;
+        let Some(entries) = raw.as_array() else {
+            return Err(ChainError::Decode(
+                "author_pendingExtrinsics did not return an array".into(),
+            ));
+        };
+        let mut proofs = Vec::new();
+        for entry in entries {
+            let Some(hex) = entry.as_str() else { continue };
+            let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+            if let Some(p) = decode_pending_proof(&bytes) {
+                proofs.push(p);
+            }
+        }
+        Ok(proofs)
     }
 
     async fn submit_proof(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError> {
