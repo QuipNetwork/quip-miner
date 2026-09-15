@@ -43,10 +43,6 @@ pub(crate) enum RoundEvent {
     Shutdown,
     /// A proof that clears the round is pending in the transaction pool.
     /// Stop the miners and wait for the block that includes it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the feeder constructs this when a clearing proof is pending")
-    )]
     WinPending,
     /// The pending proof did not land. Restart the round on the same root.
     Resume,

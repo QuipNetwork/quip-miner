@@ -111,6 +111,11 @@ pub struct FeederParams {
     pub metrics: Arc<crate::metrics::CoordinatorMetrics>,
 }
 
+/// Poll interval while the miners are stopped for a pending win. The block
+/// that includes the proof lands within one block time, so a tight poll wins
+/// most of the configured interval back. Never slower than `poll_interval`.
+const AWAIT_QBLOCK_POLL: Duration = Duration::from_millis(250);
+
 /// EMA smoothing for the per-miner consumption signal. Lower reacts slower but
 /// steadier; 0.3 favors stability over reactivity for a ~1s poll, so a single
 /// slow or fast poll doesn't swing the window.
@@ -252,6 +257,20 @@ async fn broadcast_cancel(state: &Arc<Mutex<CoordinatorState>>, max_generation: 
     n
 }
 
+/// Enter `generation`: drop every staged and in-flight job of the previous
+/// generation, forget its salts, and reset the round's best and stash.
+/// Returns the count of staged jobs dropped. The caller broadcasts `Cancel`.
+async fn stop_mining(coord: &Arc<Mutex<CoordinatorState>>, generation: u64) -> usize {
+    let mut st = coord.lock().await;
+    st.generation = generation;
+    st.current_best_milli = None;
+    st.stash.reset(generation, Vec::new(), 0, 0);
+    let dropped = st.router.cancel(generation.saturating_sub(1));
+    let _ = st.cancel_inflight(generation.saturating_sub(1));
+    st.clear_salts();
+    dropped
+}
+
 /// A unique 32-byte salt from a monotonic counter: distinct salts derive
 /// distinct nonces (job ids), so each attempt is a fresh `PoW` draw.
 fn salt_from_counter(ctr: u64) -> [u8; 32] {
@@ -345,16 +364,7 @@ where
     loop {
         let event = match machine {
             RoundState::StopMining => {
-                cancelled_jobs = {
-                    let mut st = coord.lock().await;
-                    st.generation = generation;
-                    st.current_best_milli = None;
-                    st.stash.reset(generation, Vec::new(), 0, 0);
-                    let dropped = st.router.cancel(generation.saturating_sub(1));
-                    let _ = st.cancel_inflight(generation.saturating_sub(1));
-                    st.clear_salts();
-                    dropped
-                };
+                cancelled_jobs = stop_mining(coord, generation).await;
                 miners_told = if generation > 1 {
                     broadcast_cancel(coord, generation.saturating_sub(1)).await
                 } else {
@@ -622,6 +632,8 @@ pub async fn feeder_loop<C>(
     // mempool orders were last read at.
     let mut solver_attempted: Option<u64> = None;
     let mut orders_read_at: u64 = 0;
+    // Pool scan memory and the wait for the block that includes a pending win.
+    let mut pool_watch = crate::pool_watch::PoolWatch::new();
 
     loop {
         let (snap, state_now) = match chain
@@ -693,9 +705,44 @@ pub async fn feeder_loop<C>(
             });
 
             let head = snap.last_proof_block_hash;
-            if current_head != Some(head) {
+            // Pool scan. A proof that clears the round means the next block
+            // mints a qblock. Scanned only on an unchanged root, in the two
+            // states that care: mining (to stop) and awaiting (to resume).
+            let clearing = if current_head == Some(head)
+                && matches!(
+                    round,
+                    Some(RoundState::StartMining | RoundState::AwaitingQBlock)
+                ) {
+                match chain.fetch_pending_proofs().await {
+                    Ok(pending) => pool_watch.scan(&pending, &snap),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "feeder: pool read failed");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let event = if current_head != Some(head) {
+                Some(RoundEvent::NewHead)
+            } else if round == Some(RoundState::AwaitingQBlock) {
+                pool_watch
+                    .resume_reason(clearing.is_some(), snap.block_number)
+                    .map(|reason| {
+                        tracing::info!(
+                            generation,
+                            block = snap.block_number,
+                            reason = %reason,
+                            "resuming the round on the same root"
+                        );
+                        RoundEvent::Resume
+                    })
+            } else {
+                None
+            };
+            if let Some(event) = event {
                 let next = match round {
-                    Some(s) => s.transition(RoundEvent::NewHead),
+                    Some(s) => s.transition(event),
                     None => Some(RoundState::start()),
                 };
                 let Some(machine) = next else {
@@ -808,6 +855,41 @@ pub async fn feeder_loop<C>(
                 broadcast_set_target(&state, target).await;
                 last_broadcast = Some(target_key);
                 current_head = Some(snap.last_proof_block_hash);
+            }
+
+            // A clearing proof is pending: stop the miners and wait for the
+            // block that includes it. That block's hash is the next root.
+            if round == Some(RoundState::StartMining) {
+                if let Some(win) = clearing {
+                    round = round.and_then(|s| s.transition(RoundEvent::WinPending));
+                    generation = generation.saturating_add(1);
+                    RoundState::AwaitingQBlock.log_entry(generation);
+                    let cancelled_jobs = stop_mining(&state, generation).await;
+                    let miners_told = broadcast_cancel(&state, generation.saturating_sub(1)).await;
+                    pool_watch.stopped(snap.block_number);
+                    tracing::info!(
+                        generation,
+                        block = snap.block_number,
+                        signer = %crate::chain::extrinsic::hex_encode(&win.account),
+                        best_energy = %crate::logging::energy_units(win.best_energy_milli),
+                        cancelled_jobs,
+                        miners_told,
+                        "stopping miners: a pending proof clears this round; waiting for the block that includes it"
+                    );
+                }
+            }
+            if round == Some(RoundState::AwaitingQBlock) {
+                let mut view = params.metrics.chain();
+                view.is_mining = false;
+                params.metrics.set_chain(view);
+                tokio::select! {
+                    () = tokio::time::sleep(AWAIT_QBLOCK_POLL.min(params.poll_interval)) => {}
+                    _ = stop.changed() => {
+                        let _ = RoundState::AwaitingQBlock.transition(RoundEvent::Shutdown);
+                        break;
+                    }
+                }
+                continue;
             }
 
             // Declare participation only once a miner has returned a Result

@@ -16,6 +16,7 @@
     reason = "test-local constants next to usage"
 )]
 
+use quip_coordinator::chain::PendingProof;
 use quip_coordinator::chain::{FakeChain, MiningSnapshot};
 use quip_coordinator::config::LaunchEntry;
 use quip_coordinator::router::MinerCaps;
@@ -855,6 +856,301 @@ async fn feeder_sends_requirements_before_staging_the_new_generation() {
         restaged,
         "new generation was never staged after requirements"
     );
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// A pending proof that clears `snap`. `ising_snapshot` sets the ceiling to
+/// `i64::MAX / 2` with one required row and no diversity floor, so any
+/// well-formed row clears once the nonce matches the root.
+fn clearing_pending_proof(snap: &MiningSnapshot, account: [u8; 32]) -> PendingProof {
+    use quantum_validation::packed::pack_solution;
+    use quantum_validation::{derive_nonce, AllowedValueSpec};
+    use quip_coordinator::chain::extrinsic::account_identity_bytes;
+    use quip_coordinator::chain::scale_types::QuantumProof;
+
+    let salt = [3u8; 32];
+    let nonce = derive_nonce(
+        &snap.last_proof_block_hash,
+        &account_identity_bytes(&account),
+        &salt,
+    );
+    let spins = vec![1000i32; snap.nodes.len()];
+    let packed = pack_solution(
+        &spins,
+        &AllowedValueSpec::Set(snap.allowed_spin_milli.as_slice()),
+    )
+    .expect("pack");
+    PendingProof {
+        extrinsic_hash: account,
+        account,
+        proof: QuantumProof {
+            topology_hash: sp_core::H256::from_slice(&snap.topology_hash),
+            nonce,
+            salt,
+            solutions: vec![packed],
+            device_access_time_us: 0,
+        },
+    }
+}
+
+/// Drive a feeder to its first staged round and drain the round's broadcasts.
+async fn first_round_staged(
+    state: &Arc<Mutex<CoordinatorState>>,
+    rx: &mut mpsc::Receiver<Result<quip_proto::v1::CoordMsg, tonic::Status>>,
+) {
+    let mut filled = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if new_generation_staged(&*state.lock().await, 1) > 0 {
+            filled = true;
+            break;
+        }
+    }
+    assert!(filled, "first round never staged jobs");
+    while rx.try_recv().is_ok() {}
+}
+
+/// Expect the reseed triple for `cancelled` and return once all three arrived.
+#[expect(
+    clippy::panic,
+    reason = "test helper rejects missing or unexpected reseed messages"
+)]
+async fn expect_reseed(
+    rx: &mut mpsc::Receiver<Result<quip_proto::v1::CoordMsg, tonic::Status>>,
+    cancelled: u64,
+) {
+    use quip_proto::v1::coord_msg;
+    let (mut saw_cancel, mut saw_topology, mut saw_target) = (false, false, false);
+    for _ in 0..8 {
+        let msg = recv_coord(rx).await;
+        match &msg.msg {
+            Some(coord_msg::Msg::Cancel(c)) => {
+                assert_eq!(c.max_generation, cancelled);
+                saw_cancel = true;
+            }
+            Some(coord_msg::Msg::Topology(_)) => saw_topology = true,
+            Some(coord_msg::Msg::SetTarget(_)) => saw_target = true,
+            other => panic!("unexpected outbound during reseed: {other:?}"),
+        }
+        if saw_cancel && saw_topology && saw_target {
+            return;
+        }
+    }
+    panic!("reseed did not send Cancel({cancelled}), Topology, and SetTarget");
+}
+
+/// A proof in the pool that clears the round stops the miners: the current
+/// generation is cancelled and nothing is staged until the block that
+/// includes the proof arrives. That block's hash is the next root.
+#[tokio::test]
+async fn feeder_stops_on_a_clearing_pending_proof_and_mines_the_new_root() {
+    use quip_proto::v1::coord_msg;
+
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let (tx, mut rx) = mpsc::channel::<Result<quip_proto::v1::CoordMsg, tonic::Status>>(64);
+    {
+        let mut st = state.lock().await;
+        st.router.register_miner("cpu-0", ising_caps());
+        st.register_outbound("cpu-0", tx);
+    }
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(2, 40),
+        stop_rx,
+    ));
+    first_round_staged(&state, &mut rx).await;
+
+    chain.set_pending_proofs(vec![clearing_pending_proof(
+        &snapshot_with_head([1u8; 32]),
+        [5u8; 32],
+    )]);
+
+    let msg = recv_coord(&mut rx).await;
+    match &msg.msg {
+        Some(coord_msg::Msg::Cancel(c)) => assert_eq!(c.max_generation, 1),
+        other => panic!("expected Cancel(1) on a pending win, got {other:?}"),
+    }
+    {
+        let st = state.lock().await;
+        assert_eq!(st.generation, 2);
+        assert_eq!(st.router.staged_len("cpu-0"), 0, "nothing stays staged");
+    }
+    // Waiting: no requirements, no staging, while the root is unchanged.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "no broadcast while awaiting the qblock"
+    );
+    assert_eq!(state.lock().await.router.staged_len("cpu-0"), 0);
+
+    // The block that includes the proof arrives: its hash is the new root.
+    chain.set_pending_proofs(Vec::new());
+    chain.set_snapshot(Some(snapshot_with_head([2u8; 32])));
+    expect_reseed(&mut rx, 2).await;
+
+    let mut restaged = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if new_generation_staged(&*state.lock().await, 3) > 0 {
+            restaged = true;
+            break;
+        }
+    }
+    assert!(restaged, "new root was never staged");
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// The pending proof leaves the pool and no qblock follows: the round
+/// resumes on the same root with a fresh generation.
+#[tokio::test]
+async fn feeder_resumes_when_the_pending_proof_leaves_the_pool_without_a_qblock() {
+    use quip_proto::v1::coord_msg;
+
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let (tx, mut rx) = mpsc::channel::<Result<quip_proto::v1::CoordMsg, tonic::Status>>(64);
+    {
+        let mut st = state.lock().await;
+        st.router.register_miner("cpu-0", ising_caps());
+        st.register_outbound("cpu-0", tx);
+    }
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(2, 40),
+        stop_rx,
+    ));
+    first_round_staged(&state, &mut rx).await;
+
+    chain.set_pending_proofs(vec![clearing_pending_proof(
+        &snapshot_with_head([1u8; 32]),
+        [5u8; 32],
+    )]);
+    let msg = recv_coord(&mut rx).await;
+    assert!(
+        matches!(&msg.msg, Some(coord_msg::Msg::Cancel(c)) if c.max_generation == 1),
+        "expected Cancel(1), got {:?}",
+        msg.msg
+    );
+
+    chain.set_pending_proofs(Vec::new());
+    expect_reseed(&mut rx, 2).await;
+
+    let mut restaged = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if new_generation_staged(&*state.lock().await, 3) > 0 {
+            restaged = true;
+            break;
+        }
+    }
+    assert!(restaged, "the round never resumed on the same root");
+    assert_eq!(
+        state.lock().await.last_proof_block_hash,
+        quip_coordinator::chain::extrinsic::hex_encode(&[1u8; 32]),
+        "resume keeps the root"
+    );
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// The proof stays pending but two blocks pass with no qblock: resume.
+#[tokio::test]
+async fn feeder_resumes_after_two_blocks_when_the_pending_proof_never_lands() {
+    use quip_proto::v1::coord_msg;
+
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let (tx, mut rx) = mpsc::channel::<Result<quip_proto::v1::CoordMsg, tonic::Status>>(64);
+    {
+        let mut st = state.lock().await;
+        st.router.register_miner("cpu-0", ising_caps());
+        st.register_outbound("cpu-0", tx);
+    }
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(2, 40),
+        stop_rx,
+    ));
+    first_round_staged(&state, &mut rx).await;
+
+    chain.set_pending_proofs(vec![clearing_pending_proof(
+        &snapshot_with_head([1u8; 32]),
+        [5u8; 32],
+    )]);
+    let msg = recv_coord(&mut rx).await;
+    assert!(
+        matches!(&msg.msg, Some(coord_msg::Msg::Cancel(c)) if c.max_generation == 1),
+        "expected Cancel(1), got {:?}",
+        msg.msg
+    );
+
+    // Same root, two blocks later, proof still pending.
+    let mut later = snapshot_with_head([1u8; 32]);
+    later.block_number += 2;
+    chain.set_snapshot(Some(later));
+    expect_reseed(&mut rx, 2).await;
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// A pending proof derived from another root is not this round's win.
+#[tokio::test]
+async fn feeder_ignores_a_pending_proof_for_another_round() {
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let (tx, mut rx) = mpsc::channel::<Result<quip_proto::v1::CoordMsg, tonic::Status>>(64);
+    {
+        let mut st = state.lock().await;
+        st.router.register_miner("cpu-0", ising_caps());
+        st.register_outbound("cpu-0", tx);
+    }
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(2, 40),
+        stop_rx,
+    ));
+    first_round_staged(&state, &mut rx).await;
+
+    chain.set_pending_proofs(vec![clearing_pending_proof(
+        &snapshot_with_head([9u8; 32]),
+        [5u8; 32],
+    )]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "no Cancel for another round's proof"
+    );
+    let st = state.lock().await;
+    assert_eq!(st.generation, 1);
+    assert!(st.router.staged_len("cpu-0") > 0);
+    drop(st);
 
     let _ = stop_tx.send(true);
     tokio::time::timeout(Duration::from_secs(2), feeder)
