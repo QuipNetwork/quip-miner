@@ -949,6 +949,7 @@ async fn expect_reseed(
 /// includes the proof arrives. That block's hash is the next root.
 #[tokio::test]
 async fn feeder_stops_on_a_clearing_pending_proof_and_mines_the_new_root() {
+    use quip_coordinator::chain::extrinsic::hex_encode;
     use quip_proto::v1::coord_msg;
 
     let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
@@ -995,6 +996,10 @@ async fn feeder_stops_on_a_clearing_pending_proof_and_mines_the_new_root() {
     chain.set_pending_proofs(Vec::new());
     chain.set_snapshot(Some(snapshot_with_head([2u8; 32])));
     expect_reseed(&mut rx, 2).await;
+    assert_eq!(
+        state.lock().await.last_proof_block_hash,
+        hex_encode(&[2u8; 32])
+    );
 
     let mut restaged = false;
     for _ in 0..40 {
@@ -1464,6 +1469,55 @@ async fn feeder_declares_participation_only_after_a_result_for_the_round() {
     assert!(
         wait_participations(&chain, 1).await,
         "a Result for the round must declare participation"
+    );
+    assert_eq!(chain.take_participations(), vec![11]);
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// A pending win must not erase participation owed for the stopped round.
+#[tokio::test]
+async fn feeder_declares_participation_for_a_round_stopped_by_a_pending_win() {
+    use quip_proto::v1::coord_msg;
+
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    chain.set_qblock_id(Some(10));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let (tx, mut rx) = mpsc::channel::<Result<quip_proto::v1::CoordMsg, tonic::Status>>(64);
+    {
+        let mut st = state.lock().await;
+        st.router.register_miner("cpu-0", ising_caps());
+        st.register_outbound("cpu-0", tx);
+    }
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(2, 40),
+        stop_rx,
+    ));
+    first_round_staged(&state, &mut rx).await;
+
+    // No await between the returned Result and setting the proof: on this
+    // current-thread runtime, the feeder's next poll sees both together.
+    assert!(return_one_result(&state, 1).await, "no job to complete");
+    chain.set_pending_proofs(vec![clearing_pending_proof(
+        &snapshot_with_head([1u8; 32]),
+        [5u8; 32],
+    )]);
+
+    let msg = recv_coord(&mut rx).await;
+    match &msg.msg {
+        Some(coord_msg::Msg::Cancel(c)) => assert_eq!(c.max_generation, 1),
+        other => panic!("expected Cancel(1) on a pending win, got {other:?}"),
+    }
+    assert!(
+        wait_participations(&chain, 1).await,
+        "a round mined before the stop must be declared"
     );
     assert_eq!(chain.take_participations(), vec![11]);
 

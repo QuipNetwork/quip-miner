@@ -700,7 +700,7 @@ pub async fn feeder_loop<C>(
             params.metrics.set_chain(crate::metrics::ChainView {
                 head_hash: crate::chain::extrinsic::hex_encode(&snap.head_hash),
                 head_number: snap.block_number,
-                is_mining: true,
+                is_mining: round != Some(RoundState::AwaitingQBlock),
                 miner_registered: miner_info.is_some(),
                 miner_info,
             });
@@ -874,6 +874,9 @@ pub async fn feeder_loop<C>(
             // block that includes it. That block's hash is the next root.
             if round == Some(RoundState::StartMining) {
                 if let Some(win) = clearing {
+                    // Decide before stop_mining moves the state generation.
+                    let owed =
+                        declared_generation != Some(generation) && state.lock().await.round_mined();
                     round = round.and_then(|s| s.transition(RoundEvent::WinPending));
                     generation = generation.saturating_add(1);
                     RoundState::AwaitingQBlock.log_entry(generation);
@@ -889,6 +892,21 @@ pub async fn feeder_loop<C>(
                         miners_told,
                         "stopping miners: a pending proof clears this round; waiting for the block that includes it"
                     );
+                    // Declare after Cancel: inclusion can wait, but miners must stop first.
+                    if owed {
+                        let settled = declare_round_participation(
+                            chain.as_ref(),
+                            &mut last_declared,
+                            params.miner_account,
+                        )
+                        .await;
+                        if !settled {
+                            tracing::warn!(
+                                generation,
+                                "participation for the stopped round did not settle"
+                            );
+                        }
+                    }
                 }
             }
             if round == Some(RoundState::AwaitingQBlock) {
