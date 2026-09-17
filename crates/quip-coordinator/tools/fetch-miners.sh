@@ -230,10 +230,10 @@ if [ "$want_cuda" = true ]; then
     fi
   elif [ "$cuda_required" = true ]; then
     CUDA_TAG="$(miner_tag cuda)"
-    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs"
+    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" "quip-cuda-msa"
   else
     CUDA_TAG="$(miner_tag cuda)"
-    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" ||
+    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" "quip-cuda-msa" ||
       echo "note: cuda binaries optional (no GPU host)"
   fi
 fi

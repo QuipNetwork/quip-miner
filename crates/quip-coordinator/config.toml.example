@@ -44,7 +44,7 @@ idle_timeout_s = 300
 # ordinal; the coordinator passes it to the miner as `--device N`.
 # Default binary: quip-cuda-sa.
 [cuda.0]
-binary = "quip-cuda-sa"       # or "quip-cuda-gibbs"
+binary = "quip-cuda-sa"       # or "quip-cuda-gibbs", "quip-cuda-msa"
 
 # Apple Silicon Metal miner. Default binary: quip-metal-sa.
 # [metal]
