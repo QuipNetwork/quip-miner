@@ -13,10 +13,15 @@ use std::collections::HashMap;
 /// here is `order.nodes` in received order. Every endpoint is therefore mapped
 /// through the same label-to-position table the `PoW` path caches per session,
 /// rather than forwarded verbatim.
-/// Forwarding a label verbatim leaves an endpoint naming a site the order did
-/// not place on: past the end of `h` the miner refuses the job as `Malformed`,
-/// and the coordinator's own `energy_in_place` drops every row it scores, so
-/// the order is never answered.
+///
+/// Forwarding labels fails two ways, and the quiet one is the worse. A label
+/// past the end of `h` is caught: the miner's shape check refuses the job as
+/// `Malformed`, and the coordinator's own `energy_in_place` drops every row it
+/// scores, so the order is simply never answered. A label that lands *inside*
+/// `h` while naming a different site is not caught anywhere -- the miner
+/// samples a graph the order did not describe, this coordinator scores it
+/// against the same wrong sites and agrees with itself, and a confident wrong
+/// energy goes to the chain, which resolves the labels properly and disagrees.
 ///
 /// `h_milli` and `j_milli` already arrive in that positional order (aligned
 /// with `nodes` and `edges` respectively), so the mapping touches the endpoints
@@ -133,6 +138,25 @@ mod tests {
         assert_eq!(edges.u.len(), order.edges.len());
         assert_eq!(edges.v.len(), order.edges.len());
         assert_eq!(edges.u.len(), order.j_milli.len());
+    }
+
+    /// The quiet case: every label is a valid index into `h`, so nothing
+    /// downstream refuses the job -- it just describes a different graph.
+    /// Forwarding verbatim would emit `(0, 1)` here, which the miner samples
+    /// and this coordinator scores without complaint, and only the chain
+    /// disagrees.
+    #[test]
+    fn maps_an_in_range_permutation_that_nothing_downstream_would_catch() {
+        let order = JobOrder {
+            nodes: vec![2, 0, 1],
+            edges: vec![(0, 1)],
+            h_milli: vec![1000, -1000, 250],
+            j_milli: vec![500],
+            ..sample_order()
+        };
+        let edges = edges_of(&job_order_to_job(&order).unwrap());
+        assert_eq!(edges.u, vec![1]);
+        assert_eq!(edges.v, vec![2]);
     }
 
     #[test]
