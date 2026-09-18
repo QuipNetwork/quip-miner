@@ -564,7 +564,16 @@ async fn stage_mempool_orders<C: ChainClient>(
             .mempool_orders
             .insert(order.order_id.clone(), order_gates(&order));
         let id = crate::chain::extrinsic::hex_encode(&order.order_id);
-        if let Some(miner) = st.router.route(job_order_to_job(&order)) {
+        let Some(job) = job_order_to_job(&order) else {
+            tracing::warn!(
+                order = %id,
+                nodes = order.nodes.len(),
+                edges = order.edges.len(),
+                "feeder: mempool order's node list cannot index its own edges; skipping it"
+            );
+            continue;
+        };
+        if let Some(miner) = st.router.route(job) {
             tracing::info!(order = %id, miner = %miner, nodes = order.nodes.len(), "feeder: staged mempool order");
             st.wake_dispatcher(&miner);
         } else {
