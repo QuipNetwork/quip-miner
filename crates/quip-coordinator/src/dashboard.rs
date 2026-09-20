@@ -106,6 +106,35 @@ fn unix_ts() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Format `t` as ISO 8601 UTC with second precision, e.g.
+/// `2026-09-18T14:03:07Z`. A time before the epoch renders as the epoch.
+fn iso8601_utc(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
+/// Proleptic Gregorian `(year, month, day)` for `days` since 1970-01-01, after
+/// Howard Hinnant's `civil_from_days`, restricted to non-negative input.
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    (year, month, day)
+}
+
 fn success_envelope(data: &Value) -> Response {
     Json(json!({
         "success": true,
@@ -162,6 +191,10 @@ async fn api_status(State(state): State<DashboardState>) -> Response {
         "account_id_hex": identity.account_id_hex,
         "node_id": identity.node_id,
         "is_mining": chain.is_mining,
+        "last_successful_submission": state
+            .metrics
+            .last_successful_submission()
+            .map_or(Value::Null, |t| Value::String(iso8601_utc(t))),
         "uptime_seconds": safe_u64("uptime_seconds", 0, state.metrics.uptime_seconds()),
         "chain": {
             "head_hash": chain.head_hash,
@@ -1034,6 +1067,38 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         body_json(resp).await
+    }
+
+    #[test]
+    fn iso8601_utc_formats_known_instants() {
+        use std::time::Duration;
+        assert_eq!(iso8601_utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        // 2000-02-29 exercises the leap-century rule.
+        let leap = UNIX_EPOCH + Duration::from_secs(951_782_400 + 3_661);
+        assert_eq!(iso8601_utc(leap), "2000-02-29T01:01:01Z");
+        let t = UNIX_EPOCH + Duration::from_secs(1_786_742_808);
+        assert_eq!(iso8601_utc(t), "2026-08-14T21:26:48Z");
+    }
+
+    /// QUI-830: the field is null until the chain accepts a proof, and an
+    /// error or stale drop does not set it.
+    #[tokio::test]
+    async fn status_last_successful_submission_tracks_accepted_proofs_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = keyed_state(tmp.path());
+        let v = status_body(state.clone()).await;
+        assert_eq!(at(&v, "/data/last_successful_submission"), &Value::Null);
+
+        state.metrics.record_submission_error("cpu-0");
+        state.metrics.record_stale_drop("cpu-0");
+        let v = status_body(state.clone()).await;
+        assert_eq!(at(&v, "/data/last_successful_submission"), &Value::Null);
+
+        state.metrics.record_proof_submitted("cpu-0");
+        let v = status_body(state).await;
+        let ts = at(&v, "/data/last_successful_submission").as_str().unwrap();
+        assert_eq!(ts.len(), 20, "{ts}");
+        assert!(ts.ends_with('Z'), "{ts}");
     }
 
     /// C5: a keyed coordinator with one registered CPU miner.

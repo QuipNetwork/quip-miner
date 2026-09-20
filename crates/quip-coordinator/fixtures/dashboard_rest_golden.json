@@ -79,6 +79,7 @@
         "head_number": 10249
       },
       "is_mining": true,
+      "last_successful_submission": null,
       "miner_info": {
         "deposit": "1000000000000",
         "proofs_submitted": 412,
@@ -183,6 +184,7 @@
         "head_number": 10249
       },
       "is_mining": true,
+      "last_successful_submission": null,
       "miner_info": {
         "deposit": "1000000000000",
         "proofs_submitted": 412,
@@ -303,6 +305,7 @@
         "head_number": 10249
       },
       "is_mining": true,
+      "last_successful_submission": null,
       "miner_info": {
         "deposit": "1000000000000",
         "proofs_submitted": 412,
@@ -407,6 +410,7 @@
         "head_number": 10249
       },
       "is_mining": true,
+      "last_successful_submission": null,
       "miner_info": {
         "deposit": "1000000000000",
         "proofs_submitted": 412,
