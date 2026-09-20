@@ -17,7 +17,7 @@ use crate::config::miner_kind_from_backend;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 /// The seven controller counters, as live atomics.
 #[derive(Debug, Default)]
@@ -125,6 +125,9 @@ pub struct CoordinatorMetrics {
     miner_mode: BTreeMap<String, String>,
     identity: Mutex<Identity>,
     chain: Mutex<ChainView>,
+    /// Wall-clock time the chain last accepted a proof. Kept apart from
+    /// [`ChainView`] because the feeder replaces that view on every poll.
+    last_successful_submission: Mutex<Option<SystemTime>>,
 }
 
 impl CoordinatorMetrics {
@@ -153,6 +156,7 @@ impl CoordinatorMetrics {
             miner_mode,
             identity: Mutex::new(Identity::default()),
             chain: Mutex::new(ChainView::default()),
+            last_successful_submission: Mutex::new(None),
         }
     }
 
@@ -240,9 +244,20 @@ impl CoordinatorMetrics {
         self.bump(miner_id, 1, |c| &c.results_received);
     }
 
-    /// The chain accepted a proof from `miner_id`.
+    /// The chain accepted a proof from `miner_id`. Also stamps
+    /// [`Self::last_successful_submission`].
     pub fn record_proof_submitted(&self, miner_id: &str) {
         self.bump(miner_id, 1, |c| &c.proofs_submitted);
+        if let Ok(mut g) = self.last_successful_submission.lock() {
+            *g = Some(SystemTime::now());
+        }
+    }
+
+    /// When the chain last accepted a proof, or `None` before the first
+    /// accepted proof since process start.
+    #[must_use]
+    pub fn last_successful_submission(&self) -> Option<SystemTime> {
+        self.last_successful_submission.lock().ok().and_then(|g| *g)
     }
 
     /// Work from `miner_id` was dropped because the round moved on.

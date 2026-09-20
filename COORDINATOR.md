@@ -534,6 +534,19 @@ server off.
 | `GET /api/v1/mining/attempts?solution_number=N` | submission and attempts for one solution |
 | anything else | static files under `data_dir` |
 
+Add `&limit=N` to the attempts route to receive only the newest N attempts by
+timestamp. The response then also carries a `totals` object for the whole
+trail. `totals` holds four fields: `attempt_count`, the lowest
+`best_energy_milli`, the summed `qpu_access_time_us`, and `num_valid` from
+the newest submitted attempt.
+
+A long qblock records thousands of attempts, and the full trail reaches
+megabytes, so a client that shows a bounded tail can poll the route without
+downloading every row.
+
+Without `limit`, the response carries every attempt and no `totals`. That is
+the behavior every client had before the parameter existed.
+
 The server serves reads only. It exposes no control endpoint. Bind it to an
 address the operator trusts, because it applies no authentication.
 
