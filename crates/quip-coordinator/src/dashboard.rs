@@ -271,6 +271,10 @@ fn counters_json(c: &crate::metrics::CounterSnapshot) -> Value {
 struct AttemptsQuery {
     /// Global solution number; maps to `data_dir/<solution_number>/`.
     solution_number: Option<String>,
+    /// Return only the newest N attempts by `ts_ns`, and add the `totals`
+    /// object for the whole trail. Absent means the whole trail and no
+    /// `totals`, which is what clients written before QUI-1391 expect.
+    limit: Option<String>,
 }
 
 async fn api_mining_attempts(
@@ -291,7 +295,20 @@ async fn api_mining_attempts(
             "BAD_PARAM",
         );
     };
-    match load_attempts_envelope(&state.data_dir, solution_number) {
+    let limit = match query.limit.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "limit must be a non-negative integer",
+                    "BAD_PARAM",
+                );
+            }
+        },
+    };
+    match load_attempts_envelope(&state.data_dir, solution_number, limit) {
         Ok(data) => success_envelope(&data),
         Err(AttemptsLoadError::NotFound) => error_envelope(
             StatusCode::NOT_FOUND,
@@ -320,9 +337,15 @@ enum AttemptsLoadError {
 
 /// Read `data_dir/<solution_number>/attempts.jsonl` and build the
 /// `{ submission, attempts }` envelope the indexer parser expects.
+///
+/// `limit` returns only the newest N attempts by `ts_ns` and adds a `totals`
+/// object covering the whole trail, so a client can show a bounded tail without
+/// downloading every row. A two-GPU node records about 9,000 attempts on a long
+/// qblock, which is roughly 2.3 MB in one response.
 fn load_attempts_envelope(
     data_dir: &Path,
     solution_number: u64,
+    limit: Option<usize>,
 ) -> Result<Value, AttemptsLoadError> {
     let dir = data_dir.join(solution_number.to_string());
     if !dir.is_dir() {
@@ -352,17 +375,69 @@ fn load_attempts_envelope(
         return Err(AttemptsLoadError::NotFound);
     }
 
-    let attempts = records
-        .iter()
-        .enumerate()
+    // `iter` numbers a row by its position in the whole trail, so it is
+    // assigned before any truncation and stays stable across limits.
+    let mut kept: Vec<(usize, &Map<String, Value>)> = records.iter().enumerate().collect();
+    if let Some(n) = limit {
+        // Newest by `ts_ns`. The trail interleaves miners, so file order is not
+        // guaranteed to be time order. A stable sort keeps file order among
+        // rows sharing a timestamp, which is the common case within one miner.
+        kept.sort_by_key(|(_, rec)| ts_ns_of(rec));
+        let drop = kept.len().saturating_sub(n);
+        let _ = kept.drain(..drop);
+    }
+
+    let attempts = kept
+        .into_iter()
         .map(|(i, rec)| attempt_from_record(rec, i + 1, solution_number))
         .collect::<Vec<_>>();
 
     let submission = submission_from_records(&records, solution_number);
-    Ok(json!({
-        "submission": submission,
-        "attempts": attempts,
-    }))
+    let mut envelope = Map::new();
+    let _ = envelope.insert("submission".into(), submission);
+    let _ = envelope.insert("attempts".into(), Value::Array(attempts));
+    if limit.is_some() {
+        let _ = envelope.insert(
+            "totals".into(),
+            totals_from_records(&records, solution_number),
+        );
+    }
+    Ok(Value::Object(envelope))
+}
+
+/// Summarize the whole trail for a client that only fetched a tail.
+///
+/// `num_valid` comes from the newest submitted row, matching the row
+/// [`submission_from_records`] prefers, so the two objects never disagree.
+/// `best_energy_milli` is the lowest resolved energy across the trail; a trail
+/// where no row ever cleared the gate and no row carries a raw best reports 0,
+/// the same value [`wire_energy_milli`] puts on such a row.
+fn totals_from_records(records: &[Map<String, Value>], solution_number: u64) -> Value {
+    let best = records
+        .iter()
+        .filter_map(resolved_energy_milli)
+        .min()
+        .unwrap_or(0);
+    let qpu_access_time_us = records.iter().fold(0_u64, |acc, rec| {
+        acc.saturating_add(u64_field(rec, "device_access_time_us").unwrap_or(0))
+    });
+    let num_valid = records
+        .iter()
+        .rev()
+        .find(|r| bool_field(r, "submitted") == Some(true))
+        .and_then(|r| u64_field(r, "n_valid"))
+        .map_or(Value::Null, |n| safe_u64("num_valid", solution_number, n));
+
+    json!({
+        "attempt_count": safe_u64(
+            "attempt_count",
+            solution_number,
+            u64::try_from(records.len()).unwrap_or(u64::MAX),
+        ),
+        "best_energy_milli": safe_i64("best_energy_milli", solution_number, best),
+        "qpu_access_time_us": safe_u64("qpu_access_time_us", solution_number, qpu_access_time_us),
+        "num_valid": num_valid,
+    })
 }
 
 /// Map one v0.3 [`crate::attempt::AttemptRecord`] JSON object onto the v0.2
@@ -525,14 +600,22 @@ fn u64_field(rec: &Map<String, Value>, key: &str) -> Option<u64> {
 /// `raw_best_energy_milli` existed fall to `0` here, which is why the guard in
 /// [`safe_i64`] is a backstop and not the fix.
 fn wire_energy_milli(rec: &Map<String, Value>, solution_number: u64) -> Value {
-    let resolved = match i64_field(rec, "best_energy_milli") {
-        Some(best) if best != i64::MAX => best,
-        _ => match i64_field(rec, "raw_best_energy_milli") {
-            Some(raw) if raw != i64::MAX => raw,
-            _ => 0,
-        },
-    };
+    let resolved = resolved_energy_milli(rec).unwrap_or(0);
     safe_i64("best_energy_milli", solution_number, resolved)
+}
+
+/// The real energy a record holds, or `None` when it holds no real energy:
+/// both fields are the sentinel, or neither is present. Separated from
+/// [`wire_energy_milli`] so the `totals` fold can skip such rows instead of
+/// folding their `0` in as a minimum.
+fn resolved_energy_milli(rec: &Map<String, Value>) -> Option<i64> {
+    match i64_field(rec, "best_energy_milli") {
+        Some(best) if best != i64::MAX => Some(best),
+        _ => match i64_field(rec, "raw_best_energy_milli") {
+            Some(raw) if raw != i64::MAX => Some(raw),
+            _ => None,
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -763,6 +846,148 @@ mod tests {
             let body = get_body(tmp, &uri).await;
             assert_safe_integers(&body, &uri);
         }
+    }
+
+    /// QUI-1391: a response body too large for [`body_json`]'s 1 MB cap.
+    async fn get_body_unbounded(tmp: &Path, uri: &str) -> Value {
+        let resp = router(test_state(tmp))
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri} did not return 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Write a trail of `n` rows whose `ts_ms` increases with position, so the
+    /// newest rows are unambiguous. Every 1,000th row is submitted.
+    fn write_long_trail(tmp: &Path, solution_number: u64, n: u64) {
+        let dir = tmp.join(solution_number.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut body = String::new();
+        for i in 0..n {
+            let mut rec: Value =
+                serde_json::from_str(&attempt_line("cpu-0", -14_000, 200, 3, true, false, 7))
+                    .unwrap();
+            let map = rec.as_object_mut().unwrap();
+            let _ = map.insert("ts_ms".into(), json!(1_700_000_000_000_u64 + i));
+            // One deeper energy in the middle, to prove the totals fold reads
+            // the whole trail and not just the returned tail.
+            if i == n / 2 {
+                let _ = map.insert("best_energy_milli".into(), json!(-99_000));
+            }
+            if i % 1_000 == 999 {
+                let _ = map.insert("submitted".into(), json!(true));
+                let _ = map.insert("n_valid".into(), json!(41));
+            }
+            body.push_str(&rec.to_string());
+            body.push('\n');
+        }
+        std::fs::write(dir.join("attempts.jsonl"), body).unwrap();
+    }
+
+    /// QUI-1391: `limit` returns the newest N rows and totals for the whole
+    /// trail. 10,001 rows is past the ~9,000 a two-GPU node records.
+    #[tokio::test]
+    async fn attempts_limit_returns_the_newest_rows_with_whole_trail_totals() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_long_trail(tmp.path(), 1, 10_001);
+
+        let v = get_body_unbounded(
+            tmp.path(),
+            "/api/v1/mining/attempts?solution_number=1&limit=500",
+        )
+        .await;
+        let attempts = at(&v, "/data/attempts").as_array().unwrap();
+        assert_eq!(attempts.len(), 500);
+
+        // The newest 500 are positions 9502..=10001, so `iter` is unchanged by
+        // truncation and still numbers rows within the whole trail.
+        assert_eq!(at(attempts.first().unwrap(), "/iter"), &json!(9_502));
+        assert_eq!(at(attempts.last().unwrap(), "/iter"), &json!(10_001));
+
+        assert_eq!(at(&v, "/data/totals/attempt_count"), &json!(10_001));
+        assert_eq!(at(&v, "/data/totals/best_energy_milli"), &json!(-99_000));
+        assert_eq!(at(&v, "/data/totals/qpu_access_time_us"), &json!(70_007));
+        assert_eq!(at(&v, "/data/totals/num_valid"), &json!(41));
+        assert_safe_integers(&v, "attempts?limit=500");
+    }
+
+    /// QUI-1391: a request without `limit` keeps the shape it had before, so
+    /// clients that predate the parameter are untouched.
+    #[tokio::test]
+    async fn attempts_without_limit_are_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_long_trail(tmp.path(), 1, 10_001);
+
+        let v = get_body_unbounded(tmp.path(), "/api/v1/mining/attempts?solution_number=1").await;
+        assert_eq!(at(&v, "/data/attempts").as_array().unwrap().len(), 10_001);
+        assert!(
+            at(&v, "/data").get("totals").is_none(),
+            "totals must not appear without limit"
+        );
+    }
+
+    /// QUI-1391: a limit past the trail length returns the whole trail, and
+    /// `limit=0` is a totals-only probe rather than an error.
+    #[tokio::test]
+    async fn attempts_limit_handles_the_range_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), 1, &Fixture::Normal);
+
+        let v = get_body(
+            tmp.path(),
+            "/api/v1/mining/attempts?solution_number=1&limit=999",
+        )
+        .await;
+        assert_eq!(at(&v, "/data/attempts").as_array().unwrap().len(), 2);
+        assert_eq!(at(&v, "/data/totals/attempt_count"), &json!(2));
+
+        let v = get_body(
+            tmp.path(),
+            "/api/v1/mining/attempts?solution_number=1&limit=0",
+        )
+        .await;
+        assert_eq!(at(&v, "/data/attempts").as_array().unwrap().len(), 0);
+        assert_eq!(at(&v, "/data/totals/attempt_count"), &json!(2));
+    }
+
+    /// QUI-1391: a trail where no row ever cleared the gate reports 0 rather
+    /// than the `i64::MAX` sentinel.
+    #[tokio::test]
+    async fn attempts_totals_never_report_the_energy_sentinel() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), 1, &Fixture::AllSentinel);
+
+        let v = get_body(
+            tmp.path(),
+            "/api/v1/mining/attempts?solution_number=1&limit=10",
+        )
+        .await;
+        assert_eq!(at(&v, "/data/totals/best_energy_milli"), &json!(-500));
+        assert_eq!(at(&v, "/data/totals/num_valid"), &Value::Null);
+    }
+
+    /// QUI-1391: a non-numeric limit is a 400, not a silent full trail.
+    #[tokio::test]
+    async fn attempts_reject_a_non_numeric_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), 1, &Fixture::Normal);
+        let resp = router(test_state(tmp.path()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/mining/attempts?solution_number=1&limit=abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(at(&v, "/code"), &json!("BAD_PARAM"));
+        assert_eq!(at(&v, "/success"), &json!(false));
     }
 
     /// C3: no response from any endpoint carries an unsafe integer, whatever
