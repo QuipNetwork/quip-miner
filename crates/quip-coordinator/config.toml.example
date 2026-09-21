@@ -48,7 +48,18 @@ binary = "quip-cuda-sa"       # or "quip-cuda-gibbs", "quip-cuda-msa"
 
 # Apple Silicon Metal miner. Default binary: quip-metal-sa.
 # [metal]
-# binary = "quip-metal-sa"    # or "quip-metal-gibbs"
+# binary = "quip-metal-sa"    # or "quip-metal-gibbs", "quip-metal-msa"
+#
+# Engine selection. Both keys default to true, so quip-metal-msa already uses
+# the Apple Neural Engine and Metal without either key. Set a key only to turn
+# an engine off.
+# enable_ane = true           # only quip-metal-msa has an ANE engine
+# enable_metal = true
+#
+# Two selections are invalid: both keys false, and enable_metal = false for
+# quip-metal-sa or quip-metal-gibbs, neither of which has an ANE engine. An
+# invalid selection closes admission, and the first affected job returns a
+# device fault, which can end the session.
 
 # D-Wave QPU miner (pip package, entry point quip-dwave-qa). No sa/gibbs split.
 # Every key other than the coordinator-owned ones passes through to the miner
