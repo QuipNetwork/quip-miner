@@ -7,6 +7,8 @@
 # by absolute path here. Unknown keys pass through to the miner as backend_toml.
 
 [miner]
+# Optional display name. Defaults to the miner account's SS58 address.
+# node_name = "quip-cpu"
 validators = ["ws://127.0.0.1:9944"]
 signer_key = "//Alice"
 # Host a peer uses to reach this node from outside the host. Required.

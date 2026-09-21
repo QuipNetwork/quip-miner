@@ -24,6 +24,7 @@ use quip_coordinator::runtime::{feeder_loop, run_runtime, FeederParams, RuntimeP
 use quip_coordinator::session::CoordinatorState;
 use quip_coordinator::supervisor::BackoffPolicy;
 use quip_proto::v1::{Configure, JobKind};
+use sp_core::crypto::{AccountId32, Ss58Codec};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -1766,7 +1767,7 @@ async fn feeder_files_descriptor_once_across_two_rounds() {
         .expect("feeder task panicked");
 }
 
-/// Missing `[miner].node_name` files nothing and still starts mining.
+/// Missing `[miner].node_name` files the SS58 address and starts mining.
 #[tokio::test]
 async fn feeder_reaches_mining_when_node_name_is_missing() {
     let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
@@ -1778,11 +1779,14 @@ async fn feeder_reaches_mining_when_node_name_is_missing() {
         .router
         .register_miner("cpu-0", ising_caps());
 
+    let mut params = named_feeder_params(1, 40);
+    params.descriptor.node_name = None;
+    params.miner_account = [0xab; 32];
     let (stop_tx, stop_rx) = watch::channel(false);
     let feeder = tokio::spawn(feeder_loop(
         Arc::clone(&chain),
         Arc::clone(&state),
-        feeder_params(1, 40),
+        params,
         stop_rx,
     ));
 
@@ -1790,14 +1794,21 @@ async fn feeder_reaches_mining_when_node_name_is_missing() {
         wait_generation(&state, 1).await,
         "missing node_name must not block mining"
     );
-    assert_eq!(chain.descriptor_calls(), 0);
+    let descriptors = chain.take_descriptors();
+    assert_eq!(descriptors.len(), 1);
+    let descriptor = descriptors.first().expect("one descriptor");
+    let name = std::str::from_utf8(&descriptor.node_name).expect("UTF-8 name");
+    assert_eq!(
+        AccountId32::from_ss58check(name).expect("SS58 address"),
+        AccountId32::from([0xab; 32])
+    );
     assert!(
         return_one_result(&state, 1).await,
         "first round never mined"
     );
     assert!(
         wait_participations(&chain, 1).await,
-        "a skipped descriptor must not stop participation"
+        "the default node name must not stop participation"
     );
 
     let _ = stop_tx.send(true);
