@@ -7,7 +7,7 @@
 # by absolute path here. Unknown keys pass through to the miner as backend_toml.
 
 [miner]
-# Optional display name. Defaults to the miner account ID as 64 lowercase hex characters.
+# Optional display name. Defaults to the miner account's SS58 address.
 # node_name = "quip-cpu"
 validators = ["ws://127.0.0.1:9944"]
 signer_key = "//Alice"

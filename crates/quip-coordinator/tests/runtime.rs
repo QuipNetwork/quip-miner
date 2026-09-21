@@ -24,6 +24,7 @@ use quip_coordinator::runtime::{feeder_loop, run_runtime, FeederParams, RuntimeP
 use quip_coordinator::session::CoordinatorState;
 use quip_coordinator::supervisor::BackoffPolicy;
 use quip_proto::v1::{Configure, JobKind};
+use sp_core::crypto::{AccountId32, Ss58Codec};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -1766,7 +1767,7 @@ async fn feeder_files_descriptor_once_across_two_rounds() {
         .expect("feeder task panicked");
 }
 
-/// Missing `[miner].node_name` files the account ID and starts mining.
+/// Missing `[miner].node_name` files the SS58 address and starts mining.
 #[tokio::test]
 async fn feeder_reaches_mining_when_node_name_is_missing() {
     let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
@@ -1796,7 +1797,11 @@ async fn feeder_reaches_mining_when_node_name_is_missing() {
     let descriptors = chain.take_descriptors();
     assert_eq!(descriptors.len(), 1);
     let descriptor = descriptors.first().expect("one descriptor");
-    assert_eq!(descriptor.node_name, "ab".repeat(32).into_bytes());
+    let name = std::str::from_utf8(&descriptor.node_name).expect("UTF-8 name");
+    assert_eq!(
+        AccountId32::from_ss58check(name).expect("SS58 address"),
+        AccountId32::from([0xab; 32])
+    );
     assert!(
         return_one_result(&state, 1).await,
         "first round never mined"

@@ -24,6 +24,7 @@ use crate::funding::{
     ensure_funded, BalanceSource, Faucet, FundingError, FundingParams, HttpFaucet,
 };
 use crate::round::{RoundEvent, RoundState};
+use sp_core::crypto::{AccountId32, Ss58Codec};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -263,7 +264,7 @@ pub fn node_id_from_account(account: &[u8; 32]) -> String {
     s
 }
 
-/// Build a V2 descriptor, defaulting a missing or blank name to the account hex.
+/// Build a V2 descriptor, defaulting a missing or blank name to the SS58 address.
 ///
 /// Returns `None` and warns if a field exceeds its bound or the miner plan is empty.
 /// Does not fail the walk.
@@ -276,7 +277,7 @@ pub(crate) fn build_descriptor_payload(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map_or_else(|| node_id_from_account(&account), str::to_string);
+        .map_or_else(|| AccountId32::from(account).to_ss58check(), str::to_string);
     if name.len() > MAX_NODE_NAME_BYTES {
         tracing::warn!(
             key = "node_name",
@@ -497,6 +498,7 @@ mod tests {
     use crate::config::DescriptorParams;
     use crate::funding::FundingParams;
     use crate::survey::{sanitize, RawGpu, RawSurvey};
+    use sp_core::crypto::{AccountId32, Ss58Codec};
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -876,7 +878,7 @@ token = "{SENTINEL}"
     }
 
     #[tokio::test]
-    async fn missing_or_blank_node_name_files_account_id_once() {
+    async fn missing_or_blank_node_name_files_ss58_address_once() {
         let account = [0xab; 32];
         for node_name in [None, Some(String::new()), Some(" \t\n".into())] {
             let params = DescriptorParams {
@@ -892,7 +894,11 @@ token = "{SENTINEL}"
             let descriptors = chain.take_descriptors();
             assert_eq!(descriptors.len(), 1);
             let descriptor = descriptors.first().expect("one descriptor");
-            assert_eq!(descriptor.node_name, "ab".repeat(32).into_bytes());
+            let name = std::str::from_utf8(&descriptor.node_name).expect("UTF-8 name");
+            assert_eq!(
+                AccountId32::from_ss58check(name).expect("SS58 address"),
+                AccountId32::from(account)
+            );
             assert_eq!(descriptor.node_id, b"custom-node-id");
         }
     }

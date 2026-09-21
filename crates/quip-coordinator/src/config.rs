@@ -118,7 +118,7 @@ pub struct CoordinatorConfig {
     /// Optional node id for `set_descriptor`. When absent the coordinator
     /// derives one from the miner account.
     pub node_id: Option<String>,
-    /// Display name for `set_descriptor`. Missing or blank uses the account hex.
+    /// Display name for `set_descriptor`. Missing or blank uses the SS58 address.
     pub node_name: Option<String>,
     /// Public host advertised in the descriptor. Required at parse.
     pub public_host: String,
@@ -223,7 +223,7 @@ pub fn participate_kind(launch: &[LaunchEntry]) -> MinerKind {
 pub struct DescriptorParams {
     /// Optional configured node id. When absent the account hex is used.
     pub node_id: Option<String>,
-    /// Display name. Missing or blank uses the account hex.
+    /// Display name. Missing or blank uses the SS58 address.
     pub node_name: Option<String>,
     /// Optional public host.
     pub public_host: Option<String>,

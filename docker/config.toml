@@ -7,7 +7,7 @@
 # /usr/local/bin). `binary` selects the sa vs chromatic-gibbs variant.
 
 [miner]
-# Optional display name. Defaults to the miner account ID as 64 lowercase hex characters.
+# Optional display name. Defaults to the miner account's SS58 address.
 # node_name = "quip-cpu"
 # Ordered chain endpoints; live-rotated on disconnect.
 validators = ["ws://quip-validator:9944", "ws://127.0.0.1:9944"]
