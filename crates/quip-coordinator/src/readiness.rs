@@ -263,26 +263,20 @@ pub fn node_id_from_account(account: &[u8; 32]) -> String {
     s
 }
 
-/// Build a V2 descriptor, or `None` when a required value is missing.
+/// Build a V2 descriptor, defaulting a missing or blank name to the account hex.
 ///
-/// Warns once and names the missing `[miner]` key. Does not fail the walk.
+/// Returns `None` and warns if a field exceeds its bound or the miner plan is empty.
+/// Does not fail the walk.
 pub(crate) fn build_descriptor_payload(
     params: &DescriptorParams,
     account: [u8; 32],
 ) -> Option<NodeDescriptorV2Input> {
-    let Some(name) = params
+    let name = params
         .node_name
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-    else {
-        tracing::warn!(
-            key = "node_name",
-            section = "miner",
-            "missing [miner].node_name; not filing a node descriptor"
-        );
-        return None;
-    };
+        .map_or_else(|| node_id_from_account(&account), str::to_string);
     if name.len() > MAX_NODE_NAME_BYTES {
         tracing::warn!(
             key = "node_name",
@@ -882,24 +876,37 @@ token = "{SENTINEL}"
     }
 
     #[tokio::test]
-    async fn missing_node_name_files_nothing_and_names_the_key() {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(Capture(Arc::clone(&buf)))
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let chain = FakeChain::new(snap(), None);
-        let filed = AtomicBool::new(false);
-        file_round_descriptor(&chain, &filed, &DescriptorParams::default(), account()).await;
-        assert_eq!(chain.descriptor_calls(), 0);
-        assert!(filed.load(Ordering::Relaxed));
-        let text = drain(&buf);
-        assert!(
-            text.contains("[miner].node_name"),
-            "must name the missing key, got {text:?}"
-        );
+    async fn missing_or_blank_node_name_files_account_id_once() {
+        let account = [0xab; 32];
+        for node_name in [None, Some(String::new()), Some(" \t\n".into())] {
+            let params = DescriptorParams {
+                node_name,
+                node_id: Some("custom-node-id".into()),
+                ..named_descriptor()
+            };
+            let chain = FakeChain::new(snap(), None);
+            let filed = AtomicBool::new(false);
+            file_round_descriptor(&chain, &filed, &params, account).await;
+            file_round_descriptor(&chain, &filed, &params, account).await;
+            assert!(filed.load(Ordering::Relaxed));
+            let descriptors = chain.take_descriptors();
+            assert_eq!(descriptors.len(), 1);
+            let descriptor = descriptors.first().expect("one descriptor");
+            assert_eq!(descriptor.node_name, "ab".repeat(32).into_bytes());
+            assert_eq!(descriptor.node_id, b"custom-node-id");
+        }
+    }
+
+    #[test]
+    fn explicit_node_name_is_trimmed_and_keeps_the_length_bound() {
+        let mut params = named_descriptor();
+        params.node_name = Some("  Tesla  ".into());
+        let payload = build_descriptor_payload(&params, account()).expect("payload");
+        assert_eq!(payload.node_name, b"Tesla");
+        params.node_name = Some("x".repeat(super::MAX_NODE_NAME_BYTES));
+        assert!(build_descriptor_payload(&params, account()).is_some());
+        params.node_name = Some("x".repeat(super::MAX_NODE_NAME_BYTES + 1));
+        assert!(build_descriptor_payload(&params, account()).is_none());
     }
 
     #[tokio::test]

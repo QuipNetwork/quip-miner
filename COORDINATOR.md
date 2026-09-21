@@ -299,7 +299,7 @@ Values come from `[miner]`:
 | Field | Config key | Default |
 | --- | --- | --- |
 | `node_id` | `[miner].node_id` | 64-char hex of the miner account |
-| `node_name` | `[miner].node_name` | none. Required to file. |
+| `node_name` | `[miner].node_name` | 64-char hex of the miner account |
 | `public_host` | `[miner].public_host` | required |
 | `public_port` | `[miner].public_port` | required |
 | `rpc_endpoints` | `[miner].validators` | the validator list the coordinator already reads |
@@ -321,8 +321,10 @@ missing key. It also rejects a blank host and a port of 0.
 host. In the reference deployment that is the public front door, not the
 validator peer port and not the dashboard port.
 
-If `[miner].node_name` is missing, the coordinator warns once and names that
-key. It does not file a descriptor. Mining still starts.
+If `[miner].node_name` is missing or blank, the node uses the miner account ID
+as its name. The name is 64 lowercase hex digits with no `0x` prefix.
+Set `node_name` to use your own name. A custom `node_id` does not change the
+default name.
 
 The pallet reserves `DescriptorDepositBase` plus
 `DescriptorDepositPerByte` times the payload length. The runtime sets those
