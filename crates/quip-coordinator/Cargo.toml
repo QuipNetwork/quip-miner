@@ -1,6 +1,6 @@
 [package]
 name = "quip-coordinator"
-version = "0.3.5-rc5"
+version = "0.3.5-rc6"
 edition = "2021"
 
 [[bin]]
