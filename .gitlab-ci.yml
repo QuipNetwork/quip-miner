@@ -121,6 +121,10 @@ verify-fetch-miners:
       out=$(DRY_RUN=1 TARGETOS=darwin TARGETARCH=arm64 MINER_SET=auto bash "$S")
       echo "$out"
       echo "$out" | grep -q 'quip-metal-sa-darwin-arm64'
+      # quip-miner-metal publishes an msa kernel. It must be selected, and it
+      # must be optional, so a Metal release without it cannot fail the run.
+      echo "$out" | grep -q 'would fetch (optional): quip-metal-msa-darwin-arm64' ||
+        { echo "ERROR: quip-metal-msa not selected as optional"; exit 1; }
       echo "$out" | grep -q 'quip-cpu-sa-darwin-arm64'
       echo "$out" | grep -q 'quip-dwave-qa-darwin-arm64'
       if echo "$out" | grep -q 'pip install'; then
@@ -421,10 +425,17 @@ bundle-darwin-arm64:
       # to its own latest release, so dwave being ahead of the others is fine.
       MINERS="quip-miner-cpu:quip-cpu-sa quip-miner-cpu:quip-cpu-gibbs quip-miner-metal:quip-metal-sa quip-miner-metal:quip-metal-gibbs quip-miner-dwave:quip-dwave-qa"
 
-      for pair in $MINERS; do
+      # Kernels a release may not carry yet. Mirrors the optional tier in
+      # fetch-miners.sh: an absent asset is skipped, so a Metal release cut
+      # without this kernel cannot fail a whole tag pipeline.
+      OPTIONAL_MINERS="quip-miner-metal:quip-metal-msa"
+
+      for pair in $MINERS $OPTIONAL_MINERS; do
         repo="${pair%%:*}"
         name="${pair##*:}"
         proj="quip.network%2F${repo}"
+        optional=0
+        case " $OPTIONAL_MINERS " in *" $pair "*) optional=1 ;; esac
         tag=$(curl --fail --silent --show-error \
           "${API}/projects/${proj}/releases?per_page=1" \
           | sed -n 's/.*"tag_name":"\([^"]*\)".*/\1/p' | head -n 1)
@@ -433,10 +444,22 @@ bundle-darwin-arm64:
           exit 1
         fi
         echo "bundling ${repo} ${tag} ${name}-darwin-arm64"
-        curl --fail --location --silent --show-error \
-          --output "${STAGE}/${name}" \
-          "${API}/projects/${proj}/packages/generic/${repo}/${tag}/${name}-darwin-arm64"
-        chmod +x "${STAGE}/${name}"
+        URL="${API}/projects/${proj}/packages/generic/${repo}/${tag}/${name}-darwin-arm64"
+        if [ "$optional" = 1 ]; then
+          # curl creates the output file before it reads the status line, so a
+          # miss would otherwise leave a zero-byte file the coordinator execs.
+          if curl --fail --location --silent --output "${STAGE}/${name}" "$URL"; then
+            chmod +x "${STAGE}/${name}"
+          else
+            rm -f "${STAGE}/${name}"
+            echo "note: ${name}-darwin-arm64 not in ${repo} ${tag}; skipping" >&2
+            continue
+          fi
+        else
+          curl --fail --location --silent --show-error \
+            --output "${STAGE}/${name}" "$URL"
+          chmod +x "${STAGE}/${name}"
+        fi
         echo "${repo} ${tag}" >> "${STAGE}/MANIFEST"
       done
 
