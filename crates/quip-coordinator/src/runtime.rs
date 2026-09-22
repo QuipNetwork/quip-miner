@@ -987,6 +987,11 @@ pub async fn feeder_loop<C>(
             // and emitted off-lock below. The completion pair is (window,
             // total): window is completions since the last heartbeat.
             let mut stats: Vec<(String, u64, u64, usize, usize)> = Vec::new();
+            // Probe screen: tell the sidecar which round to screen.
+            let screen_on = crate::screen::enabled();
+            if screen_on {
+                crate::screen::announce(generation, &snap, params.miner_identity);
+            }
             for id in st.router.miner_ids() {
                 let consumed_raw = st.router.take_consumed(&id);
                 let consumed = f64::from(consumed_raw);
@@ -1005,8 +1010,21 @@ pub async fn feeder_loop<C>(
                     params.buffer_depth,
                 ));
                 while st.router.staged_len(&id) < depth {
-                    salt_ctr = salt_ctr.saturating_add(1);
-                    let salt = salt_from_counter(salt_ctr);
+                    // Probe screen: the CUDA miner gets the deepest screened
+                    // salt; counter salts only as the configured fallback.
+                    let salt = if screen_on && id.starts_with("cuda") {
+                        match crate::screen::pop(generation) {
+                            Some(s) => s,
+                            None if crate::screen::fallback() => {
+                                salt_ctr = salt_ctr.saturating_add(1);
+                                salt_from_counter(salt_ctr)
+                            }
+                            None => break,
+                        }
+                    } else {
+                        salt_ctr = salt_ctr.saturating_add(1);
+                        salt_from_counter(salt_ctr)
+                    };
                     let job = match derive_pow_job(
                         &snap,
                         params.miner_identity,
