@@ -1998,10 +1998,19 @@ async fn feeder_holds_a_stashed_candidate_until_the_live_difficulty_admits_it() 
     assert!(armed, "feeder never reseeded the round");
     {
         let mut st = state.lock().await;
-        // A schedule that clears at step 0 makes the candidate due immediately,
-        // so the projection is never what withholds it.
+        // A flat model at i64::MAX clears every energy at elapsed 0, so the
+        // projection is never what withholds the candidate.
         let generation = st.generation;
-        st.stash.reset(generation, vec![i64::MAX], 0, 1);
+        st.stash.reset(
+            generation,
+            Some(quip_coordinator::decay::DecayModel {
+                base_max_energy_milli: i64::MAX,
+                curve: None,
+                epoch_length: 1,
+                algorithm: quip_coordinator::decay::DecayAlgorithm::Stepwise,
+            }),
+            0,
+        );
         assert!(
             st.stash.insert(due_candidate()),
             "candidate must be stashed"

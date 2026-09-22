@@ -92,9 +92,10 @@ pub fn ease_step(current: i64, curve: &EnergyCurve) -> i64 {
     current.saturating_add(g.min(room))
 }
 
-/// Apply `steps` EASIER steps to `base_max_energy_milli`.
+/// Apply `steps` EASIER steps of the runtime-117 rule to
+/// `base_max_energy_milli`: one [`ease_step`] per whole epoch elapsed.
 #[must_use]
-pub fn apply_decay(base_max_energy_milli: i64, steps: u64, curve: &EnergyCurve) -> i64 {
+pub fn ease_stepwise(base_max_energy_milli: i64, steps: u64, curve: &EnergyCurve) -> i64 {
     let mut cur = base_max_energy_milli;
     for _ in 0..steps {
         cur = ease_step(cur, curve);
@@ -185,64 +186,99 @@ pub fn ease_continuous(
     current.saturating_add((first + second).min(room))
 }
 
-/// Active `max_energy_milli` at `block_number`: base difficulty with per-epoch
-/// decay for blocks elapsed since the last winning proof. `last_proof_block == 0`
-/// (genesis) or `epoch_length == 0` disables decay, as does a `None` curve.
-#[must_use]
-pub fn current_max_energy(
-    block_number: u64,
-    base_max_energy_milli: i64,
-    last_proof_block: u64,
-    epoch_length: u64,
-    curve: Option<&EnergyCurve>,
-) -> i64 {
-    if last_proof_block == 0 || epoch_length == 0 {
-        return base_max_energy_milli;
+/// Which decay rule the connected runtime applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecayAlgorithm {
+    /// Runtime 117 and earlier: one 2.5% step per whole epoch.
+    Stepwise,
+    /// Runtime 118 and later: per-block closed form with overdue easing.
+    Continuous,
+}
+
+impl DecayAlgorithm {
+    /// The rule a runtime at `spec_version` applies.
+    #[must_use]
+    pub fn for_spec_version(spec_version: u32) -> Self {
+        if spec_version >= CONTINUOUS_DECAY_SPEC_VERSION {
+            Self::Continuous
+        } else {
+            Self::Stepwise
+        }
     }
-    let elapsed = block_number.saturating_sub(last_proof_block);
-    let steps = elapsed / epoch_length;
-    match curve {
-        Some(c) if steps > 0 => apply_decay(base_max_energy_milli, steps, c),
-        _ => base_max_energy_milli,
+
+    /// Lower-case name for logs and `attempts.json`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stepwise => "stepwise",
+            Self::Continuous => "continuous",
+        }
     }
 }
 
-/// `max_energy_milli` threshold at each decay step `0..=horizon` (inclusive),
-/// built incrementally. Monotonic non-decreasing (decay only eases upward). A
-/// `None` curve yields a flat schedule (decay disabled).
-#[must_use]
-pub fn build_decay_schedule(
-    base_max_energy_milli: i64,
-    curve: Option<&EnergyCurve>,
-    horizon: usize,
-) -> Vec<i64> {
-    let mut sched = Vec::with_capacity(horizon + 1);
-    sched.push(base_max_energy_milli);
-    match curve {
-        None => {
-            for _ in 0..horizon {
-                sched.push(base_max_energy_milli);
-            }
-        }
-        Some(c) => {
-            let mut cur = base_max_energy_milli;
-            for _ in 0..horizon {
-                cur = ease_step(cur, c);
-                sched.push(cur);
-            }
-        }
-    }
-    sched
+/// The inputs that fix the live threshold at every block of one round: the
+/// stored base difficulty, the curve, the epoch length, and the rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecayModel {
+    /// Base (un-decayed) `max_energy_milli` from `Difficulties[topology_hash]`.
+    pub base_max_energy_milli: i64,
+    /// Decay curve. `None` disables decay (genesis, or the curve read failed).
+    pub curve: Option<EnergyCurve>,
+    /// Blocks per decay epoch (`EpochLength`). Zero disables decay.
+    pub epoch_length: u64,
+    /// The rule the runtime applies, from its `spec_version`.
+    pub algorithm: DecayAlgorithm,
 }
 
-/// First step `s` where `schedule[s] > floor_energy_milli` (the strict
-/// `best_energy_milli < max_energy_milli` gate), or `None` if a candidate with
-/// that floor never clears within the schedule's horizon. `schedule` is
-/// monotonic non-decreasing, so this is a binary search (`bisect_right`).
-#[must_use]
-pub fn step_for_energy(schedule: &[i64], floor_energy_milli: i64) -> Option<usize> {
-    let i = schedule.partition_point(|&t| t <= floor_energy_milli);
-    (i < schedule.len()).then_some(i)
+impl DecayModel {
+    /// `max_energy_milli` `elapsed_blocks` after the last winning proof.
+    #[must_use]
+    pub fn threshold_at(&self, elapsed_blocks: u64) -> i64 {
+        let Some(curve) = self.curve.as_ref() else {
+            return self.base_max_energy_milli;
+        };
+        if self.epoch_length == 0 {
+            return self.base_max_energy_milli;
+        }
+        match self.algorithm {
+            DecayAlgorithm::Stepwise => ease_stepwise(
+                self.base_max_energy_milli,
+                elapsed_blocks / self.epoch_length,
+                curve,
+            ),
+            DecayAlgorithm::Continuous => ease_continuous(
+                self.base_max_energy_milli,
+                elapsed_blocks,
+                self.epoch_length,
+                curve,
+            ),
+        }
+    }
+
+    /// Blocks after the last proof at which the threshold first strictly
+    /// exceeds `energy_milli`, or `None` if it never does within
+    /// `horizon_blocks`. Binary search: both rules are monotone
+    /// non-decreasing in elapsed blocks.
+    #[must_use]
+    pub fn first_clearing_elapsed(&self, energy_milli: i64, horizon_blocks: u64) -> Option<u64> {
+        if self.threshold_at(0) > energy_milli {
+            return Some(0);
+        }
+        if self.threshold_at(horizon_blocks) <= energy_milli {
+            return None;
+        }
+        // Invariant: threshold_at(lo) <= energy < threshold_at(hi).
+        let (mut lo, mut hi) = (0_u64, horizon_blocks);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if self.threshold_at(mid) > energy_milli {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Some(hi)
+    }
 }
 
 /// One unit == this many milli (a value of 1000 milli is magnitude 1.0).
@@ -384,51 +420,110 @@ mod tests {
     }
 
     #[test]
-    fn apply_decay_matches_step_by_step() {
+    fn ease_stepwise_matches_step_by_step() {
         let c = curve();
-        assert_eq!(apply_decay(-50_000, 0, &c), -50_000);
-        assert_eq!(apply_decay(-50_000, 3, &c), -46_416);
+        assert_eq!(ease_stepwise(-50_000, 0, &c), -50_000);
+        assert_eq!(ease_stepwise(-50_000, 3, &c), -46_416);
     }
 
     #[test]
-    fn build_schedule_is_prefix_of_apply_decay() {
-        let c = curve();
-        let sched = build_decay_schedule(-50_000, Some(&c), 3);
-        assert_eq!(sched, vec![-50_000, -48_775, -47_581, -46_416]);
-        // None curve → flat schedule.
+    fn algorithm_follows_the_spec_version() {
         assert_eq!(
-            build_decay_schedule(-50_000, None, 3),
-            vec![-50_000, -50_000, -50_000, -50_000]
+            DecayAlgorithm::for_spec_version(117),
+            DecayAlgorithm::Stepwise
         );
+        assert_eq!(
+            DecayAlgorithm::for_spec_version(118),
+            DecayAlgorithm::Continuous
+        );
+        assert_eq!(
+            DecayAlgorithm::for_spec_version(119),
+            DecayAlgorithm::Continuous
+        );
+        assert_eq!(DecayAlgorithm::Stepwise.name(), "stepwise");
+        assert_eq!(DecayAlgorithm::Continuous.name(), "continuous");
+    }
+
+    fn stepwise_model() -> DecayModel {
+        DecayModel {
+            base_max_energy_milli: -50_000,
+            curve: Some(curve()),
+            epoch_length: 10,
+            algorithm: DecayAlgorithm::Stepwise,
+        }
     }
 
     #[test]
-    fn step_for_energy_finds_first_clearing_step() {
-        let sched = vec![-50_000, -48_775, -47_581, -46_416];
-        // A floor equal to the base clears at step 1 (strict >).
-        assert_eq!(step_for_energy(&sched, -50_000), Some(1));
-        // -48000 clears when the threshold first exceeds it → step 2.
-        assert_eq!(step_for_energy(&sched, -48_000), Some(2));
-        // A floor the schedule never exceeds within the horizon → None.
-        assert_eq!(step_for_energy(&sched, -1), None);
+    fn stepwise_model_holds_the_threshold_until_the_epoch_boundary() {
+        let m = stepwise_model();
+        // Steps: -50000, -48775, -47581, -46416 at blocks 0, 10, 20, 30.
+        assert_eq!(m.threshold_at(0), -50_000);
+        assert_eq!(m.threshold_at(9), -50_000);
+        assert_eq!(m.threshold_at(10), -48_775);
+        assert_eq!(m.threshold_at(29), -47_581);
+        assert_eq!(m.threshold_at(30), -46_416);
     }
 
     #[test]
-    fn current_max_energy_applies_epoch_decay() {
-        let c = curve();
-        // Genesis / no epoch → no decay.
-        assert_eq!(current_max_energy(1_000, -50_000, 0, 10, Some(&c)), -50_000);
-        assert_eq!(
-            current_max_energy(1_000, -50_000, 100, 0, Some(&c)),
-            -50_000
-        );
-        // elapsed 25, epoch 10 → 2 steps.
-        assert_eq!(
-            current_max_energy(125, -50_000, 100, 10, Some(&c)),
-            apply_decay(-50_000, 2, &c)
-        );
-        // No curve → base regardless of elapsed.
-        assert_eq!(current_max_energy(125, -50_000, 100, 10, None), -50_000);
+    fn stepwise_model_clears_on_epoch_boundaries() {
+        let m = stepwise_model();
+        // A floor equal to the base clears at the first step (strict >).
+        assert_eq!(m.first_clearing_elapsed(-50_000, 100), Some(10));
+        // -48000 clears when the threshold first exceeds it: step 2 → 20.
+        assert_eq!(m.first_clearing_elapsed(-48_000, 100), Some(20));
+        // Already below the base threshold → viable now.
+        assert_eq!(m.first_clearing_elapsed(-51_000, 100), Some(0));
+        // Above the easy cap → never.
+        assert_eq!(m.first_clearing_elapsed(-1, 100), None);
+        // Beyond the horizon → never, even if a later step would clear.
+        assert_eq!(m.first_clearing_elapsed(-48_000, 15), None);
+    }
+
+    #[test]
+    fn continuous_model_clears_inside_the_epoch() {
+        let m = DecayModel {
+            algorithm: DecayAlgorithm::Continuous,
+            ..stepwise_model()
+        };
+        let at = m
+            .first_clearing_elapsed(-49_500, 100)
+            .expect("the threshold passes -49500 inside the first epoch");
+        assert!(0 < at && at < 10, "cleared at {at}");
+        assert!(m.threshold_at(at) > -49_500);
+        assert!(m.threshold_at(at - 1) <= -49_500);
+    }
+
+    #[test]
+    fn continuous_model_is_earlier_than_stepwise_for_the_same_energy() {
+        let stepwise = stepwise_model();
+        let continuous = DecayModel {
+            algorithm: DecayAlgorithm::Continuous,
+            ..stepwise_model()
+        };
+        for energy in [-49_900, -49_000, -48_000, -46_500] {
+            let s = stepwise.first_clearing_elapsed(energy, 1_000);
+            let c = continuous.first_clearing_elapsed(energy, 1_000);
+            assert!(
+                c <= s,
+                "energy {energy}: continuous {c:?} vs stepwise {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_without_curve_or_epoch_never_decays() {
+        let flat = DecayModel {
+            curve: None,
+            ..stepwise_model()
+        };
+        assert_eq!(flat.threshold_at(1_000), -50_000);
+        assert_eq!(flat.first_clearing_elapsed(-50_000, 100), None);
+        assert_eq!(flat.first_clearing_elapsed(-50_001, 100), Some(0));
+        let no_epoch = DecayModel {
+            epoch_length: 0,
+            ..stepwise_model()
+        };
+        assert_eq!(no_epoch.threshold_at(1_000), -50_000);
     }
 
     #[test]

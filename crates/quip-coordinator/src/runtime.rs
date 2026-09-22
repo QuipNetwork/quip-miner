@@ -9,7 +9,7 @@
 use crate::chain::sync::{wait_until_synced, SyncOutcome, SyncSource};
 use crate::chain::{ChainClient, JobOrder, MiningSnapshot};
 use crate::config::{DescriptorParams, LaunchEntry};
-use crate::decay::{build_decay_schedule, EnergyCurve};
+use crate::decay::{DecayAlgorithm, DecayModel, EnergyCurve};
 use crate::funding::{ensure_funded, BalanceSource, Faucet};
 use crate::logging::LogLevel;
 use crate::pool_watch::PoolObservation;
@@ -125,10 +125,6 @@ const CONSUMPTION_EMA_ALPHA: f64 = 0.3;
 /// Staging headroom over smoothed consumption: keep ~2 poll-intervals of drain
 /// staged so a fast miner never idles waiting for the next top-up.
 const WINDOW_HEADROOM: f64 = 2.0;
-
-/// How many decay steps (epochs) ahead the win-time stash projects viability.
-/// A candidate needing more than this to clear is dropped as too far out.
-const DECAY_HORIZON_STEPS: usize = 256;
 
 /// Adaptive staging depth for one miner from its smoothed drain rate. The
 /// `buffer_depth` floor keeps a small reserve for idle/slow miners. `ema`
@@ -265,7 +261,7 @@ async fn stop_mining(coord: &Arc<Mutex<CoordinatorState>>, generation: u64) -> u
     let mut st = coord.lock().await;
     st.generation = generation;
     st.current_best_milli = None;
-    st.stash.reset(generation, Vec::new(), 0, 0);
+    st.stash.reset(generation, None, 0);
     let dropped = st.router.cancel(generation.saturating_sub(1));
     let _ = st.cancel_inflight(generation.saturating_sub(1));
     st.clear_salts();
@@ -813,7 +809,7 @@ pub async fn feeder_loop<C>(
                     },
                     Err(_) => None,
                 };
-                let (schedule, last_proof_block, epoch_length) = match &decay {
+                let (model, last_proof_block) = match &decay {
                     Some(dp) => {
                         let curve = EnergyCurve::from_topology(
                             snap.nodes.len() as u64,
@@ -825,16 +821,16 @@ pub async fn feeder_loop<C>(
                             &snap.allowed_j_milli,
                         );
                         (
-                            build_decay_schedule(
-                                dp.base_max_energy_milli,
-                                Some(&curve),
-                                DECAY_HORIZON_STEPS,
-                            ),
+                            Some(DecayModel {
+                                base_max_energy_milli: dp.base_max_energy_milli,
+                                curve: Some(curve),
+                                epoch_length: dp.epoch_length,
+                                algorithm: DecayAlgorithm::for_spec_version(snap.spec_version),
+                            }),
                             dp.last_proof_block,
-                            dp.epoch_length,
                         )
                     }
-                    None => (Vec::new(), 0, 0),
+                    None => (None, 0),
                 };
                 let topo_proto = topo.to_proto();
                 let target = target_from_snapshot(&snap);
@@ -867,8 +863,7 @@ pub async fn feeder_loop<C>(
                     st.qblock_id = qblock_id;
                     st.last_proof_block_hash =
                         crate::chain::extrinsic::hex_encode(&snap.last_proof_block_hash);
-                    st.stash
-                        .reset(generation, schedule, last_proof_block, epoch_length);
+                    st.stash.reset(generation, model, last_proof_block);
                 }
                 // Requirements before any new-generation Job: Topology and
                 // SetTarget go out on every reseed, even when the values match
