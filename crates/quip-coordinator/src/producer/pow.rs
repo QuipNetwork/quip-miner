@@ -89,6 +89,7 @@ mod tests {
             max_energy_milli: -14_000_000,
             min_diversity_milli: 200,
             block_number: 42,
+            spec_version: 117,
         }
     }
 

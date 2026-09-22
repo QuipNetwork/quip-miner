@@ -65,6 +65,7 @@ fn trivial_snapshot() -> MiningSnapshot {
         max_energy_milli: 0,
         min_diversity_milli: 0,
         block_number: 0,
+        spec_version: 117,
     }
 }
 
@@ -173,6 +174,7 @@ fn ising_snapshot() -> MiningSnapshot {
         max_energy_milli: i64::MAX / 2,
         min_diversity_milli: 0,
         block_number: 42,
+        spec_version: 117,
     }
 }
 

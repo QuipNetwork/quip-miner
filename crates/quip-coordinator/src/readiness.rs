@@ -519,6 +519,7 @@ mod tests {
             max_energy_milli: 0,
             min_diversity_milli: 0,
             block_number: 1,
+            spec_version: 117,
         }
     }
 

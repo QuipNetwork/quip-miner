@@ -73,6 +73,7 @@ fn loose_snapshot() -> MiningSnapshot {
         max_energy_milli: i64::MAX / 2, // energy ceiling (strict <)
         min_diversity_milli: 0,
         block_number: 42,
+        spec_version: 117,
     }
 }
 
