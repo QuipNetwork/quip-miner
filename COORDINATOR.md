@@ -424,9 +424,11 @@ mirrors the chain's rule so the projection needs no per-block RPC.
 
 The chain has shipped two rules. Runtime 117 steps the threshold once per
 100-block epoch by 2.5% of the room to the easy cap. Runtime 118
-(quip-validator !87) eases every block in closed form, and past 100 blocks
-in a round it eases at twice the baseline rate. `DecayAlgorithm` names the
-two. `DecayModel` holds the stored base difficulty, the curve, the epoch
+(quip-validator !87) eases every block in closed form. Past 100 blocks in a
+round it eases at twice the baseline rate. That doubling holds while the
+room to the easy cap exceeds the 40,000 milli floor crossover. Under the
+crossover both phases step 1,000 milli per epoch and the overdue term adds
+nothing. `DecayAlgorithm` names the two. `DecayModel` holds the stored base difficulty, the curve, the epoch
 length, and the rule, and answers the threshold at any elapsed block.
 
 `fetch_mining_snapshot` reads `state_getRuntimeVersion` at the snapshot

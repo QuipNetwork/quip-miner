@@ -23,7 +23,9 @@ pub const MIN_ENERGY_DELTA_MILLI: i64 = 1000;
 pub const TARGET_PROOF_BLOCKS: u64 = 100;
 /// Extra easing rate per epoch for overdue blocks
 /// (`OVERDUE_EASE_RATE_MILLI` in the pallet). Equal to `DECAY_RATE_MILLI`, so
-/// an overdue round eases at twice the baseline rate.
+/// in the geometric regime an overdue round eases at twice the baseline
+/// rate. Once the room is under the floor crossover both phases step
+/// `MIN_ENERGY_DELTA_MILLI` per epoch and the overdue term adds nothing.
 pub const OVERDUE_EASE_RATE_MILLI: i64 = 25;
 /// First runtime `spec_version` that decays per block (quip-validator !87).
 /// Earlier runtimes step once per whole epoch.
@@ -152,9 +154,12 @@ fn ease_room(room: i64, blocks: u64, epoch_length: u64, rate: f64) -> i64 {
 /// `curve.max_milli`. A degenerate curve, zero elapsed, or zero epoch is a
 /// no-op.
 ///
-/// Transcribed from the pallet's `ease_continuous`. Keep the expression
-/// order: `1.0 - baseline_retained` is not exactly `0.025` in f64, and the
-/// golden table pins the result.
+/// Transcribed from the pallet's `decay_phases`, which `ease_continuous`
+/// sums there. The pallet clamps the second phase to `room - first`; this
+/// clamps the sum to `room`, which is the same value because `ease_room`
+/// never returns more than its room. Keep the expression order:
+/// `1.0 - baseline_retained` is not exactly `0.025` in f64, and the golden
+/// table pins the result.
 #[must_use]
 pub fn ease_continuous(
     current: i64,
@@ -706,9 +711,11 @@ mod tests {
     )]
     fn ease_continuous_matches_the_stepwise_reference_at_every_epoch() {
         // The retired rule stepped once per epoch by max(round(room * rate),
-        // 1_000), clamped to the room. Inside the target the rate is the
+        // 1_000), clamped to the room: geometric while the step beat the
+        // floor, linear at the floor after. Inside the target the rate is the
         // baseline; past it, the combined baseline-plus-overdue rate. The
-        // closed form lands within one milli per epoch of that loop.
+        // closed form lands within one milli per epoch of that loop at every
+        // epoch boundary, through the floor crossover and on to the easy cap.
         let c = walkup_curve();
         let epoch = 100_u64;
         let target_epochs = TARGET_PROOF_BLOCKS / epoch;
@@ -736,7 +743,7 @@ mod tests {
             c.max_milli - 45_000,
             c.max_milli - 3_500,
         ] {
-            for epochs in [1_u64, 2, 5, 10, 25, 50, 100, 200] {
+            for epochs in 1_u64..=200 {
                 let closed = ease_continuous(start, epochs * epoch, epoch, &c);
                 let stepped = reference(start, epochs);
                 assert!(
