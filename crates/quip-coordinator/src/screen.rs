@@ -51,11 +51,19 @@ impl SaltQueue {
         self.heap.clear();
     }
 
-    /// Queue a salt reported for `generation`. Salts of another round, or past
-    /// the cap, are dropped. Returns whether it was queued.
+    /// Queue a salt reported for `generation`; salts of another round are
+    /// dropped. At the cap the queue keeps its deepest half, so a long round
+    /// still admits later, deeper salts. Returns whether it was queued.
     pub fn push(&mut self, generation: u64, salt: [u8; 32], energy: i64) -> bool {
-        if generation != self.generation || self.heap.len() >= QUEUE_CAP {
+        if generation != self.generation {
             return false;
+        }
+        if self.heap.len() >= QUEUE_CAP {
+            // Ascending by `Reverse(energy)` is shallowest first.
+            let mut kept = std::mem::take(&mut self.heap).into_sorted_vec();
+            kept.reverse();
+            kept.truncate(QUEUE_CAP / 2);
+            self.heap = kept.into_iter().collect();
         }
         self.heap.push((Reverse(energy), salt));
         true
@@ -339,6 +347,31 @@ mod tests {
         assert_eq!(q.pop(7), Some(([2; 32], -14_500)));
         assert_eq!(q.pop(7), Some(([1; 32], -14_400)));
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn a_full_queue_keeps_its_deepest_half_and_admits_new_salts() {
+        let mut q = SaltQueue::default();
+        q.reset(1);
+        for i in 0..QUEUE_CAP {
+            let e = -i64::try_from(i).unwrap_or(0);
+            assert!(q.push(1, [0; 32], e));
+        }
+        assert!(
+            q.push(1, [9; 32], -1_000_000),
+            "a deeper salt is admitted when full"
+        );
+        assert_eq!(q.len(), QUEUE_CAP / 2 + 1);
+        assert_eq!(q.pop(1), Some(([9; 32], -1_000_000)));
+        let shallowest_kept = -i64::try_from(QUEUE_CAP / 2).unwrap_or(0) + 1;
+        let mut last = i64::MIN;
+        while let Some((_, e)) = q.pop(1) {
+            assert!(
+                e >= last && e <= shallowest_kept,
+                "deepest half, served deepest first"
+            );
+            last = e;
+        }
     }
 
     #[test]
