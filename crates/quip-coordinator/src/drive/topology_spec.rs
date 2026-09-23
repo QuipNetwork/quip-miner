@@ -133,6 +133,7 @@ impl TopologySpec {
             max_energy_milli: self.max_energy_milli,
             min_diversity_milli: self.min_diversity_milli,
             block_number: 0,
+            spec_version: 0,
         }
     }
 }

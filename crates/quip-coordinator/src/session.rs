@@ -1116,6 +1116,7 @@ pub async fn serve_one_session_expecting(
             max_energy_milli: 0,
             min_diversity_milli: 0,
             block_number: 0,
+            spec_version: 117,
         },
         None,
     ));

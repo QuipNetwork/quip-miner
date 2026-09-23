@@ -33,6 +33,9 @@ pub struct MiningSnapshot {
     pub min_diversity_milli: u32,
     /// Chain block number the snapshot was taken at.
     pub block_number: u64,
+    /// Runtime `specVersion` at the snapshot block. Selects the decay rule
+    /// the coordinator mirrors (`DecayAlgorithm::for_spec_version`).
+    pub spec_version: u32,
 }
 
 /// Difficulty-decay parameters read alongside the snapshot (independent
@@ -150,6 +153,7 @@ mod tests {
             max_energy_milli: -14_000_000,
             min_diversity_milli: 200,
             block_number: 42,
+            spec_version: 117,
         }
     }
 
