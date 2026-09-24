@@ -1535,6 +1535,83 @@ async fn wait_participations(chain: &FakeChain, n: usize) -> bool {
     false
 }
 
+/// A real session with the lease-capable mock: the coordinator verifies a
+/// winning salt and submits it with the salt from inside the lease.
+#[tokio::test]
+async fn runtime_submits_a_verified_lease_winner() {
+    let miner = mock_miner();
+    let sock = format!("/tmp/quip-rt-lease-{}.sock", std::process::id());
+    let chain = Arc::new(FakeChain::new(ising_snapshot(), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let params = RuntimeParams {
+        max_submit_attempts: 5,
+        sock_path: sock,
+        grace_ms: 500,
+        backoff: BackoffPolicy::default(),
+        miner_identity: [0u8; 32],
+        miner_account: [0u8; 32],
+        buffer_depth: 1,
+        poll_interval_ms: 50,
+        dashboard: None,
+        log_level: quip_coordinator::logging::LogLevel::Info,
+        funding: quip_coordinator::funding::FundingParams::default(),
+        descriptor: quip_coordinator::config::DescriptorParams::default(),
+        descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        solver_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        identity: quip_coordinator::metrics::Identity::default(),
+    };
+    let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
+    let run = tokio::spawn(run_runtime(
+        vec![cpu_entry(miner)],
+        Arc::clone(&chain),
+        state,
+        params,
+        async move {
+            let _ = trigger_rx.await;
+        },
+    ));
+
+    let submitted = wait_for(|| !chain.submitted.lock().expect("submitted lock").is_empty()).await;
+    let participated = wait_participations(&chain, 1).await;
+
+    trigger_tx.send(()).expect("send shutdown trigger");
+    tokio::time::timeout(Duration::from_secs(6), run)
+        .await
+        .expect("run_runtime did not return after shutdown")
+        .expect("run_runtime task panicked")
+        .expect("run_runtime returned an error");
+
+    assert!(submitted, "no lease winner reached submit_proof");
+    assert!(participated, "a lease round must declare participation");
+    let proof = chain
+        .take_submitted()
+        .into_iter()
+        .next()
+        .expect("one proof");
+    assert_eq!(proof.salt.len(), 32);
+    let counter_bytes: [u8; 8] = proof
+        .salt
+        .get(..8)
+        .expect("8 salt counter bytes")
+        .try_into()
+        .expect("8 bytes");
+    let counter = u64::from_le_bytes(counter_bytes);
+    assert!(
+        counter >= 1,
+        "lease counters start after the feeder's first increment"
+    );
+    assert!(
+        proof
+            .salt
+            .get(8..)
+            .expect("base salt bytes")
+            .iter()
+            .all(|&b| b == 0),
+        "zero base salt"
+    );
+}
+
 /// Staging work is not participating. The declaration waits for a miner to
 /// return a Result for the round: a QPU that sits a round out by withholding
 /// credits (or any miner that is down) must not be recorded as a participant.
