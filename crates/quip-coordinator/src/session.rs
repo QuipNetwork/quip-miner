@@ -19,6 +19,7 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+use tokio_stream::StreamExt as _;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -415,25 +416,49 @@ pub struct CoordinatorService<C: ChainClient + 'static> {
     pub submit_notify: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
-#[tonic::async_trait]
-impl<C: ChainClient + 'static> MinerService for CoordinatorService<C> {
-    type SessionStream = ReceiverStream<Result<CoordMsg, Status>>;
-
-    async fn session(
+impl<C: ChainClient + 'static> CoordinatorService<C> {
+    /// Serve one miner session from raw frames. The first frame picks the
+    /// protocol, see [`crate::edge::classify`].
+    #[expect(
+        clippy::result_large_err,
+        reason = "tonic streams require Status errors"
+    )]
+    pub(crate) async fn session_frames(
         &self,
-        request: Request<Streaming<MinerMsg>>,
-    ) -> Result<Response<Self::SessionStream>, Status> {
-        let mut inbound = request.into_inner();
+        mut inbound: Streaming<bytes::Bytes>,
+    ) -> Result<Response<crate::edge::FrameStream>, Status> {
+        use prost::Message as _;
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("stream closed before Hello"))?;
+        let (peer, hello) = crate::edge::classify(&first);
         let (tx, rx) = mpsc::channel::<Result<CoordMsg, Status>>(64);
         let state = Arc::clone(&self.state);
         let chain = Arc::clone(&self.chain);
         let submit_notify = Arc::clone(&self.submit_notify);
-
+        let decode = match peer {
+            crate::edge::PeerProtocol::V1 => crate::edge::decode_v1,
+            crate::edge::PeerProtocol::V2 => crate::edge::decode_v2,
+        };
+        let rest = inbound.map(move |frame| frame.and_then(|b| decode(&b)));
+        let mut msgs = Box::pin(tokio_stream::once(hello).chain(rest));
         drop(tokio::spawn(async move {
-            run_session(&mut inbound, &tx, state, chain, submit_notify).await;
+            run_session(&mut msgs, &tx, state, chain, submit_notify, peer).await;
         }));
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let out = ReceiverStream::new(rx);
+        let frames: crate::edge::FrameStream = match peer {
+            crate::edge::PeerProtocol::V2 => {
+                Box::pin(out.map(|r| r.map(|m| bytes::Bytes::from(m.encode_to_vec()))))
+            }
+            crate::edge::PeerProtocol::V1 => Box::pin(out.filter_map(|r| match r {
+                Ok(m) => {
+                    crate::edge::v2_to_v1(m).map(|o| Ok(bytes::Bytes::from(o.encode_to_vec())))
+                }
+                Err(s) => Some(Err(s)),
+            })),
+        };
+        Ok(Response::new(frames))
     }
 }
 
@@ -774,17 +799,19 @@ pub(crate) fn handle_lease_done(
     reason = "session loop is one cohesive handshake + message dispatch"
 )]
 async fn run_session<C: ChainClient>(
-    inbound: &mut Streaming<MinerMsg>,
+    inbound: &mut (impl tokio_stream::Stream<Item = Result<MinerMsg, Status>> + Unpin),
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
     state: Arc<Mutex<CoordinatorState>>,
     chain: Arc<C>,
     submit_notify: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    peer: crate::edge::PeerProtocol,
 ) {
     // 1. Hello
-    let Ok(Some(MinerMsg {
+    let Some(Ok(MinerMsg {
         msg: Some(miner_msg::Msg::Hello(hello)),
-    })) = inbound.message().await
+    })) = inbound.next().await
     else {
+        tracing::warn!(protocol = ?peer, "miner handshake rejected; expected Hello");
         return;
     };
 
@@ -836,6 +863,7 @@ async fn run_session<C: ChainClient>(
         max_nodes = miner_caps.max_nodes,
         max_edges = miner_caps.max_edges,
         stream_width = miner_caps.stream_width,
+        protocol = ?peer,
         "miner registered"
     );
 
@@ -905,7 +933,7 @@ async fn run_session<C: ChainClient>(
 
     // 3. Message loop
     'session: loop {
-        let Ok(Some(msg)) = inbound.message().await else {
+        let Some(Ok(msg)) = inbound.next().await else {
             break;
         };
         match msg.msg {
@@ -1295,7 +1323,7 @@ pub async fn serve_one_session_expecting(
     };
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(MinerServiceServer::new(svc))
+            .add_service(crate::edge::DualMinerServer::new(svc))
             .serve_with_incoming(incoming)
             .await
     });

@@ -12,6 +12,8 @@ name = "quip_coordinator"
 path = "src/lib.rs"
 
 [dependencies]
+quip-proto-v1 = { package = "quip-proto", version = "=0.0.1" }
+bytes = "1"
 rayon = "1.10"
 quip-proto = "0.0.2-rc3"
 quip-protocol = "0.0.2-rc3"

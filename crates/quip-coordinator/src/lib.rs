@@ -7,6 +7,7 @@ pub mod config;
 pub mod dashboard;
 pub mod decay;
 pub mod drive;
+pub mod edge;
 pub mod funding;
 pub mod keygen;
 pub mod lease;

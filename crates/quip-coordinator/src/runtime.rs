@@ -23,7 +23,6 @@ use crate::session::{coord, CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
 use crate::topology::Topology;
 use crate::validate::QualityGates;
-use quip_proto::v1::miner_service_server::MinerServiceServer;
 use quip_proto::v1::{coord_msg, SetTarget};
 use std::collections::HashMap;
 use std::future::Future;
@@ -1370,7 +1369,7 @@ where
     };
     let server = tokio::spawn(
         Server::builder()
-            .add_service(MinerServiceServer::new(svc))
+            .add_service(crate::edge::DualMinerServer::new(svc))
             .serve_with_incoming(incoming),
     );
 
