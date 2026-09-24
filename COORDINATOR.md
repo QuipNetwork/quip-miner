@@ -246,6 +246,21 @@ When `last_proof_block_hash` changes, the feeder drives the round state
 machine. Startup drives the same machine. Mining is the last state. A new
 qblock head in any state returns the machine to the first state.
 
+### Probe screen (optional)
+
+With `QUIP_SCREEN_BIN` pointing at `quip-screen` (quip-miner-cuda), the feeder
+starts it as a sidecar on the first poll. It writes the snapshot's topology to
+`$TMPDIR/quip-screen-<hash>.json`, passes `--spec` and `QUIP_SCREEN_ARGS`, and
+sends `R <generation> <prev hash> <identity>` on every round change. The
+sidecar probes fresh salts with the same `derive_nonce` and prints the deepest
+as `K <generation> <salt> <energy>`. When topping up a `cuda*` miner, the
+feeder pops the deepest queued salt of the current generation and derives the
+job from it with `derive_pow_job`, so validation, stash and submission do not
+change. With the queue empty it stages nothing for that miner, which leaves the
+GPU to the screen; `QUIP_SCREEN_FALLBACK=1` tops it up with counter salts
+instead. If the sidecar exits, the feeder uses counter salts. A topology change
+restarts the sidecar with a new spec. Module: `screen.rs`.
+
 ### Round state machine
 
 The states, in order:
