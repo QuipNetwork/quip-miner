@@ -453,12 +453,12 @@ classifies the first frame, then decodes and encodes messages with that
 protocol's schema. The edge translates v1 frames to the coordinator's v2
 messages and translates supported v2 responses back to v1.
 
-| v1 message or field | v2 form |
+| Message | Translation at the edge |
 |---|---|
-| `Hello` identity and capabilities | `Hello` with v2 capabilities |
-| `Result` spin bytes | Packed spin bytes in a v2 `Result` |
-| Plain `I32` problems at scale 1000 | v1 `Job` with little-endian milli coefficients |
-| Lease jobs or other encodings | No v1 form, so the router does not send them to v1 miners |
+| v1 `Hello` in | v2 `Hello` with v2 capabilities |
+| v1 `Result` spin bytes in | Packed spins in a v2 `Result` |
+| v2 plain `I32` job at scale 1000 out | v1 `Job` with little-endian milli coefficients |
+| v2 lease or other encoding out | No v1 form. The router does not send it to v1 miners |
 
 The edge reports a v1 peer as protocol v2 to the session handler after
 translation. Remove the edge and its v1 dependency after every miner repository

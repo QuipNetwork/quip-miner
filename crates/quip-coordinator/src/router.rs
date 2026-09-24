@@ -485,11 +485,9 @@ mod tests {
             kind: kind as i32,
             generation,
             deadline_ms: 9_999_999,
-            ising: Some({
-                let mut problem = crate::producer::problem::milli_problem(None, &[0; 2], &[0; 1]);
-                problem.num_reads = 0;
-                problem
-            }),
+            ising: Some(crate::producer::problem::milli_problem(
+                None, &[0; 2], &[0; 1],
+            )),
             provenance: Some(Provenance {
                 is_pow: generation != 0,
                 order_id: vec![],

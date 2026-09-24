@@ -2003,11 +2003,9 @@ mod tests {
             kind: JobKind::IsingSample as i32,
             generation: 1,
             deadline_ms: 0,
-            ising: Some({
-                let mut problem = crate::producer::problem::milli_problem(None, &[0; 2], &[0; 1]);
-                problem.num_reads = 0;
-                problem
-            }),
+            ising: Some(crate::producer::problem::milli_problem(
+                None, &[0; 2], &[0; 1],
+            )),
             provenance: Some(Provenance {
                 is_pow: true,
                 order_id: vec![],

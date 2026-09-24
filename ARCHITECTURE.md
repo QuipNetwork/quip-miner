@@ -112,8 +112,8 @@ of the target design still differs from the source:
 
 `quip-solver-core` carries no chain or consensus logic. A lease miner draws
 problems from the chain-derived nonce in its generator specification, but it
-still cannot reach the node. It uses `quip-protocol` for wire, session, and
-lease primitives. A miner cannot reach the node, directly or transitively. It
+uses `quip-protocol` for wire, session, and lease primitives. A miner cannot
+directly or transitively reach the node. It
 receives an Ising problem and samples it. It returns spins with energies. This
 isolation is why the contract could move to its own repository: the solver side
 depends on the chain through nothing but the wire.

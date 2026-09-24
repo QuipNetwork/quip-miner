@@ -2,6 +2,8 @@
 //! protocol v2 rollout. Remove it, and the `quip-proto-v1` dependency, once
 //! the newest release of every miner repository speaks v2.
 
+use crate::chain::ChainClient;
+use crate::session::CoordinatorService;
 use bytes::{Buf, BufMut, Bytes};
 use prost::Message;
 use quip_proto::v1::{
@@ -11,6 +13,12 @@ use quip_proto::v1::{
 use quip_proto_v1::v1 as old;
 use quip_protocol::session::{algorithm_from_name, backend_from_name, PROTOCOL_VERSION};
 use quip_protocol::wire::{decode_spins, encode_spins_packed};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio_stream::Stream;
+use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::codegen::{empty_body, http, Body, BoxFuture, StdError};
 use tonic::Status;
 
 /// Protocol a miner speaks on the wire.
@@ -213,15 +221,6 @@ fn job_to_v1(job: quip_proto::v1::Job) -> Option<old::Job> {
         provenance: job.provenance.as_ref().and_then(recode),
     })
 }
-
-use crate::chain::ChainClient;
-use crate::session::CoordinatorService;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use tokio_stream::Stream;
-use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
-use tonic::codegen::{empty_body, http, Body, BoxFuture, StdError};
 
 /// gRPC path both protocol versions dial.
 const SESSION_PATH: &str = "/quip.v1.MinerService/Session";
