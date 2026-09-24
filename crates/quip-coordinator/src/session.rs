@@ -147,6 +147,10 @@ pub struct CoordinatorState {
     pub configure: HashMap<String, Configure>,
     /// Active graph topology advertised to miners, if any.
     pub topology: Option<Topology>,
+    /// Dense-position view of `topology` that lease verification draws on.
+    /// Built once in [`CoordinatorState::set_topology`]. `None` without a
+    /// topology or when the topology cannot map its edges.
+    pub lease_topology: Option<Arc<quip_protocol::lease::TopologyView>>,
     /// Position-indexed scoring form of `topology`, resolved once via
     /// [`CoordinatorState::set_topology`]. A run constant every result borrows
     /// by `Arc`, so the graph is never rebuilt per result.
@@ -227,6 +231,7 @@ impl CoordinatorState {
             expected_tokens: HashMap::new(),
             configure: HashMap::new(),
             topology: None,
+            lease_topology: None,
             resolved_topo: Arc::new(ResolvedTopo::default()),
             target: None,
             router: Router::new(),
@@ -256,6 +261,12 @@ impl CoordinatorState {
     /// once. Both drive and production go through here so `validate_result`
     /// never rebuilds the graph per result.
     pub fn set_topology(&mut self, topology: Option<Topology>) {
+        self.lease_topology = topology.as_ref().and_then(|t| {
+            quip_protocol::lease::TopologyView::from_proto(&t.to_proto())
+                .map_err(|e| tracing::error!(error = ?e, "topology cannot back lease verification"))
+                .ok()
+                .map(Arc::new)
+        });
         self.resolved_topo = Arc::new(
             topology
                 .as_ref()
@@ -645,6 +656,119 @@ pub(crate) async fn settle_pow_result<C: ChainClient>(
     }
 }
 
+/// Verify one lease winner and settle it like a plain proof-of-work result.
+///
+/// The lease stays in flight: only `LeaseDone` completes it. A result for an
+/// unknown or cancelled lease, a result that fails verification, and a result
+/// that arrives before a target exists are dropped with a log line.
+pub(crate) async fn handle_lease_result<C: ChainClient>(
+    chain: &C,
+    state: &Arc<Mutex<CoordinatorState>>,
+    submit_notify: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    miner_id: &str,
+    result: quip_proto::v1::Result,
+) {
+    let (job, view, target, best) = {
+        let st = state.lock().await;
+        st.metrics.record_result_received(miner_id);
+        let job = st.inflight.get(&result.job_id).cloned();
+        if job.is_none() {
+            st.metrics.record_duplicate_result_drop(miner_id);
+        }
+        (
+            job,
+            st.lease_topology.clone(),
+            st.target,
+            st.current_best_milli,
+        )
+    };
+    let Some(job) = job else { return };
+    let (Some(generator), Some(view), Some(target)) = (job.generator.as_ref(), view, target) else {
+        tracing::warn!(miner = %miner_id, "lease result before topology or target; dropping");
+        return;
+    };
+    let wire_target = quip_protocol::target::Target::from_proto(&target);
+    let verified = match quip_protocol::lease::verify_lease_result(
+        generator,
+        &view,
+        &wire_target,
+        &result,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(miner = %miner_id, error = %e, "lease result failed verification; dropping");
+            return;
+        }
+    };
+    state.lock().await.note_result(job.generation);
+    // Verification decoded these rows already, so a decode failure here is
+    // unreachable. `filter_map` keeps the order of the proof.
+    let rows: Vec<crate::validate::SpinRow> = result
+        .solutions
+        .iter()
+        .filter_map(|s| {
+            quip_protocol::wire::decode_spins_packed(&s.spins, view.num_nodes)
+                .ok()
+                .map(|spins| crate::validate::SpinRow {
+                    spins,
+                    energy_milli: s.energy_milli,
+                })
+        })
+        .collect();
+    let stats = verified.stats;
+    let validated = crate::validate::Validated {
+        best_energy_milli: stats.best_energy_milli,
+        diversity_milli: stats.diversity_milli,
+        n_valid: stats.valid_solution_count,
+        accepted: true,
+        selected_solutions: rows.clone(),
+        raw_best_energy_milli: stats.best_energy_milli,
+        stash_solutions: rows,
+    };
+    settle_pow_result(
+        chain,
+        state,
+        submit_notify,
+        PowOutcome {
+            miner_id,
+            job: &job,
+            job_id: &verified.nonce,
+            salt: Some(verified.salt),
+            validated,
+            gates: crate::validate::gates_from_target(Some(&target)),
+            current_best_milli: best,
+            device_access_time_us: result.meta.as_ref().map_or(0, |m| m.device_access_time_us),
+        },
+    )
+    .await;
+}
+
+/// Complete a lease. Its salts count toward the miner's rate even when the
+/// lease was cancelled, and a lease that finished salts in the current round
+/// counts as mining, the same as a `Result`.
+pub(crate) fn handle_lease_done(
+    st: &mut CoordinatorState,
+    miner_id: &str,
+    done: &quip_proto::v1::LeaseDone,
+) {
+    st.router.record_lease_salts(miner_id, done.salts_done);
+    match st.complete_inflight(&done.job_id) {
+        Some(job) => {
+            st.router.record_completion(miner_id);
+            if done.salts_done > 0 {
+                st.note_result(job.generation);
+            }
+        }
+        None => st.metrics.record_duplicate_result_drop(miner_id),
+    }
+    tracing::debug!(
+        miner = %miner_id,
+        salts_done = done.salts_done,
+        best_energy = %crate::logging::display_energy((done.best_energy_milli != i64::MAX).then_some(done.best_energy_milli)),
+        "lease done"
+    );
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "session loop is one cohesive handshake + message dispatch"
@@ -802,6 +926,17 @@ async fn run_session<C: ChainClient>(
                 }
             }
             Some(miner_msg::Msg::Result(result)) => {
+                let is_lease = state
+                    .lock()
+                    .await
+                    .inflight
+                    .get(&result.job_id)
+                    .is_some_and(crate::lease::is_lease);
+                if is_lease {
+                    handle_lease_result(chain.as_ref(), &state, &submit_notify, &miner_id, result)
+                        .await;
+                    continue 'session;
+                }
                 let (job, salt, topo, best, gates, generation) = {
                     let mut st = state.lock().await;
                     st.metrics.record_result_received(&miner_id);
@@ -925,11 +1060,9 @@ async fn run_session<C: ChainClient>(
                     "miner advertised capabilities; ignored (no capability routing)"
                 );
             }
-            Some(miner_msg::Msg::LeaseDone(_)) => {
-                tracing::debug!(
-                    miner = %miner_id,
-                    "lease completion ignored; lease jobs are not enabled"
-                );
+            Some(miner_msg::Msg::LeaseDone(done)) => {
+                let mut st = state.lock().await;
+                handle_lease_done(&mut st, &miner_id, &done);
             }
             // An empty `msg` is a message this build cannot name: either a
             // field number the miner uses and this coordinator does not, or the
@@ -1606,8 +1739,196 @@ pub fn shutdown_msg(grace_ms: u32) -> CoordMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::FakeChain;
     use crate::router::MinerCaps;
-    use quip_proto::v1::{Job, JobKind, Provenance};
+    use quip_proto::v1::{
+        Job, JobKind, LeaseDone, Provenance, Result as WireResult, SetTarget, Solution,
+    };
+    use quip_protocol::lease::{LeaseSpec, TopologyView};
+
+    fn lease_snapshot() -> crate::chain::snapshot::MiningSnapshot {
+        let nodes = vec![0, 1, 2, 3];
+        let edges = vec![(0, 1), (1, 2), (2, 3), (0, 3)];
+        let (h, j, spin) = (vec![-1000, 0, 1000], vec![-1000, 1000], vec![-1000, 1000]);
+        crate::chain::snapshot::MiningSnapshot {
+            head_hash: [0; 32],
+            last_proof_block_hash: [7; 32],
+            topology_hash: crate::topology::topology_hash_sets(&nodes, &edges, &h, &j, &spin)
+                .to_vec(),
+            nodes,
+            edges,
+            allowed_h_milli: h,
+            allowed_j_milli: j,
+            allowed_spin_milli: spin,
+            min_solutions: 1,
+            max_energy_milli: i64::MAX / 2,
+            min_diversity_milli: 0,
+            block_number: 42,
+        }
+    }
+
+    /// State with one live lease of generation 1, its topology, and a target.
+    fn lease_state() -> (CoordinatorState, Job) {
+        let snap = lease_snapshot();
+        let mut st = CoordinatorState::new();
+        st.router.register_miner("m", MinerCaps::default());
+        st.generation = 1;
+        st.set_topology(Some(Topology::from_nodes_edges(
+            snap.nodes.clone(),
+            snap.edges.clone(),
+            &snap.allowed_h_milli,
+            &snap.allowed_j_milli,
+            &snap.allowed_spin_milli,
+        )));
+        st.target = Some(SetTarget {
+            max_energy_milli: i64::MAX / 2,
+            min_solutions: 1,
+            min_diversity_milli: 0,
+            max_proof_solutions: 32,
+            ..Default::default()
+        });
+        let job = crate::lease::build_lease_job(&snap, [1; 32], 100, 4, 1);
+        st.dispatch_inflight("m", job.clone());
+        (st, job)
+    }
+
+    /// All-+1 winner for salt index `i` of `job`, scored on the drawn problem.
+    fn winner(job: &Job, i: u64) -> WireResult {
+        let spec = LeaseSpec::from_proto(job.generator.as_ref().unwrap()).unwrap();
+        let snap = lease_snapshot();
+        let view = TopologyView {
+            num_nodes: snap.nodes.len(),
+            edges: snap
+                .edges
+                .iter()
+                .map(|&(u, v)| (u as usize, v as usize))
+                .collect(),
+            allowed_h_milli: snap.allowed_h_milli.clone(),
+            allowed_j_milli: snap.allowed_j_milli.clone(),
+        };
+        let nonce = spec.nonce(i).unwrap();
+        let (h, j) = view.draw(nonce).unwrap();
+        let spins = vec![1i8; view.num_nodes];
+        let energy = quip_protocol::scoring::energy_from_milli(&spins, &h, &j, &view.edges);
+        WireResult {
+            job_id: job.job_id.clone(),
+            solutions: vec![Solution {
+                spins: quip_protocol::wire::encode_spins_packed(&spins),
+                energy_milli: energy,
+            }],
+            meta: None,
+            salt: spec.salt(i).unwrap().to_vec(),
+            nonce: nonce.to_vec(),
+        }
+    }
+
+    fn notify() -> Arc<Mutex<Option<oneshot::Sender<()>>>> {
+        Arc::new(Mutex::new(None))
+    }
+
+    #[tokio::test]
+    async fn verified_lease_winner_is_submitted_with_its_salt() {
+        let (st, job) = lease_state();
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        let r = winner(&job, 2);
+        handle_lease_result(&chain, &state, &notify(), "m", r.clone()).await;
+        let submitted = chain.take_submitted();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted.first().map(|proof| &proof.salt), Some(&r.salt));
+        assert_eq!(
+            submitted.first().map(|proof| &proof.job_id),
+            Some(&r.nonce),
+            "attempt id is the nonce"
+        );
+        assert!(
+            state.lock().await.inflight.contains_key(&job.job_id),
+            "a lease stays live until LeaseDone"
+        );
+        assert!(state.lock().await.round_mined());
+    }
+
+    #[tokio::test]
+    async fn lease_result_with_a_wrong_energy_is_not_submitted() {
+        let (st, job) = lease_state();
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        let mut r = winner(&job, 0);
+        r.solutions
+            .iter_mut()
+            .for_each(|solution| solution.energy_milli -= 1);
+        handle_lease_result(&chain, &state, &notify(), "m", r).await;
+        assert!(chain.take_submitted().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_result_after_cancel_is_dropped() {
+        let (mut st, job) = lease_state();
+        let _ = st.cancel_inflight(1);
+        st.generation = 2;
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        handle_lease_result(&chain, &state, &notify(), "m", winner(&job, 1)).await;
+        assert!(chain.take_submitted().is_empty());
+        let mut st = state.lock().await;
+        handle_lease_done(
+            &mut st,
+            "m",
+            &LeaseDone {
+                job_id: job.job_id,
+                salts_done: 3,
+                best_energy_milli: 0,
+            },
+        );
+        assert_eq!(
+            st.router.take_lease_salts("m"),
+            3,
+            "cancelled salts still count toward the rate"
+        );
+        assert!(!st.round_mined());
+    }
+
+    #[tokio::test]
+    async fn lease_result_without_target_is_dropped() {
+        let (mut st, job) = lease_state();
+        st.target = None;
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        handle_lease_result(&chain, &state, &notify(), "m", winner(&job, 0)).await;
+        assert!(chain.take_submitted().is_empty());
+    }
+
+    #[test]
+    fn lease_done_with_salts_marks_the_round_mined() {
+        let (mut st, job) = lease_state();
+        handle_lease_done(
+            &mut st,
+            "m",
+            &LeaseDone {
+                job_id: job.job_id.clone(),
+                salts_done: 4,
+                best_energy_milli: -5,
+            },
+        );
+        assert!(st.round_mined());
+        assert!(!st.inflight.contains_key(&job.job_id));
+        assert_eq!(st.router.take_lease_salts("m"), 4);
+    }
+
+    #[test]
+    fn lease_done_with_no_salts_does_not_mark_the_round() {
+        let (mut st, job) = lease_state();
+        handle_lease_done(
+            &mut st,
+            "m",
+            &LeaseDone {
+                job_id: job.job_id,
+                salts_done: 0,
+                best_energy_milli: i64::MAX,
+            },
+        );
+        assert!(!st.round_mined());
+    }
 
     #[test]
     fn reclaimed_lease_restages_with_same_range() {
