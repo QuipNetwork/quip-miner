@@ -623,6 +623,7 @@ fn set_target_from_spec(
         .target_energy
         .map_or(spec.max_energy_milli, energy_to_milli);
     quip_proto::v1::SetTarget {
+        max_proof_solutions: quip_coordinator::validate::MAX_PROOF_SOLUTIONS_WIRE,
         max_energy_milli,
         min_solutions: args.min_solutions.unwrap_or(spec.min_solutions),
         min_diversity_milli: spec.min_diversity_milli,

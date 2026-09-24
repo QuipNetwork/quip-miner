@@ -1,10 +1,10 @@
 //! Derive `PoW` [`Job`]s from mining snapshots via golden-pinned `ChaCha8` + `derive_nonce`.
 
 use crate::chain::snapshot::MiningSnapshot;
-use quip_proto::v1::{ising_problem, IsingProblem, Job, JobKind, Provenance};
+use crate::producer::problem::milli_problem;
+use quip_proto::v1::{ising_problem, Job, JobKind, Provenance};
 use quip_protocol::chacha8::{draw_ising_milli, DrawError};
 use quip_protocol::derive::derive_nonce;
-use quip_protocol::wire::encode_i32_le;
 
 /// Build an `ISING_SAMPLE` `PoW` job from a snapshot, miner account, and salt.
 ///
@@ -52,16 +52,14 @@ pub fn build_ising_job_from_nonce(
         kind: JobKind::IsingSample as i32,
         generation,
         deadline_ms,
-        ising: Some(IsingProblem {
-            graph: Some(ising_problem::Graph::TopologyHash(
+        ising: Some(milli_problem(
+            Some(ising_problem::Graph::TopologyHash(
                 snap.topology_hash.clone(),
             )),
-            h_milli_le32: encode_i32_le(&h),
-            j_milli_le32: encode_i32_le(&j),
-            num_reads: 0,
-            num_sweeps: 0,
-            anneal_time_us: 0,
-        }),
+            &h,
+            &j,
+        )),
+        generator: None,
         provenance: Some(Provenance {
             is_pow: true,
             order_id: vec![],
@@ -72,8 +70,8 @@ pub fn build_ising_job_from_nonce(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::producer::problem::problem_milli;
     use quip_proto::v1::{ising_problem, JobKind};
-    use quip_protocol::wire::decode_i32_le;
 
     fn fixture() -> MiningSnapshot {
         MiningSnapshot {
@@ -104,8 +102,7 @@ mod tests {
             ising.graph,
             Some(ising_problem::Graph::TopologyHash(_))
         ));
-        let h = decode_i32_le(&ising.h_milli_le32).unwrap();
-        let j = decode_i32_le(&ising.j_milli_le32).unwrap();
+        let (h, j) = problem_milli(&ising).unwrap();
         assert_eq!(h.len(), 4);
         assert_eq!(j.len(), 4);
         assert!(h.iter().all(|v| [-1000, 0, 1000].contains(v)));
@@ -117,6 +114,9 @@ mod tests {
         let snap = fixture();
         let a = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 1, 1).unwrap();
         let b = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 1, 1).unwrap();
-        assert_eq!(a.ising.unwrap().h_milli_le32, b.ising.unwrap().h_milli_le32);
+        assert_eq!(
+            problem_milli(a.ising.as_ref().unwrap()).unwrap(),
+            problem_milli(b.ising.as_ref().unwrap()).unwrap()
+        );
     }
 }

@@ -183,6 +183,7 @@ fn ising_caps() -> MinerCaps {
         supported_kinds: vec![JobKind::IsingSample as i32],
         max_nodes: 0,
         max_edges: 0,
+        ..MinerCaps::default()
     }
 }
 
@@ -1923,27 +1924,21 @@ fn gated_snapshot(max_energy_milli: i64) -> MiningSnapshot {
     snap
 }
 
-/// Wire spin bytes: `+1 -> 0x01`, `-1 -> 0xFF`.
-fn spin_bytes(spins: &[i8]) -> Vec<u8> {
-    spins
-        .iter()
-        .map(|&s| if s > 0 { 0x01 } else { 0xFF })
-        .collect()
-}
-
 /// Three mutually distant rows, each pair at symmetric Hamming distance 2 of 4
 /// spins, so any two score 500 milli and all three score 500 milli.
-fn distant_rows() -> Vec<quip_proto::v1::Solution> {
+fn distant_rows() -> Vec<quip_coordinator::validate::SpinRow> {
     [
         (vec![1, 1, 1, 1], -3000),
         (vec![1, 1, -1, -1], -2000),
         (vec![1, -1, 1, -1], -1000),
     ]
     .into_iter()
-    .map(|(spins, energy_milli)| quip_proto::v1::Solution {
-        spins_bytes: spin_bytes(&spins),
-        energy_milli,
-    })
+    .map(
+        |(spins, energy_milli)| quip_coordinator::validate::SpinRow {
+            spins,
+            energy_milli,
+        },
+    )
     .collect()
 }
 

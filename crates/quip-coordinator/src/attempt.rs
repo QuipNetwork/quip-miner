@@ -272,6 +272,7 @@ mod tests {
     fn rec(qblock_id: Option<u64>, job_id: &[u8], is_pow: bool) -> AttemptRecord {
         let job = Job {
             job_id: job_id.to_vec(),
+            generator: None,
             generation: 7,
             provenance: Some(Provenance {
                 is_pow,

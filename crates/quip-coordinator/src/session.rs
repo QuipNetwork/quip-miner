@@ -9,6 +9,7 @@ use crate::topology::Topology;
 use crate::validate::{beats_current, validate_result, ResolvedTopo};
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, Shutdown, Welcome};
+use quip_protocol::session::{backend_name, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -445,6 +446,7 @@ async fn run_session<C: ChainClient>(
     };
 
     let miner_id = hello.miner_id.clone();
+    let caps = hello.capabilities.clone().unwrap_or_default();
     let (token_ok, protocol_ok, configure) = {
         let st = state.lock().await;
         let expected = st
@@ -453,7 +455,7 @@ async fn run_session<C: ChainClient>(
             .cloned()
             .unwrap_or_default();
         let token_ok = !expected.is_empty() && hello.session_token == expected;
-        let protocol_ok = hello.protocol_version == 1;
+        let protocol_ok = hello.capabilities.is_some() && caps.protocol_version == PROTOCOL_VERSION;
         let configure = st.configure.get(&miner_id).cloned().unwrap_or(Configure {
             queue_depth: 3,
             idle_timeout_s: 300,
@@ -472,38 +474,32 @@ async fn run_session<C: ChainClient>(
             miner = %miner_id,
             token_ok,
             protocol_ok,
-            offered_protocol = hello.protocol_version,
+            offered_protocol = caps.protocol_version,
             "miner handshake rejected; dropping session"
         );
         return;
     }
 
+    let miner_caps = MinerCaps::from_capabilities(&caps);
     {
         let mut st = state.lock().await;
-        st.router.register_miner(
-            miner_id.clone(),
-            MinerCaps {
-                backend: hello.backend.clone(),
-                algorithm: hello.algorithm.clone(),
-                supported_kinds: hello.supported_kinds.clone(),
-                max_nodes: hello.max_nodes,
-                max_edges: hello.max_edges,
-            },
-        );
+        st.router
+            .register_miner(miner_id.clone(), miner_caps.clone());
     }
     tracing::info!(
         miner = %miner_id,
-        backend = %hello.backend,
-        algorithm = %hello.algorithm,
-        max_nodes = hello.max_nodes,
-        max_edges = hello.max_edges,
+        backend = %miner_caps.backend,
+        algorithm = %miner_caps.algorithm,
+        max_nodes = miner_caps.max_nodes,
+        max_edges = miner_caps.max_edges,
+        stream_width = miner_caps.stream_width,
         "miner registered"
     );
 
     // 2. Welcome + Configure (+ Topology if cached)
     if tx
         .send(Ok(coord(coord_msg::Msg::Welcome(Welcome {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
         }))))
         .await
         .is_err()
@@ -890,10 +886,16 @@ async fn run_session<C: ChainClient>(
             Some(miner_msg::Msg::Capabilities(caps)) => {
                 tracing::debug!(
                     miner = %miner_id,
-                    backend = %caps.backend,
+                    backend = %backend_name(caps.backend()),
                     max_nodes = caps.max_nodes,
                     stream_width = caps.stream_width,
                     "miner advertised capabilities; ignored (no capability routing)"
+                );
+            }
+            Some(miner_msg::Msg::LeaseDone(_)) => {
+                tracing::debug!(
+                    miner = %miner_id,
+                    "lease completion ignored; lease jobs are not enabled"
                 );
             }
             // An empty `msg` is a message this build cannot name: either a
@@ -1236,6 +1238,7 @@ pub async fn drive_pow_round<C: ChainClient + 'static>(p: DrivePowParams<'_, C>)
             supported_kinds: vec![quip_proto::v1::JobKind::IsingSample as i32],
             max_nodes: 0,
             max_edges: 0,
+            ..MinerCaps::default()
         },
     );
     // Route will re-register on Hello and overwrite caps; stage via direct insert
@@ -1363,6 +1366,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
             else {
                 return;
             };
+            let caps = hello.capabilities.clone().unwrap_or_default();
             {
                 let st = state.lock().await;
                 let expected = st
@@ -1370,22 +1374,17 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                     .get(&miner_id)
                     .cloned()
                     .unwrap_or_default();
-                if hello.session_token != expected || hello.protocol_version != 1 {
+                if hello.session_token != expected
+                    || hello.capabilities.is_none()
+                    || caps.protocol_version != PROTOCOL_VERSION
+                {
                     return;
                 }
             }
             {
                 let mut st = state.lock().await;
-                st.router.register_miner(
-                    miner_id.clone(),
-                    MinerCaps {
-                        backend: hello.backend,
-                        algorithm: hello.algorithm,
-                        supported_kinds: hello.supported_kinds,
-                        max_nodes: hello.max_nodes,
-                        max_edges: hello.max_edges,
-                    },
-                );
+                st.router
+                    .register_miner(miner_id.clone(), MinerCaps::from_capabilities(&caps));
                 // Stage pre-jobs now that the miner is registered.
                 let jobs = pre_jobs.lock().await.drain(..).collect::<Vec<_>>();
                 for j in jobs {
@@ -1407,7 +1406,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
             let seed_credits = configure.queue_depth.max(1);
             let _ = tx
                 .send(Ok(coord(coord_msg::Msg::Welcome(Welcome {
-                    protocol_version: 1,
+                    protocol_version: PROTOCOL_VERSION,
                 }))))
                 .await;
             let _ = tx
@@ -1575,21 +1574,19 @@ pub fn shutdown_msg(grace_ms: u32) -> CoordMsg {
 mod tests {
     use super::*;
     use crate::router::MinerCaps;
-    use quip_proto::v1::{IsingProblem, Job, JobKind, Provenance};
+    use quip_proto::v1::{Job, JobKind, Provenance};
 
     fn job(id: &[u8]) -> Job {
         Job {
             job_id: id.to_vec(),
+            generator: None,
             kind: JobKind::IsingSample as i32,
             generation: 1,
             deadline_ms: 0,
-            ising: Some(IsingProblem {
-                graph: None,
-                h_milli_le32: vec![0; 8], // 2 nodes
-                j_milli_le32: vec![0; 4], // 1 edge
-                num_reads: 0,
-                num_sweeps: 0,
-                anneal_time_us: 0,
+            ising: Some({
+                let mut problem = crate::producer::problem::milli_problem(None, &[0; 2], &[0; 1]);
+                problem.num_reads = 0;
+                problem
             }),
             provenance: Some(Provenance {
                 is_pow: true,
@@ -1605,6 +1602,7 @@ mod tests {
             supported_kinds: vec![JobKind::IsingSample as i32],
             max_nodes: 0, // unlimited
             max_edges: 0,
+            ..MinerCaps::default()
         }
     }
 

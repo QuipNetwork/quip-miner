@@ -5,7 +5,6 @@ use super::submit::Proof;
 use parity_scale_codec::Encode;
 use quantum_validation::packed::pack_solution;
 use quantum_validation::{derive_nonce, AllowedValueSpec, MilliValue};
-use quip_protocol::wire::decode_spins;
 use sp_core::{H256, U256};
 
 /// Inputs needed to pack and nonce a proof for submission.
@@ -36,8 +35,8 @@ pub struct ProofBuildContext {
 pub fn build_quantum_proof(proof: &Proof, ctx: &ProofBuildContext) -> Result<QuantumProof, String> {
     let spin_spec = ctx.allowed_spin.as_slice();
     let mut packed = Vec::with_capacity(proof.solutions.len());
-    for sol in &proof.solutions {
-        let spins = decode_spins(&sol.spins_bytes).map_err(|e| format!("spins: {e}"))?;
+    for row in &proof.solutions {
+        let spins = &row.spins;
         if spins.len() != ctx.num_nodes {
             return Err(format!(
                 "solution length {} != topology nodes {}",
@@ -80,7 +79,6 @@ mod tests {
     use super::*;
     use crate::chain::submit::Proof;
     use parity_scale_codec::Decode;
-    use quip_protocol::wire::encode_spins;
 
     fn binary_ctx() -> ProofBuildContext {
         ProofBuildContext {
@@ -101,8 +99,8 @@ mod tests {
             best_energy_milli: -100,
             diversity_milli: 200,
             n_valid: 1,
-            solutions: vec![quip_proto::v1::Solution {
-                spins_bytes: encode_spins(&[1, -1, 1, -1]),
+            solutions: vec![crate::validate::SpinRow {
+                spins: vec![1, -1, 1, -1],
                 energy_milli: -100,
             }],
             is_pow: true,

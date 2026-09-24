@@ -1,12 +1,11 @@
 //! Capability index, per-miner staged queue, credit accounting, cancel, reject.
 
-use quip_proto::v1::ising_problem;
-use quip_proto::v1::{Job, RejectReason};
+use quip_proto::v1::{ising_problem, Capabilities, Job, RejectReason};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Capability envelope advertised in `Hello`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MinerCaps {
     /// Backend name (e.g. `"cpu"`, `"cuda"`).
     pub backend: String,
@@ -18,6 +17,27 @@ pub struct MinerCaps {
     pub max_nodes: u32,
     /// Maximum edges; `0` means unlimited.
     pub max_edges: u32,
+    /// Problem generators this miner runs for `ISING_GENERATE` leases.
+    pub generators: Vec<i32>,
+    /// Problems the miner keeps in flight. `0` means unknown until the device opens.
+    pub stream_width: u32,
+}
+
+impl MinerCaps {
+    /// Index a v2 `Capabilities` message.
+    #[must_use]
+    pub fn from_capabilities(c: &Capabilities) -> Self {
+        use quip_protocol::session::{algorithm_name, backend_name};
+        Self {
+            backend: backend_name(c.backend()).to_owned(),
+            algorithm: algorithm_name(c.algorithm()).to_owned(),
+            supported_kinds: c.supported_kinds.clone(),
+            max_nodes: c.max_nodes,
+            max_edges: c.max_edges,
+            generators: c.generators.clone(),
+            stream_width: c.stream_width,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -334,7 +354,8 @@ fn job_node_count(job: &Job) -> u32 {
         return 0;
     };
     // h field length / 4 = node count
-    (ising.h_milli_le32.len() / 4) as u32
+    // Coordinator-authored problems are always `I32`, four bytes per element.
+    (ising.h.len() / 4) as u32
 }
 
 #[expect(
@@ -347,14 +368,14 @@ fn job_edge_count(job: &Job) -> u32 {
     };
     match &ising.graph {
         Some(ising_problem::Graph::Edges(e)) => e.u.len() as u32,
-        _ => (ising.j_milli_le32.len() / 4) as u32,
+        _ => (ising.j.len() / 4) as u32,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_proto::v1::{IsingProblem, JobKind, Provenance};
+    use quip_proto::v1::{JobKind, Provenance};
 
     fn caps_ising() -> MinerCaps {
         MinerCaps {
@@ -363,22 +384,21 @@ mod tests {
             supported_kinds: vec![JobKind::IsingSample as i32],
             max_nodes: 1000,
             max_edges: 10000,
+            ..MinerCaps::default()
         }
     }
 
     fn make_job(generation: u64, kind: JobKind) -> Job {
         Job {
             job_id: format!("g{generation}").into_bytes(),
+            generator: None,
             kind: kind as i32,
             generation,
             deadline_ms: 9_999_999,
-            ising: Some(IsingProblem {
-                graph: None,
-                h_milli_le32: vec![0; 8], // 2 nodes
-                j_milli_le32: vec![0; 4], // 1 edge
-                num_reads: 0,
-                num_sweeps: 0,
-                anneal_time_us: 0,
+            ising: Some({
+                let mut problem = crate::producer::problem::milli_problem(None, &[0; 2], &[0; 1]);
+                problem.num_reads = 0;
+                problem
             }),
             provenance: Some(Provenance {
                 is_pow: generation != 0,
@@ -516,6 +536,7 @@ mod tests {
                 supported_kinds: vec![JobKind::IsingSample as i32],
                 max_nodes: 1000,
                 max_edges: 10000,
+                ..MinerCaps::default()
             },
         );
         let job = make_job(1, JobKind::IsingSample);

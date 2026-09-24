@@ -76,7 +76,6 @@ impl JobSource for RandomSource {
 mod tests {
     use super::*;
     use crate::drive::{drain_all, parse_topology_spec};
-    use quip_protocol::wire::decode_i32_le;
 
     const SPEC: &str = r#"{
         "nodes": [0, 1, 2, 3],
@@ -103,8 +102,8 @@ mod tests {
         for (ja, jb) in jobs_a.iter().zip(&jobs_b) {
             assert_eq!(ja.job_id, jb.job_id);
             assert_eq!(
-                ja.ising.as_ref().unwrap().h_milli_le32,
-                jb.ising.as_ref().unwrap().h_milli_le32
+                crate::producer::problem::problem_milli(ja.ising.as_ref().unwrap()).unwrap(),
+                crate::producer::problem::problem_milli(jb.ising.as_ref().unwrap()).unwrap()
             );
         }
     }
@@ -127,8 +126,7 @@ mod tests {
         let mut src = RandomSource::new(&spec, [1u8; 32], 99, 4, 9_999_999);
         for job in drain_all(&mut src) {
             let ising = job.ising.unwrap();
-            let h = decode_i32_le(&ising.h_milli_le32).unwrap();
-            let j = decode_i32_le(&ising.j_milli_le32).unwrap();
+            let (h, j) = crate::producer::problem::problem_milli(&ising).unwrap();
             assert!(h.iter().all(|v| [-1000, 0, 1000].contains(v)));
             assert!(j.iter().all(|v| [-1000, 1000].contains(v)));
         }

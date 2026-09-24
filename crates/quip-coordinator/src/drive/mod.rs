@@ -59,21 +59,19 @@ pub fn drain_all(source: &mut dyn JobSource) -> Vec<Job> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_proto::v1::{IsingProblem, JobKind, Provenance};
+    use quip_proto::v1::{JobKind, Provenance};
 
     fn job(n: u64) -> Job {
         Job {
             job_id: n.to_le_bytes().to_vec(),
+            generator: None,
             kind: JobKind::IsingSample as i32,
             generation: n,
             deadline_ms: 9_999_999,
-            ising: Some(IsingProblem {
-                graph: None,
-                h_milli_le32: vec![0; 4],
-                j_milli_le32: vec![],
-                num_reads: 0,
-                num_sweeps: 0,
-                anneal_time_us: 0,
+            ising: Some({
+                let mut problem = crate::producer::problem::milli_problem(None, &[0; 1], &[]);
+                problem.num_reads = 0;
+                problem
             }),
             provenance: Some(Provenance {
                 is_pow: true,

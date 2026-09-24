@@ -1,8 +1,8 @@
 //! Convert mempool `JobOrder`s to wire `Job`s with inline `EdgeList`.
 
 use crate::chain::mempool::JobOrder;
-use quip_proto::v1::{ising_problem, EdgeList, IsingProblem, Job, JobKind, Provenance};
-use quip_protocol::wire::encode_i32_le;
+use crate::producer::problem::milli_problem;
+use quip_proto::v1::{ising_problem, EdgeList, Job, JobKind, Provenance};
 use std::collections::HashMap;
 
 /// Convert a mempool order into an `ISING_SAMPLE` job with inline edges.
@@ -56,14 +56,12 @@ pub fn job_order_to_job(order: &JobOrder) -> Option<Job> {
         kind: JobKind::IsingSample as i32,
         generation: 0,
         deadline_ms: order.deadline_ms,
-        ising: Some(IsingProblem {
-            graph: Some(ising_problem::Graph::Edges(EdgeList { u, v })),
-            h_milli_le32: encode_i32_le(&order.h_milli),
-            j_milli_le32: encode_i32_le(&order.j_milli),
-            num_reads: 0,
-            num_sweeps: 0,
-            anneal_time_us: 0,
-        }),
+        ising: Some(milli_problem(
+            Some(ising_problem::Graph::Edges(EdgeList { u, v })),
+            &order.h_milli,
+            &order.j_milli,
+        )),
+        generator: None,
         provenance: Some(Provenance {
             is_pow: false,
             order_id: order.order_id.clone(),

@@ -758,12 +758,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
 
 [[package]]
-name = "bytemuck"
-version = "1.25.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
-
-[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3019,7 +3013,6 @@ dependencies = [
  "axum 0.8.9",
  "blake2",
  "blake3",
- "bytemuck",
  "clap",
  "futures",
  "getrandom 0.2.17",
@@ -3028,8 +3021,8 @@ dependencies = [
  "parity-scale-codec",
  "prost",
  "quantum-validation",
- "quip-proto 0.0.1",
- "quip-protocol 0.0.1",
+ "quip-proto",
+ "quip-protocol",
  "quip-transaction-crypto",
  "quip-transaction-crypto-core",
  "rand 0.8.7",
@@ -3100,22 +3093,12 @@ dependencies = [
  "clap",
  "hyper-util",
  "prost",
- "quip-proto 0.0.1",
- "quip-protocol 0.0.1",
+ "quip-proto",
+ "quip-protocol",
  "tokio",
  "tokio-stream",
  "tonic",
  "tower 0.5.3",
-]
-
-[[package]]
-name = "quip-proto"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b6c09ef8df03dec54672cf6f20109a0217e772018a1515f1cf76587cb79e6df"
-dependencies = [
- "prost",
- "tonic",
 ]
 
 [[package]]
@@ -3130,22 +3113,12 @@ dependencies = [
 
 [[package]]
 name = "quip-protocol"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "662b61607000230563ffeeea5b2c2226209ff06fd1eebe912d35753ce2dc462d"
-dependencies = [
- "blake3",
- "quip-proto 0.0.1",
-]
-
-[[package]]
-name = "quip-protocol"
 version = "0.0.2-rc3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed93b261c81e2eeb036f0bb4e166e38091ae450ee0fabb4b05a514d67c891d23"
 dependencies = [
  "blake3",
- "quip-proto 0.0.2-rc3",
+ "quip-proto",
 ]
 
 [[package]]
@@ -3160,8 +3133,8 @@ dependencies = [
  "half",
  "hyper-util",
  "prost",
- "quip-proto 0.0.2-rc3",
- "quip-protocol 0.0.2-rc3",
+ "quip-proto",
+ "quip-protocol",
  "serde",
  "serde_json",
  "tokio",

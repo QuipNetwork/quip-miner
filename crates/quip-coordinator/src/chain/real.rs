@@ -1397,11 +1397,7 @@ impl ChainClient for RealChainClient {
                 ))
             })?;
         // Wire spins are 0x01 / 0xFF, which read as +1 / -1 when taken as i8.
-        let rows: Vec<Vec<i8>> = proof
-            .solutions
-            .iter()
-            .map(|s| bytemuck::cast_slice::<u8, i8>(&s.spins_bytes).to_vec())
-            .collect();
+        let rows: Vec<Vec<i8>> = proof.solutions.iter().map(|r| r.spins.clone()).collect();
         let account = signer_account_bytes(&self.pair()?);
         let call = encode_submit_solution_call(order_id, &rows);
         let (outcome, extrinsic_hash) = self

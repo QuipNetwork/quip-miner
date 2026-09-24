@@ -6,15 +6,15 @@
 use clap::Parser;
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{
-    coord_msg, ising_problem, miner_msg, Capabilities, CoordMsg, Fatal, IsingProblem, Job, JobKind,
-    JobRequest, MinerMsg, Ready, Reject, RejectReason, Result as JobResult, SamplerMeta, Solution,
-    Status, Topology,
+    coord_msg, ising_problem, miner_msg, Algorithm, Backend, Capabilities, CoefficientEncoding,
+    CoordMsg, Fatal, IsingProblem, Job, JobKind, JobRequest, MinerMsg, Ready, Reject, RejectReason,
+    Result as JobResult, SamplerMeta, Solution, Status, Topology,
 };
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::session::{
-    build_hello, check_welcome, BackendCaps, ExitCode, SessionConfig, SessionError,
+    build_hello, check_welcome, ExitCode, SessionConfig, PROTOCOL_VERSION,
 };
-use quip_protocol::wire::decode_i32_le;
+use quip_protocol::wire::{decode_i32_le, encode_spins_packed};
 use std::process::ExitCode as ProcessExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -22,7 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Endpoint, Uri};
 
 #[derive(Parser)]
-#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 2"))]
 struct Cli {
     #[arg(long)]
     quip_coordinator: Option<String>,
@@ -46,6 +46,23 @@ fn print_capabilities() {
         println!(
             r#"{{"backend":"mock","algorithm":"sa","supported_kinds":["ISING_SAMPLE"],"max_nodes":100000,"max_edges":1000000}}"#
         );
+    }
+}
+
+/// The envelope this mock advertises in `Hello` and on `GetCapabilities`.
+fn mock_capabilities() -> Capabilities {
+    Capabilities {
+        supported_kinds: vec![JobKind::IsingSample as i32],
+        max_nodes: 100_000,
+        max_edges: 1_000_000,
+        features: vec![],
+        protocol_version: PROTOCOL_VERSION,
+        stream_width: 1,
+        native_topology_hash: None,
+        encodings: vec![CoefficientEncoding::I32 as i32],
+        generators: vec![],
+        backend: Backend::Mock as i32,
+        algorithm: Algorithm::Sa as i32,
     }
 }
 
@@ -218,13 +235,17 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
 
     let ising = job.ising.unwrap_or_default();
 
+    if ising.encoding != CoefficientEncoding::I32 as i32 || ising.scale != 1000 {
+        return reject_and_replace(job_id, RejectReason::Malformed);
+    }
+
     // MALFORMED: h field is not a valid i32-LE array (length not a multiple of 4).
-    let Ok(h) = decode_milli_f64(&ising.h_milli_le32) else {
+    let Ok(h) = decode_milli_f64(&ising.h) else {
         return reject_and_replace(job_id, RejectReason::Malformed);
     };
 
     // MALFORMED: j field must also be a valid i32-LE array (mirror h handling).
-    let Ok(j) = decode_milli_f64(&ising.j_milli_le32) else {
+    let Ok(j) = decode_milli_f64(&ising.j) else {
         return reject_and_replace(job_id, RejectReason::Malformed);
     };
 
@@ -252,9 +273,11 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
     let result = JobResult {
         job_id,
         solutions: vec![Solution {
-            spins_bytes: vec![0x01u8; n],
+            spins: encode_spins_packed(&spins),
             energy_milli: energy,
         }],
+        salt: vec![],
+        nonce: vec![],
         // The reference miner produces a single trivial read with no annealing;
         // report that faithfully so results carry SamplerMeta like real miners.
         meta: Some(SamplerMeta {
@@ -270,25 +293,10 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
     ]
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "session loop kept as one linear match over CoordMsg for clarity"
-)]
 async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
     // Resolve token before any network I/O so a missing QUIP_SESSION_TOKEN
     // always maps to exit 77 (never InternalFatal from a connect failure).
-    let hello = build_hello(
-        miner_id,
-        "mock",
-        "sa",
-        &[JobKind::IsingSample],
-        &[],
-        BackendCaps {
-            max_nodes: 0,
-            max_edges: 0,
-        },
-    )
-    .map_err(|e: SessionError| ExitCode::from(e))?;
+    let hello = build_hello(miner_id, mock_capabilities()).map_err(ExitCode::from)?;
 
     let path = uri.strip_prefix("unix://").unwrap_or(uri).to_string();
     let channel = Endpoint::try_from("http://[::]:50051") // dummy authority, unused for UDS
@@ -367,19 +375,9 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
             }
             // Answer with the same permissive envelope --capabilities prints.
             Some(coord_msg::Msg::GetCapabilities(_)) => {
-                tx.send(miner(miner_msg::Msg::Capabilities(Capabilities {
-                    backend: "mock".into(),
-                    algorithm: "sa".into(),
-                    supported_kinds: vec![JobKind::IsingSample as i32],
-                    max_nodes: 100_000,
-                    max_edges: 1_000_000,
-                    features: vec![],
-                    protocol_version: 1,
-                    stream_width: 1,
-                    native_topology_hash: None,
-                })))
-                .await
-                .map_err(|_| ExitCode::InternalFatal)?;
+                tx.send(miner(miner_msg::Msg::Capabilities(mock_capabilities())))
+                    .await
+                    .map_err(|_| ExitCode::InternalFatal)?;
             }
             Some(coord_msg::Msg::Shutdown(s)) => {
                 grace_ms = if s.grace_ms == 0 {
@@ -418,19 +416,23 @@ mod tests {
     fn sample_job(job_id: &[u8], kind: JobKind, j_bytes: Vec<u8>) -> Job {
         Job {
             job_id: job_id.to_vec(),
+            generator: None,
             kind: kind as i32,
             generation: 1,
             deadline_ms: now_unix_ms() + 60_000,
             ising: Some(IsingProblem {
+                encoding: CoefficientEncoding::I32 as i32,
+                scale: 1000,
                 graph: Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
                     u: vec![0],
                     v: vec![1],
                 })),
-                h_milli_le32: encode_i32_le(&[1000, -1000]),
-                j_milli_le32: j_bytes,
+                h: encode_i32_le(&[1000, -1000]),
+                j: j_bytes,
                 num_reads: 1,
                 num_sweeps: 0,
                 anneal_time_us: 0,
+                ..Default::default()
             }),
             provenance: None,
         }

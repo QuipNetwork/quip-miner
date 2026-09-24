@@ -19,6 +19,7 @@ use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
     coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, Reject, Result as JobResult, Welcome,
 };
+use quip_protocol::session::PROTOCOL_VERSION;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -229,6 +230,7 @@ async fn handshake(
     else {
         return None;
     };
+    let caps = hello.capabilities.clone().unwrap_or_default();
     {
         let st = state.lock().await;
         let expected = st
@@ -238,22 +240,18 @@ async fn handshake(
             .unwrap_or_default();
         // Mirror production `run_session`: an empty expected token must never
         // authenticate an empty-token miner.
-        if expected.is_empty() || hello.session_token != expected || hello.protocol_version != 1 {
+        if expected.is_empty()
+            || hello.session_token != expected
+            || hello.capabilities.is_none()
+            || caps.protocol_version != PROTOCOL_VERSION
+        {
             return None;
         }
     }
     let configure = {
         let mut st = state.lock().await;
-        st.router.register_miner(
-            miner_id.to_string(),
-            MinerCaps {
-                backend: hello.backend,
-                algorithm: hello.algorithm,
-                supported_kinds: hello.supported_kinds,
-                max_nodes: hello.max_nodes,
-                max_edges: hello.max_edges,
-            },
-        );
+        st.router
+            .register_miner(miner_id.to_string(), MinerCaps::from_capabilities(&caps));
         let staged = jobs.lock().await.drain(..).collect::<Vec<_>>();
         for j in staged {
             let _ = st.router.route(j);
@@ -274,7 +272,7 @@ async fn handshake(
     };
     let _ = tx
         .send(Ok(coord(coord_msg::Msg::Welcome(Welcome {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
         }))))
         .await;
     let _ = tx

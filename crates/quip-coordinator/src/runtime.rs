@@ -198,6 +198,7 @@ fn stage_ceiling(num_nodes: usize, num_edges: usize, floor: usize) -> usize {
 /// Difficulty gates advertised to miners, from the snapshot.
 fn target_from_snapshot(snap: &MiningSnapshot) -> SetTarget {
     SetTarget {
+        max_proof_solutions: crate::validate::MAX_PROOF_SOLUTIONS_WIRE,
         max_energy_milli: snap.max_energy_milli,
         min_solutions: snap.min_solutions,
         min_diversity_milli: snap.min_diversity_milli,
