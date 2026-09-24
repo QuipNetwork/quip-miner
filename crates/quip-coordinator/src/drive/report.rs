@@ -33,6 +33,10 @@ pub struct JobRow {
     pub sweeps: u32,
     /// True if the miner rejected the job outright (no `Result` returned).
     pub rejected: bool,
+    /// Salts the miner finished: lease `LeaseDone.salts_done`, or one for a plain result.
+    pub salts_done: u64,
+    /// Verified winning salts in a lease, or one for a plain job that passed.
+    pub winners: u32,
 }
 
 /// Aggregate stats over a full drive run.
@@ -48,6 +52,10 @@ pub struct Aggregate {
     pub wall_ms_total: u64,
     /// Throughput in jobs per second using `wall_ms_total`.
     pub throughput_per_s: f64,
+    /// Number of lease salts completed.
+    pub salts_done: u64,
+    /// Salt throughput using `wall_ms_total`.
+    pub salts_per_s: f64,
 }
 
 /// Compute aggregate stats from per-job rows.
@@ -64,8 +72,14 @@ pub fn aggregate(rows: &[JobRow], run_wall_ms: u64) -> Aggregate {
     let total_jobs = rows.len();
     let passed = rows.iter().filter(|r| r.passed).count();
     let rejected = rows.iter().filter(|r| r.rejected).count();
+    let salts_done = rows.iter().map(|r| r.salts_done).sum();
     let throughput_per_s = if run_wall_ms > 0 {
         total_jobs as f64 / (run_wall_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let salts_per_s = if run_wall_ms > 0 {
+        salts_done as f64 / (run_wall_ms as f64 / 1000.0)
     } else {
         0.0
     };
@@ -75,6 +89,8 @@ pub fn aggregate(rows: &[JobRow], run_wall_ms: u64) -> Aggregate {
         rejected,
         wall_ms_total: run_wall_ms,
         throughput_per_s,
+        salts_done,
+        salts_per_s,
     }
 }
 
@@ -82,8 +98,8 @@ pub fn aggregate(rows: &[JobRow], run_wall_ms: u64) -> Aggregate {
 #[expect(clippy::print_stdout, reason = "drive CLI output")]
 pub fn print_table(rows: &[JobRow], agg: &Aggregate) {
     println!(
-        "{:<4} {:<18} {:>10} {:>12} {:>10} {:>6} {:>8}",
-        "#", "job_id", "n_sol", "best_energy", "diversity", "pass", "wall_ms"
+        "{:<4} {:<18} {:>10} {:>12} {:>10} {:>6} {:>8} {:>8} {:>8}",
+        "#", "job_id", "n_sol", "best_energy", "diversity", "pass", "wall_ms", "salts", "winners"
     );
     for (i, r) in rows.iter().enumerate() {
         let job_id_hex = hex(&r.job_id);
@@ -95,19 +111,26 @@ pub fn print_table(rows: &[JobRow], agg: &Aggregate) {
             "fail"
         };
         println!(
-            "{:<4} {:<18} {:>10} {:>12} {:>10} {:>6} {:>8}",
+            "{:<4} {:<18} {:>10} {:>12} {:>10} {:>6} {:>8} {:>8} {:>8}",
             i + 1,
             truncate_hex(&job_id_hex),
             r.n_solutions,
             r.best_energy_milli,
             r.diversity_milli,
             status,
-            r.wall_ms
+            r.wall_ms,
+            r.salts_done,
+            r.winners
         );
     }
     println!(
-        "--- {} jobs, {} passed, {} rejected, {:.2} jobs/s ---",
-        agg.total_jobs, agg.passed, agg.rejected, agg.throughput_per_s
+        "--- {} jobs, {} passed, {} rejected, {:.2} jobs/s, {} salts, {:.2} salts/s ---",
+        agg.total_jobs,
+        agg.passed,
+        agg.rejected,
+        agg.throughput_per_s,
+        agg.salts_done,
+        agg.salts_per_s
     );
     if let Some(p) = effective_params(rows) {
         println!("--- effective reads {}, sweeps {} ---", p.0, p.1);
@@ -162,6 +185,8 @@ fn row_to_json(r: &JobRow) -> serde_json::Value {
         "reads": r.reads,
         "sweeps": r.sweeps,
         "wall_ms": r.wall_ms,
+        "salts_done": r.salts_done,
+        "winners": r.winners,
     })
 }
 
@@ -185,6 +210,8 @@ pub fn write_jsonl(path: &Path, rows: &[JobRow], agg: &Aggregate) -> std::io::Re
             "rejected": agg.rejected,
             "wall_ms_total": agg.wall_ms_total,
             "throughput_per_s": agg.throughput_per_s,
+            "salts_done": agg.salts_done,
+            "salts_per_s": agg.salts_per_s,
         })
     )?;
     Ok(())
@@ -207,6 +234,8 @@ mod tests {
             sweeps: 256,
             wall_ms,
             rejected,
+            salts_done: 1,
+            winners: u32::from(passed),
         }
     }
 
@@ -235,6 +264,17 @@ mod tests {
         {
             assert_eq!(agg.throughput_per_s, 0.0);
         }
+    }
+
+    #[test]
+    fn aggregate_reports_salts_per_second() {
+        let mut a = row(true, false, 10);
+        a.salts_done = 30;
+        let mut b = row(false, false, 10);
+        b.salts_done = 10;
+        let agg = aggregate(&[a, b], 2_000);
+        assert_eq!(agg.salts_done, 40);
+        assert!((agg.salts_per_s - 20.0).abs() < 1e-9);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use quip_coordinator::chain::{
 use quip_coordinator::config::{parse_config, CoordinatorConfig, LaunchEntry};
 use quip_coordinator::drive::{
     aggregate, drain_all, parse_topology_spec, print_table, run_drive, write_jsonl,
-    DriveManyParams, ListSource, RandomSource,
+    DriveManyParams, LeaseSource, ListSource, RandomSource,
 };
 use quip_coordinator::logging::LogLevel;
 use quip_coordinator::presets::preset_spec;
@@ -101,6 +101,7 @@ struct SeedChainArgs {
 #[derive(ValueEnum, Clone, Debug)]
 enum DriveSourceKind {
     Random,
+    Lease,
     List,
 }
 
@@ -109,7 +110,7 @@ struct DriveArgs {
     /// Miner binary to spawn.
     #[arg(long)]
     miner: PathBuf,
-    /// Job source: golden-draw random problems, or a JSONL replay list.
+    /// Job source: golden-draw random problems, salt leases, or a JSONL replay list.
     #[arg(long, value_enum)]
     source: DriveSourceKind,
     /// Topology spec JSON. For `--source random`, optional — defaults to the
@@ -121,12 +122,15 @@ struct DriveArgs {
     /// the binary. Mutually exclusive with `--topology`.
     #[arg(long)]
     topology_preset: Option<String>,
-    /// Number of problems to draw (`--source random`).
+    /// Number of problems (`random`) or salts (`lease`) to draw.
     #[arg(long, default_value_t = 10)]
     count: u32,
-    /// Draw seed: same seed + topology draws the same jobs (`--source random`).
+    /// Draw seed: same seed + topology draws the same jobs (`random` or `lease`).
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Salts per lease (`--source lease`). `--count` is the total salt count.
+    #[arg(long, default_value_t = 64)]
+    lease_size: u64,
     /// JSONL model list (`--source list`).
     #[arg(long)]
     list: Option<PathBuf>,
@@ -651,6 +655,22 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
             let target = set_target_from_spec(&spec, args);
             Ok((jobs, Some(spec.topology), Some(target)))
         }
+        DriveSourceKind::Lease => {
+            let text =
+                topo_text.ok_or("--source lease requires --topology or --topology-preset")?;
+            let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
+            let miner_account = [0u8; 32];
+            let mut src = LeaseSource::new(
+                &spec,
+                miner_account,
+                args.seed,
+                u64::from(args.count),
+                args.lease_size,
+            );
+            let jobs = drain_all(&mut src);
+            let target = set_target_from_spec(&spec, args);
+            Ok((jobs, Some(spec.topology), Some(target)))
+        }
         DriveSourceKind::List => {
             let list_path = args
                 .list
@@ -676,12 +696,12 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
     }
 }
 
-/// Default preset used by `--source random` when no topology is specified.
+/// Default preset used by `--source random` and `--source lease` when no topology is specified.
 const DEFAULT_PRESET: &str = "advantage2-system1";
 
 /// Resolve the topology spec text from `--topology` / `--topology-preset`.
-/// `--source random` falls back to [`DEFAULT_PRESET`]; `--source list` returns
-/// `None` (a nonce-ref list supplies its own topology or needs none).
+/// `--source random` and `--source lease` fall back to [`DEFAULT_PRESET`];
+/// `--source list` returns `None` (a nonce-ref list supplies its own topology or needs none).
 fn resolve_topology_text(args: &DriveArgs) -> Result<Option<String>, String> {
     if args.topology.is_some() && args.topology_preset.is_some() {
         return Err("--topology and --topology-preset are mutually exclusive".into());
@@ -696,6 +716,7 @@ fn resolve_topology_text(args: &DriveArgs) -> Result<Option<String>, String> {
     }
     match args.source {
         DriveSourceKind::Random => preset_spec(DEFAULT_PRESET).map(|s| Some(s.to_string())),
+        DriveSourceKind::Lease => preset_spec(DEFAULT_PRESET).map(|s| Some(s.to_string())),
         DriveSourceKind::List => Ok(None),
     }
 }
@@ -833,6 +854,7 @@ mod tests {
             topology_preset: None,
             count: 10,
             seed: 0,
+            lease_size: 64,
             list: None,
             target_energy: None,
             min_solutions: None,

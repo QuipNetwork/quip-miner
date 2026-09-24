@@ -7,12 +7,14 @@
 //! same `JobSource` / topology-provider seams.
 
 pub mod harness;
+pub mod lease_source;
 pub mod list_source;
 pub mod random_source;
 pub mod report;
 pub mod topology_spec;
 
 pub use harness::{run_drive, DriveManyParams, DriveManyReport};
+pub use lease_source::LeaseSource;
 pub use list_source::{ListSource, ListSourceError};
 pub use random_source::RandomSource;
 pub use report::{aggregate, print_table, write_jsonl, Aggregate, JobRow};

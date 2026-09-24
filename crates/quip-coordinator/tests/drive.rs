@@ -12,8 +12,8 @@
 )]
 
 use quip_coordinator::config::LaunchEntry;
-use quip_coordinator::drive::{aggregate, drain_all, DriveManyParams, ListSource};
-use quip_proto::v1::Configure;
+use quip_coordinator::drive::{aggregate, drain_all, DriveManyParams, LeaseSource, ListSource};
+use quip_proto::v1::{Configure, SetTarget};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Sibling `quip-mock-miner` binary (not same package → no `CARGO_BIN_EXE_*`).
@@ -111,4 +111,57 @@ async fn drives_two_entry_list_end_to_end() {
     if report.run_wall_ms > 0 {
         assert!(agg.throughput_per_s > 0.0);
     }
+}
+
+#[tokio::test]
+async fn drives_leases_end_to_end() {
+    let miner = mock_miner();
+    let spec = quip_coordinator::drive::parse_topology_spec(
+        quip_coordinator::presets::preset_spec("smoke").expect("preset"),
+    )
+    .expect("spec");
+    let mut src = LeaseSource::new(&spec, [0; 32], 1, 10, 4);
+    let jobs = drain_all(&mut src);
+    let target = SetTarget {
+        max_energy_milli: i64::MAX / 2,
+        min_solutions: 1,
+        max_proof_solutions: 32,
+        ..Default::default()
+    };
+    let entry = LaunchEntry {
+        miner_id: "cpu-0".into(),
+        binary: miner.clone(),
+        backend: "cpu".into(),
+        device: None,
+        configure: Configure {
+            queue_depth: 3,
+            idle_timeout_s: 30,
+            heartbeat_s: 15,
+            reconnect_window_s: 60,
+            backend_toml: String::new(),
+        },
+    };
+    let report = quip_coordinator::drive::run_drive(DriveManyParams {
+        miner_bin: &miner,
+        sock_path: &format!("/tmp/quip-drive-lease-{}.sock", std::process::id()),
+        miner_id: "cpu-0",
+        token: "tok",
+        entry: &entry,
+        topology: Some(spec.topology.clone()),
+        target: Some(target),
+        jobs,
+        utilization: None,
+        yielding: false,
+        log_level: quip_coordinator::logging::LogLevel::Info,
+    })
+    .await;
+    assert!(report.handshake_ok);
+    assert_eq!(report.rows.len(), 3, "one row per lease");
+    let agg = aggregate(&report.rows, report.run_wall_ms);
+    assert_eq!(agg.salts_done, 10);
+    assert_eq!(
+        report.rows.iter().map(|r| r.winners).sum::<u32>(),
+        10,
+        "every salt wins an open target"
+    );
 }
