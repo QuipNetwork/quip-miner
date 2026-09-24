@@ -9,6 +9,7 @@ pub mod decay;
 pub mod drive;
 pub mod funding;
 pub mod keygen;
+pub mod lease;
 pub mod liveness;
 pub mod logging;
 pub mod metrics;

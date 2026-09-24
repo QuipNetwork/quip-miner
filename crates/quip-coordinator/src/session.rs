@@ -1609,6 +1609,44 @@ mod tests {
     use crate::router::MinerCaps;
     use quip_proto::v1::{Job, JobKind, Provenance};
 
+    #[test]
+    fn reclaimed_lease_restages_with_same_range() {
+        let mut st = CoordinatorState::new();
+        let caps = MinerCaps {
+            supported_kinds: vec![JobKind::IsingGenerate as i32],
+            generators: vec![quip_proto::v1::GeneratorAlgorithm::Blake3Chacha8V1 as i32],
+            ..MinerCaps::default()
+        };
+        st.router.register_miner("m", caps);
+        let snap = crate::chain::snapshot::MiningSnapshot {
+            head_hash: [0; 32],
+            last_proof_block_hash: [7; 32],
+            topology_hash: vec![9; 32],
+            nodes: vec![0, 1],
+            edges: vec![(0, 1)],
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![1000],
+            allowed_spin_milli: vec![-1000, 1000],
+            min_solutions: 1,
+            max_energy_milli: 0,
+            min_diversity_milli: 0,
+            block_number: 1,
+        };
+        let job = crate::lease::build_lease_job(&snap, [0; 32], 21, 4, 1);
+        st.dispatch_inflight("m", job.clone());
+        let reclaimed = st.reclaim_miner("m");
+        assert_eq!(reclaimed, vec![job.clone()]);
+        assert_eq!(
+            st.router
+                .route(reclaimed.first().cloned().expect("one reclaimed lease"))
+                .as_deref(),
+            Some("m")
+        );
+        st.router.grant_credits("m", 1);
+        let staged = st.router.next_job("m").expect("restaged lease");
+        assert_eq!(staged.generator, job.generator);
+    }
+
     fn job(id: &[u8]) -> Job {
         Job {
             job_id: id.to_vec(),
