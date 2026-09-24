@@ -2,7 +2,7 @@
 
 Cross-tool instructions for AI coding assistants (Claude Code, Codex, Cursor, Gemini CLI).
 
-QuIP v0.3 is a Rust workspace. The coordinator owns chain access and work routing. It spawns and supervises the miner subprocesses that do the sampling. The miner binaries ship from their own repos. The solver contract (wire protocol, consensus primitives, solver harness) lives in `quip.network/quip-solver-core` and is consumed from crates.io at v0.0.0.
+QuIP v0.3 is a Rust workspace. The coordinator owns chain access and work routing. It spawns and supervises the miner subprocesses that do the sampling. The miner binaries ship from their own repos. The solver contract (wire protocol, consensus primitives, solver harness) lives in `quip.network/quip-solver-core` and is consumed from crates.io at v0.0.2-rc3.
 
 For deeper detail, see the companion guides: `COORDINATOR.md` covers how the coordinator works, and `NEWMINER.md` covers adding a new miner. The solver contract itself is specified in the quip-solver-core repo (`SPEC.md`).
 
@@ -60,6 +60,10 @@ quip-coordinator --config ./docker/config.toml
 # for benchmarking and matched-condition parity runs.
 quip-coordinator drive --miner ./miners/quip-cpu-sa --source random \
   --topology-preset advantage2-system1 --count 100
+
+# Drive a miner with generated salt leases.
+quip-coordinator drive --miner ./miners/quip-cpu-sa --source lease \
+  --topology-preset smoke --count 200 --lease-size 32 --seed 7
 
 # Seed a fresh chain: register the default topology and set its difficulty.
 # Give exactly one of --sudo-key or --mnemonic-file.
