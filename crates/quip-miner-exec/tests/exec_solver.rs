@@ -7,7 +7,7 @@ use quip_solver_core::{IsingGraph, SampleError, SampleParams, Sampler};
 
 /// A 2-node problem, so valid solutions have `spins.len() == 2`.
 fn graph() -> IsingGraph {
-    IsingGraph::new(vec![1000, -1000], vec![1000], vec![(0, 1)])
+    IsingGraph::new(vec![1.0, -1.0], vec![1.0], vec![(0, 1)])
 }
 
 const ONE_SOLUTION: &str = r#"[{\"spins\":[1,-1],\"energy_milli\":-5}]"#;

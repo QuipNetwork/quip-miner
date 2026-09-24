@@ -26,12 +26,11 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// JSON model handed to the external solver. `h` and `j` are owned float copies
-/// of the milli coefficients. The other fields are borrowed.
+/// JSON model handed to the external solver. Borrows the job's fields directly.
 #[derive(Serialize)]
 struct ModelJson<'a> {
-    h: Vec<f64>,
-    j: Vec<f64>,
+    h: &'a [f64],
+    j: &'a [f64],
     edges: &'a [(usize, usize)],
     num_reads: usize,
     num_sweeps: usize,
@@ -43,8 +42,8 @@ struct ModelJson<'a> {
 impl<'a> ModelJson<'a> {
     fn new(graph: &'a IsingGraph, params: &'a SampleParams) -> Self {
         Self {
-            h: graph.h_f64(),
-            j: graph.j_f64(),
+            h: &graph.h,
+            j: &graph.j,
             edges: &graph.edges,
             num_reads: params.num_reads,
             num_sweeps: params.num_sweeps,
@@ -333,7 +332,7 @@ mod tests {
 
     #[test]
     fn model_json_serializes_expected_fields() {
-        let graph = IsingGraph::new(vec![1000, -1000], vec![1500], vec![(0, 1)]);
+        let graph = IsingGraph::new(vec![1.0, -1.0], vec![1.5], vec![(0, 1)]);
         let params = SampleParams {
             num_reads: 8,
             num_sweeps: 64,

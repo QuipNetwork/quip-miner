@@ -1644,6 +1644,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
+]
+
+[[package]]
 name = "hash-db"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3017,8 +3028,8 @@ dependencies = [
  "parity-scale-codec",
  "prost",
  "quantum-validation",
- "quip-proto",
- "quip-protocol",
+ "quip-proto 0.0.1",
+ "quip-protocol 0.0.1",
  "quip-transaction-crypto",
  "quip-transaction-crypto-core",
  "rand 0.8.7",
@@ -3089,8 +3100,8 @@ dependencies = [
  "clap",
  "hyper-util",
  "prost",
- "quip-proto",
- "quip-protocol",
+ "quip-proto 0.0.1",
+ "quip-protocol 0.0.1",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -3108,28 +3119,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "quip-proto"
+version = "0.0.2-rc3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9d89e305792adc6cadabe5ccee47a61919bd2812be29d2c48359962722c05c0"
+dependencies = [
+ "prost",
+ "tonic",
+]
+
+[[package]]
 name = "quip-protocol"
 version = "0.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "662b61607000230563ffeeea5b2c2226209ff06fd1eebe912d35753ce2dc462d"
 dependencies = [
  "blake3",
- "quip-proto",
+ "quip-proto 0.0.1",
+]
+
+[[package]]
+name = "quip-protocol"
+version = "0.0.2-rc3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed93b261c81e2eeb036f0bb4e166e38091ae450ee0fabb4b05a514d67c891d23"
+dependencies = [
+ "blake3",
+ "quip-proto 0.0.2-rc3",
 ]
 
 [[package]]
 name = "quip-solver-core"
-version = "0.0.1"
+version = "0.0.2-rc3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3146536d40f2d0bd44d1cc81a578129e9d9cbd56825e6b8b9f1770be48aec096"
+checksum = "d8d3805f56d9842019b830e0492dcf67a4692ff2d448969097a0e16fbf3c7e66"
 dependencies = [
  "base64",
  "clap",
  "getrandom 0.2.17",
+ "half",
  "hyper-util",
  "prost",
- "quip-proto",
- "quip-protocol",
+ "quip-proto 0.0.2-rc3",
+ "quip-protocol 0.0.2-rc3",
  "serde",
  "serde_json",
  "tokio",

@@ -6,7 +6,11 @@
 
 use clap::Parser;
 use quip_miner_exec::ExecSampler;
-use quip_solver_core::{adapt::AdaptBounds, run, BackendIdentity, CommonArgs, OpenError};
+use quip_solver_core::{
+    adapt::AdaptBounds,
+    quip_proto::v1::{Algorithm, Backend},
+    run, BackendIdentity, CommonArgs, OpenError,
+};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -37,8 +41,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     run(
         BackendIdentity {
-            backend: "exec",
-            algorithm: "external",
+            backend: Backend::Exec,
+            algorithm: Algorithm::External,
             max_nodes: 100_000,
             max_edges: 1_000_000,
             features: &[],
