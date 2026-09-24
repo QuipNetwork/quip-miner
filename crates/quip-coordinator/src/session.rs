@@ -426,6 +426,225 @@ impl<C: ChainClient + 'static> MinerService for CoordinatorService<C> {
     }
 }
 
+/// One validated proof-of-work outcome to settle.
+pub(crate) struct PowOutcome<'a> {
+    /// Miner that produced the result.
+    pub miner_id: &'a str,
+    /// The dispatched job: a plain job, or the lease the winner came from.
+    pub job: &'a quip_proto::v1::Job,
+    /// Attempt identifier: the nonce for proof-of-work.
+    pub job_id: &'a [u8],
+    /// Salt the nonce was derived from, required by live submit.
+    pub salt: Option<[u8; 32]>,
+    /// Scored rows and gate verdict.
+    pub validated: crate::validate::Validated,
+    /// Gates the verdict used.
+    pub gates: crate::validate::QualityGates,
+    /// Round best before this outcome.
+    pub current_best_milli: Option<i64>,
+    /// Device time the miner reported.
+    pub device_access_time_us: u64,
+}
+
+/// Submit an accepted outcome that beats the round best, keep a transient
+/// submit failure for the win-time retry, stash a sub-threshold outcome, and
+/// record the attempt.
+#[expect(
+    clippy::too_many_lines,
+    reason = "settling a proof preserves submit, stash, and attempt ordering"
+)]
+pub(crate) async fn settle_pow_result<C: ChainClient>(
+    chain: &C,
+    state: &Arc<Mutex<CoordinatorState>>,
+    submit_notify: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    outcome: PowOutcome<'_>,
+) {
+    let PowOutcome {
+        miner_id,
+        job,
+        job_id,
+        salt,
+        validated,
+        gates,
+        current_best_milli: best,
+        device_access_time_us,
+    } = outcome;
+    let mut submitted = false;
+    // Set when an accepted proof fails to submit for a
+    // transient reason: keep it for the win-time retry loop
+    // instead of dropping a genuine winner.
+    let mut retain_for_retry = false;
+    // Chain detail of the submit attempt, kept for the
+    // attempt record below; `None` when this result never
+    // reached the gate that triggers a submit.
+    let mut receipt: Option<Result<SubmitReceipt, ChainError>> = None;
+    if validated.accepted && beats_current(validated.best_energy_milli, best) {
+        let proof = Proof {
+            job_id: job_id.to_vec(),
+            best_energy_milli: validated.best_energy_milli,
+            diversity_milli: validated.diversity_milli,
+            n_valid: validated.n_valid,
+            // Diverse gate-passing subset, capped at the
+            // pallet's MAX_PROOF_SOLUTIONS (not all raw rows,
+            // which would fail bounded-vec decode).
+            solutions: validated.selected_solutions.clone(),
+            is_pow: job.provenance.as_ref().is_some_and(|p| p.is_pow),
+            order_id: job
+                .provenance
+                .as_ref()
+                .map(|p| p.order_id.clone())
+                .unwrap_or_default(),
+            generation: job.generation,
+            // Salt is chosen by the feeder when the PoW job
+            // is derived and remembered by job_id; the live
+            // RealChainClient submit requires 32 bytes.
+            salt: salt.map_or_else(Vec::new, |s| s.to_vec()),
+            device_access_time_us,
+        };
+        let job_hex = crate::chain::extrinsic::hex_encode(job_id);
+        let submit_result = chain.submit_proof(&proof).await;
+        match submit_result.as_ref().map(|r| r.action) {
+            Ok(SubmitAction::Success) => {
+                let mut st = state.lock().await;
+                st.current_best_milli = Some(validated.best_energy_milli);
+                st.metrics.record_proof_submitted(miner_id);
+                if let Some(n) = submit_notify.lock().await.take() {
+                    let _ = n.send(());
+                }
+                submitted = true;
+            }
+            Ok(SubmitAction::Retry) => {
+                tracing::warn!(job = %job_hex, "session submit rejected (retryable); retaining accepted candidate for win-time retry");
+                state.lock().await.metrics.record_submission_error(miner_id);
+                retain_for_retry = true;
+            }
+            Ok(SubmitAction::StopRoundStale) => {
+                tracing::info!(job = %job_hex, "session submit stale for round; dropping candidate");
+                state.lock().await.metrics.record_stale_drop(miner_id);
+            }
+            Ok(SubmitAction::StopFatal) => {
+                tracing::error!(job = %job_hex, "session submit fatally rejected by pallet; dropping candidate");
+                state.lock().await.metrics.record_submission_error(miner_id);
+            }
+            Err(e) => {
+                tracing::error!(job = %job_hex, error = %e, "session submit failed (transient); retaining accepted candidate for win-time retry");
+                state.lock().await.metrics.record_submission_error(miner_id);
+                retain_for_retry = true;
+            }
+        }
+        receipt = Some(submit_result);
+    }
+    // Record the attempt; stash sub-threshold candidates so
+    // the easing difficulty can still win them; refresh the
+    // per-qblock summary when the stash or a submit changed.
+    {
+        let mut st = state.lock().await;
+        st.results_validated += 1;
+        let qblock_id = st.qblock_id;
+        let device_us = device_access_time_us;
+
+        // A solution below the current threshold is submitted
+        // immediately (above); one not yet viable is stashed
+        // if the projection says the decay will clear it. An
+        // accepted candidate whose submit failed transiently
+        // (`retain_for_retry`) is also stashed so the win-time
+        // loop resubmits it instead of losing a winner.
+        let mut stash_changed = false;
+        if !validated.accepted || retain_for_retry {
+            let is_pow = job.provenance.as_ref().is_some_and(|p| p.is_pow);
+            let order_id = job
+                .provenance
+                .as_ref()
+                .map(|p| p.order_id.clone())
+                .unwrap_or_default();
+            stash_changed = st.stash.insert(crate::stash::Candidate {
+                job_id: job_id.to_vec(),
+                salt,
+                generation: job.generation,
+                // Raw best (gate-agnostic) so the decay
+                // projection can decide when the easing gate
+                // admits it. The rows resubmitted with it are
+                // `stash_solutions`: the prefix-safe subset
+                // (≤ MAX_PROOF_SOLUTIONS) that keeps clearing
+                // the chain's diversity gate however tight the
+                // ceiling is when the proof lands.
+                best_energy_milli: validated.raw_best_energy_milli,
+                diversity_milli: validated.diversity_milli,
+                n_valid: validated.n_valid,
+                solutions: validated.stash_solutions.clone(),
+                is_pow,
+                order_id,
+                device_access_time_us: device_us,
+                submitted: false,
+            });
+            let decision = if stash_changed {
+                "stashed"
+            } else {
+                "discarded"
+            };
+            let stash_txt = match st.stash.summary().retained_band_milli() {
+                None => "empty".to_owned(),
+                Some((worst, best)) => format!(
+                    "{} -> {}",
+                    crate::logging::energy_units(worst),
+                    crate::logging::energy_units(best)
+                ),
+            };
+            let target_txt =
+                crate::logging::display_energy(st.target.as_ref().map(|t| t.max_energy_milli));
+            tracing::info!(
+                "[quip-miner-{miner_id}] attempt {}: {decision} (stash: {stash_txt}, target <= {target_txt})",
+                short_job_id(job_id),
+            );
+        }
+
+        let pow_sequence = submitted
+            .then(|| st.metrics.chain().miner_info.map(|i| i.proofs_submitted))
+            .flatten();
+        let ctx = crate::attempt::AttemptContext {
+            miner_type: st.miner_types.get(miner_id).cloned().unwrap_or_default(),
+            // The ceiling the coordinator checked this
+            // result against, not the base difficulty: the
+            // gate is what decided accept or reject.
+            threshold_milli: gates.min_energy_milli,
+            last_proof_block_hash: st.last_proof_block_hash.clone(),
+            extrinsic_hash: receipt
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|r| r.extrinsic_hash)
+                .map(|h| crate::chain::extrinsic::hex_encode(&h)),
+            chain_block_hash: receipt
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|r| r.block_hash)
+                .map(|h| crate::chain::extrinsic::hex_encode(&h)),
+            chain_block_number: receipt
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|r| r.block_number),
+            pow_sequence,
+            device_access_time_us: device_us,
+        };
+        let attempt = crate::attempt::AttemptRecord::new(
+            qblock_id, miner_id, job_id, job, &validated, submitted, &ctx,
+        );
+        let summary = (stash_changed || submitted).then(|| {
+            crate::attempt::summary_body(
+                qblock_id,
+                st.current_best_milli,
+                st.results_validated,
+                st.stash.summary(),
+            )
+        });
+        if let Some(tx) = st.attempt_tx.as_ref() {
+            let _ = tx.send(crate::attempt::WriterMsg::Attempt(Box::new(attempt)));
+            if let Some(body) = summary {
+                let _ = tx.send(crate::attempt::WriterMsg::Summary { qblock_id, body });
+            }
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "session loop is one cohesive handshake + message dispatch"
@@ -625,211 +844,25 @@ async fn run_session<C: ChainClient>(
                     }
                     if let Some(ising) = job.ising.as_ref() {
                         let validated = validate_result(ising, &result.solutions, &gates, &topo);
-                        let mut submitted = false;
-                        // Set when an accepted proof fails to submit for a
-                        // transient reason: keep it for the win-time retry loop
-                        // instead of dropping a genuine winner.
-                        let mut retain_for_retry = false;
-                        // Chain detail of the submit attempt, kept for the
-                        // attempt record below; `None` when this result never
-                        // reached the gate that triggers a submit.
-                        let mut receipt: Option<Result<SubmitReceipt, ChainError>> = None;
-                        if validated.accepted && beats_current(validated.best_energy_milli, best) {
-                            let proof = Proof {
-                                job_id: result.job_id.clone(),
-                                best_energy_milli: validated.best_energy_milli,
-                                diversity_milli: validated.diversity_milli,
-                                n_valid: validated.n_valid,
-                                // Diverse gate-passing subset, capped at the
-                                // pallet's MAX_PROOF_SOLUTIONS (not all raw rows,
-                                // which would fail bounded-vec decode).
-                                solutions: validated.selected_solutions.clone(),
-                                is_pow: job.provenance.as_ref().is_some_and(|p| p.is_pow),
-                                order_id: job
-                                    .provenance
-                                    .as_ref()
-                                    .map(|p| p.order_id.clone())
-                                    .unwrap_or_default(),
-                                generation: job.generation,
-                                // Salt is chosen by the feeder when the PoW job
-                                // is derived and remembered by job_id; the live
-                                // RealChainClient submit requires 32 bytes.
-                                salt: salt.map_or_else(Vec::new, |s| s.to_vec()),
+                        settle_pow_result(
+                            chain.as_ref(),
+                            &state,
+                            &submit_notify,
+                            PowOutcome {
+                                miner_id: &miner_id,
+                                job: &job,
+                                job_id: &result.job_id,
+                                salt,
+                                validated,
+                                gates,
+                                current_best_milli: best,
                                 device_access_time_us: result
                                     .meta
                                     .as_ref()
                                     .map_or(0, |m| m.device_access_time_us),
-                            };
-                            let job_hex = crate::chain::extrinsic::hex_encode(&result.job_id);
-                            let submit_result = chain.submit_proof(&proof).await;
-                            match submit_result.as_ref().map(|r| r.action) {
-                                Ok(SubmitAction::Success) => {
-                                    let mut st = state.lock().await;
-                                    st.current_best_milli = Some(validated.best_energy_milli);
-                                    st.metrics.record_proof_submitted(&miner_id);
-                                    if let Some(n) = submit_notify.lock().await.take() {
-                                        let _ = n.send(());
-                                    }
-                                    submitted = true;
-                                }
-                                Ok(SubmitAction::Retry) => {
-                                    tracing::warn!(job = %job_hex, "session submit rejected (retryable); retaining accepted candidate for win-time retry");
-                                    state
-                                        .lock()
-                                        .await
-                                        .metrics
-                                        .record_submission_error(&miner_id);
-                                    retain_for_retry = true;
-                                }
-                                Ok(SubmitAction::StopRoundStale) => {
-                                    tracing::info!(job = %job_hex, "session submit stale for round; dropping candidate");
-                                    state.lock().await.metrics.record_stale_drop(&miner_id);
-                                }
-                                Ok(SubmitAction::StopFatal) => {
-                                    tracing::error!(job = %job_hex, "session submit fatally rejected by pallet; dropping candidate");
-                                    state
-                                        .lock()
-                                        .await
-                                        .metrics
-                                        .record_submission_error(&miner_id);
-                                }
-                                Err(e) => {
-                                    tracing::error!(job = %job_hex, error = %e, "session submit failed (transient); retaining accepted candidate for win-time retry");
-                                    state
-                                        .lock()
-                                        .await
-                                        .metrics
-                                        .record_submission_error(&miner_id);
-                                    retain_for_retry = true;
-                                }
-                            }
-                            receipt = Some(submit_result);
-                        }
-                        // Record the attempt; stash sub-threshold candidates so
-                        // the easing difficulty can still win them; refresh the
-                        // per-qblock summary when the stash or a submit changed.
-                        {
-                            let mut st = state.lock().await;
-                            st.results_validated += 1;
-                            let qblock_id = st.qblock_id;
-                            let device_us =
-                                result.meta.as_ref().map_or(0, |m| m.device_access_time_us);
-
-                            // A solution below the current threshold is submitted
-                            // immediately (above); one not yet viable is stashed
-                            // if the projection says the decay will clear it. An
-                            // accepted candidate whose submit failed transiently
-                            // (`retain_for_retry`) is also stashed so the win-time
-                            // loop resubmits it instead of losing a winner.
-                            let mut stash_changed = false;
-                            if !validated.accepted || retain_for_retry {
-                                let is_pow = job.provenance.as_ref().is_some_and(|p| p.is_pow);
-                                let order_id = job
-                                    .provenance
-                                    .as_ref()
-                                    .map(|p| p.order_id.clone())
-                                    .unwrap_or_default();
-                                stash_changed = st.stash.insert(crate::stash::Candidate {
-                                    job_id: result.job_id.clone(),
-                                    salt,
-                                    generation: job.generation,
-                                    // Raw best (gate-agnostic) so the decay
-                                    // projection can decide when the easing gate
-                                    // admits it. The rows resubmitted with it are
-                                    // `stash_solutions`: the prefix-safe subset
-                                    // (≤ MAX_PROOF_SOLUTIONS) that keeps clearing
-                                    // the chain's diversity gate however tight the
-                                    // ceiling is when the proof lands.
-                                    best_energy_milli: validated.raw_best_energy_milli,
-                                    diversity_milli: validated.diversity_milli,
-                                    n_valid: validated.n_valid,
-                                    solutions: validated.stash_solutions.clone(),
-                                    is_pow,
-                                    order_id,
-                                    device_access_time_us: device_us,
-                                    submitted: false,
-                                });
-                                let decision = if stash_changed {
-                                    "stashed"
-                                } else {
-                                    "discarded"
-                                };
-                                let stash_txt = match st.stash.summary().retained_band_milli() {
-                                    None => "empty".to_owned(),
-                                    Some((worst, best)) => format!(
-                                        "{} -> {}",
-                                        crate::logging::energy_units(worst),
-                                        crate::logging::energy_units(best)
-                                    ),
-                                };
-                                let target_txt = crate::logging::display_energy(
-                                    st.target.as_ref().map(|t| t.max_energy_milli),
-                                );
-                                tracing::info!(
-                                    "[quip-miner-{miner_id}] attempt {}: {decision} (stash: {stash_txt}, target <= {target_txt})",
-                                    short_job_id(&result.job_id),
-                                );
-                            }
-
-                            let pow_sequence = submitted
-                                .then(|| st.metrics.chain().miner_info.map(|i| i.proofs_submitted))
-                                .flatten();
-                            let ctx = crate::attempt::AttemptContext {
-                                miner_type: st
-                                    .miner_types
-                                    .get(&miner_id)
-                                    .cloned()
-                                    .unwrap_or_default(),
-                                // The ceiling the coordinator checked this
-                                // result against, not the base difficulty: the
-                                // gate is what decided accept or reject.
-                                threshold_milli: gates.min_energy_milli,
-                                last_proof_block_hash: st.last_proof_block_hash.clone(),
-                                extrinsic_hash: receipt
-                                    .as_ref()
-                                    .and_then(|r| r.as_ref().ok())
-                                    .and_then(|r| r.extrinsic_hash)
-                                    .map(|h| crate::chain::extrinsic::hex_encode(&h)),
-                                chain_block_hash: receipt
-                                    .as_ref()
-                                    .and_then(|r| r.as_ref().ok())
-                                    .and_then(|r| r.block_hash)
-                                    .map(|h| crate::chain::extrinsic::hex_encode(&h)),
-                                chain_block_number: receipt
-                                    .as_ref()
-                                    .and_then(|r| r.as_ref().ok())
-                                    .and_then(|r| r.block_number),
-                                pow_sequence,
-                                device_access_time_us: device_us,
-                            };
-                            let attempt = crate::attempt::AttemptRecord::new(
-                                qblock_id,
-                                &miner_id,
-                                &result.job_id,
-                                &job,
-                                &validated,
-                                submitted,
-                                &ctx,
-                            );
-                            let summary = (stash_changed || submitted).then(|| {
-                                crate::attempt::summary_body(
-                                    qblock_id,
-                                    st.current_best_milli,
-                                    st.results_validated,
-                                    st.stash.summary(),
-                                )
-                            });
-                            if let Some(tx) = st.attempt_tx.as_ref() {
-                                let _ =
-                                    tx.send(crate::attempt::WriterMsg::Attempt(Box::new(attempt)));
-                                if let Some(body) = summary {
-                                    let _ = tx.send(crate::attempt::WriterMsg::Summary {
-                                        qblock_id,
-                                        body,
-                                    });
-                                }
-                            }
-                        }
+                            },
+                        )
+                        .await;
                     }
                 }
             }
