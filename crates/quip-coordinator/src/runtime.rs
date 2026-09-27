@@ -1022,10 +1022,14 @@ pub async fn feeder_loop<C>(
                     .map(|c| c.stream_width);
                 let depth = if let Some(stream_width) = lease_width {
                     let finished = st.router.take_lease_salts(&id);
-                    let rate = salt_rates
-                        .entry(id.clone())
-                        .or_default()
-                        .observe(finished, rate_secs);
+                    // A miner's window opens at its first lease. Time before
+                    // that, such as the wait for registration, is not its rate.
+                    let rate = if let Some(r) = salt_rates.get_mut(&id) {
+                        r.observe(finished, rate_secs)
+                    } else {
+                        let _ = salt_rates.insert(id.clone(), crate::lease::SaltRate::default());
+                        0.0
+                    };
                     let count = crate::lease::lease_salt_count(rate, stream_width);
                     while st.router.staged_len(&id) < crate::lease::LEASE_STAGE_DEPTH {
                         let start = salt_ctr.saturating_add(1);

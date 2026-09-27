@@ -27,10 +27,12 @@ pub const LEASE_STAGE_DEPTH: usize = 2;
 /// nonce, so the two id spaces cannot collide.
 pub const LEASE_JOB_ID_PREFIX: &[u8] = b"lease:";
 
-/// Pipeline fills in a first lease, before any rate is known. A screening
-/// miner passes most salts in milliseconds, so a first lease this size still
-/// completes quickly while giving the rate estimate a useful first sample.
-const INITIAL_FILLS: u64 = 64;
+/// Assumed salts per second per pipeline slot before a miner's first lease
+/// completes. A Metal screening miner declares 81 slots and runs about 6,000
+/// salts per second, so its first lease already covers [`LEASE_TARGET_SECS`].
+/// A small first lease would measure the cascade tail instead of the miner,
+/// and the estimate would take several rounds to climb.
+const INITIAL_SALTS_PER_SEC_PER_SLOT: f64 = 75.0;
 
 /// Unique `job_id` for the lease whose first counter is `salt_start`. The feeder's
 /// counter never repeats within a process, so neither does the id.
@@ -85,8 +87,8 @@ pub fn build_lease_job(
 ///
 /// Covers [`LEASE_TARGET_SECS`] at `salts_per_sec`, but never fewer than one
 /// pipeline fill (`stream_width`, at least 1), so the miner's stream stays
-/// full, and never more than [`LEASE_MAX_SALTS`]. With no usable rate yet, a
-/// first lease holds [`INITIAL_FILLS`] pipeline fills.
+/// full, and never more than [`LEASE_MAX_SALTS`]. With no usable rate yet, it
+/// assumes [`INITIAL_SALTS_PER_SEC_PER_SLOT`] per slot.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
@@ -96,9 +98,11 @@ pub fn build_lease_job(
 )]
 pub fn lease_salt_count(salts_per_sec: f64, stream_width: u32) -> u64 {
     let fill = u64::from(stream_width.max(1));
-    if !salts_per_sec.is_finite() || salts_per_sec <= 0.0 {
-        return (fill * INITIAL_FILLS).min(LEASE_MAX_SALTS);
-    }
+    let salts_per_sec = if salts_per_sec.is_finite() && salts_per_sec > 0.0 {
+        salts_per_sec
+    } else {
+        fill as f64 * INITIAL_SALTS_PER_SEC_PER_SLOT
+    };
     let want = (salts_per_sec * LEASE_TARGET_SECS).ceil();
     let want = if want >= LEASE_MAX_SALTS as f64 {
         LEASE_MAX_SALTS
@@ -158,10 +162,6 @@ pub fn verify_and_select(
 /// salts or a whole lease. The estimate divides salts by elapsed time, both
 /// decayed over [`LEASE_RATE_WINDOW_SECS`], which turns those steps into a
 /// rate instead of a spike followed by decay toward zero.
-///
-/// The window opens at the first completed lease. Time before it holds no
-/// information about the rate, and counting it would size the next leases
-/// from the startup delay instead of the miner.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SaltRate {
     salts: f64,
@@ -170,15 +170,12 @@ pub struct SaltRate {
 
 impl SaltRate {
     /// Record `salts` finished over the last `elapsed_secs` and return the
-    /// updated rate, zero until the first lease completes.
+    /// updated rate.
     #[expect(
         clippy::cast_precision_loss,
         reason = "salt counts stay far below 2^52"
     )]
     pub fn observe(&mut self, salts: u64, elapsed_secs: f64) -> f64 {
-        if self.secs <= 0.0 && salts == 0 {
-            return 0.0;
-        }
         let keep = (-elapsed_secs / LEASE_RATE_WINDOW_SECS).exp();
         self.salts = self.salts * keep + salts as f64;
         self.secs = self.secs * keep + elapsed_secs;
@@ -251,8 +248,8 @@ mod tests {
 
     #[test]
     fn salt_count_starts_from_stream_width_without_a_rate() {
-        assert_eq!(lease_salt_count(0.0, 8), 512);
-        assert_eq!(lease_salt_count(0.0, 0), 64);
+        assert_eq!(lease_salt_count(0.0, 81), 364_500);
+        assert_eq!(lease_salt_count(0.0, 0), 4_500);
     }
 
     #[test]
@@ -275,24 +272,13 @@ mod tests {
     }
 
     #[test]
-    fn salt_rate_ignores_the_wait_before_the_first_lease() {
-        let mut rate = SaltRate::default();
-        for _ in 0..120 {
-            assert!(rate.observe(0, 1.0).abs() < f64::EPSILON);
-        }
-        // Two minutes of startup do not dilute the first lease.
-        let first = rate.observe(6_000, 1.0);
-        assert!((first - 6_000.0).abs() < 1.0, "first rate {first}");
-    }
-
-    #[test]
     fn salt_count_covers_the_target_duration_within_bounds() {
         assert_eq!(lease_salt_count(10.0, 1), 600);
         assert_eq!(lease_salt_count(0.1, 8), 8, "never below one pipeline fill");
         assert_eq!(lease_salt_count(1e12, 1), LEASE_MAX_SALTS);
         assert_eq!(
             lease_salt_count(f64::NAN, 2),
-            128,
+            9_000,
             "a bad rate falls back to the initial size"
         );
     }
