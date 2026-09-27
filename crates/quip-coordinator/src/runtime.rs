@@ -599,10 +599,6 @@ async fn stage_mempool_orders<C: ChainClient>(
     clippy::too_many_lines,
     reason = "single feeder loop: reseed, top-up, win-time submit"
 )]
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "salt counts per poll are far below 2^52"
-)]
 pub async fn feeder_loop<C>(
     chain: Arc<C>,
     state: Arc<Mutex<CoordinatorState>>,
@@ -619,8 +615,11 @@ pub async fn feeder_loop<C>(
     let start = std::time::Instant::now();
     // Per-miner smoothed jobs-consumed-per-poll, driving the adaptive window.
     let mut consumption_ema: HashMap<String, f64> = HashMap::new();
-    // Per-miner smoothed lease salts finished per poll, for lease sizing.
-    let mut salt_ema: HashMap<String, f64> = HashMap::new();
+    // Per-miner lease throughput, for lease sizing.
+    let mut salt_rates: HashMap<String, crate::lease::SaltRate> = HashMap::new();
+    // When lease rates were last updated, so each update covers the real
+    // time since the previous one rather than the nominal poll interval.
+    let mut last_rate_update = std::time::Instant::now();
     // Last difficulty triple broadcast to miners, so we only re-push on change
     // within a round. A reseed always pushes Topology and SetTarget again.
     let mut last_broadcast: Option<(i64, u32, u32)> = None;
@@ -1002,6 +1001,8 @@ pub async fn feeder_loop<C>(
             // and emitted off-lock below. The completion pair is (window,
             // total): window is completions since the last heartbeat.
             let mut stats: Vec<(String, u64, u64, usize, usize)> = Vec::new();
+            let rate_secs = last_rate_update.elapsed().as_secs_f64();
+            last_rate_update = std::time::Instant::now();
             for id in st.router.miner_ids() {
                 let consumed_raw = st.router.take_consumed(&id);
                 let consumed = f64::from(consumed_raw);
@@ -1020,15 +1021,11 @@ pub async fn feeder_loop<C>(
                     .filter(|c| c.accepts_leases())
                     .map(|c| c.stream_width);
                 let depth = if let Some(stream_width) = lease_width {
-                    let finished = st.router.take_lease_salts(&id) as f64;
-                    let ema = match salt_ema.get(&id) {
-                        Some(&prev) => {
-                            CONSUMPTION_EMA_ALPHA * finished + (1.0 - CONSUMPTION_EMA_ALPHA) * prev
-                        }
-                        None => finished,
-                    };
-                    let _ = salt_ema.insert(id.clone(), ema);
-                    let rate = ema / params.poll_interval.as_secs_f64().max(f64::EPSILON);
+                    let finished = st.router.take_lease_salts(&id);
+                    let rate = salt_rates
+                        .entry(id.clone())
+                        .or_default()
+                        .observe(finished, rate_secs);
                     let count = crate::lease::lease_salt_count(rate, stream_width);
                     while st.router.staged_len(&id) < crate::lease::LEASE_STAGE_DEPTH {
                         let start = salt_ctr.saturating_add(1);

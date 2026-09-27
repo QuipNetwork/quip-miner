@@ -4,10 +4,16 @@
 use crate::chain::snapshot::MiningSnapshot;
 use quip_proto::v1::{GeneratorAlgorithm, IsingProblemGenerator, Job, JobKind, Provenance};
 
-/// Seconds of sampling one lease should hold. The upgrade guide asks for "a
-/// few seconds": long enough that the lease round trip is small against the
-/// work, short enough that sizing follows a changing rate.
-pub const LEASE_TARGET_SECS: f64 = 4.0;
+/// Seconds of sampling one lease should hold. A lease completes only when its
+/// slowest salt does, and a screening miner can hold one salt for tens of
+/// seconds at full budget, so a lease must be long against that tail or the
+/// miner idles while it waits for `LeaseDone` to refund the credit.
+pub const LEASE_TARGET_SECS: f64 = 60.0;
+
+/// Time constant, in seconds, of the window [`SaltRate`] averages over. It
+/// spans several leases at [`LEASE_TARGET_SECS`], so one completion moves the
+/// estimate by a fraction of a lease rather than a whole one.
+pub const LEASE_RATE_WINDOW_SECS: f64 = 300.0;
 
 /// Upper bound on salts in one lease. Salts are counter values, so this bounds
 /// how far one lease can run past a rate estimate, not memory.
@@ -144,6 +150,37 @@ pub fn verify_and_select(
     Ok((verified, validated))
 }
 
+/// A miner's lease throughput in salts per second.
+///
+/// Salts are counted only at `LeaseDone`, so a single poll sees either no
+/// salts or a whole lease. The estimate divides salts by elapsed time, both
+/// decayed over [`LEASE_RATE_WINDOW_SECS`], which turns those steps into a
+/// rate instead of a spike followed by decay toward zero.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SaltRate {
+    salts: f64,
+    secs: f64,
+}
+
+impl SaltRate {
+    /// Record `salts` finished over the last `elapsed_secs` and return the
+    /// updated rate, zero until any time has passed.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "salt counts stay far below 2^52"
+    )]
+    pub fn observe(&mut self, salts: u64, elapsed_secs: f64) -> f64 {
+        let keep = (-elapsed_secs / LEASE_RATE_WINDOW_SECS).exp();
+        self.salts = self.salts * keep + salts as f64;
+        self.secs = self.secs * keep + elapsed_secs;
+        if self.secs > 0.0 {
+            self.salts / self.secs
+        } else {
+            0.0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,8 +247,33 @@ mod tests {
     }
 
     #[test]
+    fn salt_rate_averages_lease_completions_over_quiet_polls() {
+        // A miner finishing one 60,000-salt lease every 10 one-second polls
+        // runs at 6,000 salts per second. Per-poll smoothing swings between
+        // the whole lease and near zero. The window holds the true rate.
+        let mut rate = SaltRate::default();
+        let mut seen = Vec::new();
+        for poll in 1..=600 {
+            let salts = if poll % 10 == 0 { 60_000 } else { 0 };
+            seen.push(rate.observe(salts, 1.0));
+        }
+        for r in seen.iter().skip(300) {
+            assert!(
+                (5_000.0..=7_000.0).contains(r),
+                "rate {r} strays from 6,000"
+            );
+        }
+    }
+
+    #[test]
+    fn salt_rate_is_zero_before_any_time_passes() {
+        assert!(SaltRate::default().observe(0, 0.0).abs() < f64::EPSILON);
+        assert!(SaltRate::default().observe(5, 1.0) > 0.0);
+    }
+
+    #[test]
     fn salt_count_covers_the_target_duration_within_bounds() {
-        assert_eq!(lease_salt_count(10.0, 1), 40);
+        assert_eq!(lease_salt_count(10.0, 1), 600);
         assert_eq!(lease_salt_count(0.1, 8), 8, "never below one pipeline fill");
         assert_eq!(lease_salt_count(1e12, 1), LEASE_MAX_SALTS);
         assert_eq!(
