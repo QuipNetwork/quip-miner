@@ -258,8 +258,8 @@ async fn feeder_stages_disjoint_leases_for_a_lease_miner() {
         "overlapping ranges: {ranges:?}"
     );
     assert!(
-        ranges.iter().all(|(s, e)| e - s == 8),
-        "first lease holds 4 fills of width 2"
+        ranges.iter().all(|(s, e)| e - s == 128),
+        "first lease holds 64 fills of width 2"
     );
     drop(st);
 

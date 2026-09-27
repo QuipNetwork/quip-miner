@@ -27,8 +27,10 @@ pub const LEASE_STAGE_DEPTH: usize = 2;
 /// nonce, so the two id spaces cannot collide.
 pub const LEASE_JOB_ID_PREFIX: &[u8] = b"lease:";
 
-/// Pipeline fills in a first lease, before any rate is known.
-const INITIAL_FILLS: u64 = 4;
+/// Pipeline fills in a first lease, before any rate is known. A screening
+/// miner passes most salts in milliseconds, so a first lease this size still
+/// completes quickly while giving the rate estimate a useful first sample.
+const INITIAL_FILLS: u64 = 64;
 
 /// Unique `job_id` for the lease whose first counter is `salt_start`. The feeder's
 /// counter never repeats within a process, so neither does the id.
@@ -156,6 +158,10 @@ pub fn verify_and_select(
 /// salts or a whole lease. The estimate divides salts by elapsed time, both
 /// decayed over [`LEASE_RATE_WINDOW_SECS`], which turns those steps into a
 /// rate instead of a spike followed by decay toward zero.
+///
+/// The window opens at the first completed lease. Time before it holds no
+/// information about the rate, and counting it would size the next leases
+/// from the startup delay instead of the miner.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SaltRate {
     salts: f64,
@@ -164,12 +170,15 @@ pub struct SaltRate {
 
 impl SaltRate {
     /// Record `salts` finished over the last `elapsed_secs` and return the
-    /// updated rate, zero until any time has passed.
+    /// updated rate, zero until the first lease completes.
     #[expect(
         clippy::cast_precision_loss,
         reason = "salt counts stay far below 2^52"
     )]
     pub fn observe(&mut self, salts: u64, elapsed_secs: f64) -> f64 {
+        if self.secs <= 0.0 && salts == 0 {
+            return 0.0;
+        }
         let keep = (-elapsed_secs / LEASE_RATE_WINDOW_SECS).exp();
         self.salts = self.salts * keep + salts as f64;
         self.secs = self.secs * keep + elapsed_secs;
@@ -242,8 +251,8 @@ mod tests {
 
     #[test]
     fn salt_count_starts_from_stream_width_without_a_rate() {
-        assert_eq!(lease_salt_count(0.0, 8), 32);
-        assert_eq!(lease_salt_count(0.0, 0), 4);
+        assert_eq!(lease_salt_count(0.0, 8), 512);
+        assert_eq!(lease_salt_count(0.0, 0), 64);
     }
 
     #[test]
@@ -266,9 +275,14 @@ mod tests {
     }
 
     #[test]
-    fn salt_rate_is_zero_before_any_time_passes() {
-        assert!(SaltRate::default().observe(0, 0.0).abs() < f64::EPSILON);
-        assert!(SaltRate::default().observe(5, 1.0) > 0.0);
+    fn salt_rate_ignores_the_wait_before_the_first_lease() {
+        let mut rate = SaltRate::default();
+        for _ in 0..120 {
+            assert!(rate.observe(0, 1.0).abs() < f64::EPSILON);
+        }
+        // Two minutes of startup do not dilute the first lease.
+        let first = rate.observe(6_000, 1.0);
+        assert!((first - 6_000.0).abs() < 1.0, "first rate {first}");
     }
 
     #[test]
@@ -278,7 +292,7 @@ mod tests {
         assert_eq!(lease_salt_count(1e12, 1), LEASE_MAX_SALTS);
         assert_eq!(
             lease_salt_count(f64::NAN, 2),
-            8,
+            128,
             "a bad rate falls back to the initial size"
         );
     }
