@@ -1048,6 +1048,14 @@ pub async fn feeder_loop<C>(
                         if !st.router.stage_on(&id, job) {
                             break;
                         }
+                        tracing::info!(
+                            miner = %id,
+                            generation,
+                            salt_start = start,
+                            salt_count = count,
+                            salts_per_sec = rate,
+                            "lease issued"
+                        );
                         salt_ctr = start.saturating_add(count - 1);
                     }
                     crate::lease::LEASE_STAGE_DEPTH
