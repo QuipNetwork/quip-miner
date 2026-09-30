@@ -644,15 +644,22 @@ pub(crate) async fn settle_pow_result<C: ChainClient>(
             };
             let target_txt =
                 crate::logging::display_energy(st.target.as_ref().map(|t| t.max_energy_milli));
-            // Debug, not info: a lease Result now reports every salt a miner
-            // chooses to, not only winners, so this fires once per
-            // non-winning Result. At lease volume (one Result per salt) an
-            // info line here would dominate the log; the stash/metrics
-            // counters below still record every decision.
-            tracing::debug!(
+            let msg = format!(
                 "[quip-miner-{miner_id}] attempt {}: {decision} (stash: {stash_txt}, target <= {target_txt})",
                 short_job_id(job_id),
             );
+            // A plain PoW job produces at most one Result per dispatched job,
+            // so this stays at info. A lease Result now reports every salt a
+            // miner chooses to, not only winners, so this fires once per
+            // non-winning Result of a lease — at lease volume (one Result
+            // per salt) an info line there would dominate the log, so lease
+            // stays at debug. The stash/metrics counters below still record
+            // every decision either way.
+            if crate::lease::is_lease(job) {
+                tracing::debug!("{msg}");
+            } else {
+                tracing::info!("{msg}");
+            }
         }
 
         let pow_sequence = submitted
@@ -736,6 +743,14 @@ pub(crate) async fn handle_lease_result<C: ChainClient>(
         tracing::warn!(miner = %miner_id, "lease result before topology or target; dropping");
         return;
     };
+    if result.solutions.is_empty() {
+        // Not a protocol violation (a miner may report zero rows for a salt
+        // it drew but chose not to send), so this is debug, not warn. It is
+        // not participation either: the authenticity-only target accepts an
+        // empty set, so without this check `note_result` would fire for it.
+        tracing::debug!(miner = %miner_id, "lease result reports no solutions; dropping");
+        return;
+    }
     let (verified, validated) = match crate::lease::verify_and_select(
         generator, &view, &target, &result,
     ) {
@@ -1910,7 +1925,7 @@ mod tests {
 
     /// A verified lease Result whose energy does not clear the live target is
     /// held in the decay-ratchet stash, not submitted, and still counts as
-    /// participation for the round — the same as a plain PoW Result that
+    /// participation for the round — the same as a plain `PoW` Result that
     /// misses the gate.
     #[tokio::test]
     async fn lease_result_above_target_is_stashed_and_marks_round_mined() {
@@ -1944,6 +1959,7 @@ mod tests {
         );
         let state = Arc::new(Mutex::new(st));
         let chain = FakeChain::new(lease_snapshot(), None);
+        let (expected_nonce, expected_salt) = (r.nonce.clone(), r.salt.clone());
         handle_lease_result(&chain, &state, &notify(), "m", r).await;
         assert!(
             chain.take_submitted().is_empty(),
@@ -1954,6 +1970,19 @@ mod tests {
         assert!(
             st.round_mined(),
             "a verified lease Result counts as participation whether or not it clears the target"
+        );
+        let candidate = st
+            .stash
+            .due_at(u64::MAX)
+            .expect("the single stashed candidate becomes due within the horizon");
+        assert_eq!(
+            candidate.job_id, expected_nonce,
+            "stashed candidate keeps the result's nonce as its attempt id"
+        );
+        assert_eq!(
+            candidate.salt.map(|s| s.to_vec()),
+            Some(expected_salt),
+            "stashed candidate keeps the result's salt for the later live submit"
         );
     }
 
@@ -2013,6 +2042,21 @@ mod tests {
         let chain = FakeChain::new(lease_snapshot(), None);
         handle_lease_result(&chain, &state, &notify(), "m", winner(&job, 0)).await;
         assert!(chain.take_submitted().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_result_with_no_solutions_is_dropped_without_marking_the_round() {
+        let (st, job) = lease_state();
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        let mut r = winner(&job, 0);
+        r.solutions.clear();
+        handle_lease_result(&chain, &state, &notify(), "m", r).await;
+        assert!(chain.take_submitted().is_empty());
+        assert!(
+            !state.lock().await.round_mined(),
+            "reporting zero solutions is not participation"
+        );
     }
 
     #[test]
