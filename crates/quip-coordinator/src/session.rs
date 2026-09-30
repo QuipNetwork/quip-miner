@@ -753,6 +753,9 @@ pub(crate) fn handle_lease_done(
     match st.complete_inflight(&done.job_id) {
         Some(job) => {
             st.router.record_completion(miner_id);
+            if job.generation == st.generation {
+                st.router.record_round_salts(miner_id, done.salts_done);
+            }
             if done.salts_done > 0 {
                 st.note_result(job.generation);
             }
@@ -1924,6 +1927,11 @@ mod tests {
             3,
             "cancelled salts still count toward the rate"
         );
+        assert_eq!(
+            st.router.round_salts("m"),
+            0,
+            "a cancelled round's salts do not count toward this round"
+        );
         assert!(!st.round_mined());
     }
 
@@ -1952,6 +1960,7 @@ mod tests {
         assert!(st.round_mined());
         assert!(!st.inflight.contains_key(&job.job_id));
         assert_eq!(st.router.take_lease_salts("m"), 4);
+        assert_eq!(st.router.round_salts("m"), 4);
     }
 
     #[test]
