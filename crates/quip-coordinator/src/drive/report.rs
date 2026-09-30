@@ -17,6 +17,10 @@ pub struct JobRow {
     pub n_solutions: usize,
     /// Best (lowest) energy among accepted solutions, in milli-units.
     pub best_energy_milli: i64,
+    /// Lowest energy over every shape-valid solution, before the gate and the
+    /// diversity selection. `best_energy_milli` covers only the selected
+    /// subset, so a replay that wants the miner's best reads this field.
+    pub raw_best_energy_milli: i64,
     /// Diversity score of the solution set, in milli-units.
     pub diversity_milli: u32,
     /// Whether the result passed the quality gates.
@@ -178,6 +182,7 @@ fn row_to_json(r: &JobRow) -> serde_json::Value {
         "is_pow": r.is_pow,
         "n_solutions": r.n_solutions,
         "best_energy_milli": r.best_energy_milli,
+        "raw_best_energy_milli": r.raw_best_energy_milli,
         "diversity_milli": r.diversity_milli,
         "passed": r.passed,
         "rejected": r.rejected,
@@ -227,6 +232,7 @@ mod tests {
             is_pow: true,
             n_solutions: 1,
             best_energy_milli: -500,
+            raw_best_energy_milli: -700,
             diversity_milli: 200,
             passed,
             device_access_time_us: 100,
@@ -294,6 +300,8 @@ mod tests {
         {
             let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
             assert_eq!(first["passed"], true);
+            assert_eq!(first["best_energy_milli"], -500);
+            assert_eq!(first["raw_best_energy_milli"], -700);
             let last: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
             assert_eq!(last["aggregate"], true);
             assert_eq!(last["total_jobs"], 2);
