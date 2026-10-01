@@ -23,6 +23,9 @@ how they fit together. For build and run commands, see `AGENTS.md`.
 - `quip-coordinator seed-chain …` — registers a default topology and sets its
   difficulty on a fresh chain. You can seed a chain only once. Wipe the chain
   data and restart the validator if `DefaultTopology` is already set.
+- `quip-coordinator download …` — reads winning qblocks from a validator and
+  writes a `hardest_models` dataset that `drive --source list` can replay. It
+  never signs or submits.
 
 ## Logging
 
@@ -629,3 +632,26 @@ CPU-versus-CUDA benchmarking.
 
 The preset JSON stays under `crates/quip-coordinator/fixtures/drive/` as the
 readable source. The binary copies each file in at compile time.
+
+## Download mode
+
+`quip-coordinator download`, in the `download` module, reads winning qblocks from a
+validator and writes a `hardest_models` dataset. Select an inclusive range of qblocks with
+`--from` and `--to`, or select every qblock with `--all`, and name the output directory with
+`--out`.
+
+For each qblock, the command redraws the Ising problem from the qblock nonce and
+the topology, then scores the posted solution. The command skips a qblock whose redraw does
+not reproduce the recorded energy, and counts it in the summary.
+
+The command does not trust the `topology_hash` stored on each qblock. A chain
+migration overwrote that field with the default topology of the time. The
+command builds a timeline from `RegisteredTopologies`, ordered by
+`registered_at`, and gives each qblock the topology that was current at its
+`submitted_at` block. The command moves a qblock with an energy below
+`--energy-floor-milli` to the previous topology, because only a deeper topology can reach that
+energy. The default floor is the measured h0 floor, −14,650,000.
+
+The dataset holds one `instances.jsonl` per topology, ranked hardest first and
+capped at `--cap` records, plus one `manifest.json`. The manifest carries each
+topology specification, so a replay needs no chain. `--topology` keeps one topology only.
