@@ -415,6 +415,35 @@ floor is 256 (`main.rs`), generous enough to keep every miner fed from the
 first poll. The one-minute heartbeat reports completions, not this dispatch
 counter.
 
+### Decay projection and the win-time stash
+
+The chain eases `max_energy_milli` between wins. A solution that misses the
+threshold now may clear it later in the same round, so the session path
+stashes it and the feeder submits it at the projected block. `decay.rs`
+mirrors the chain's rule so the projection needs no per-block RPC.
+
+The chain has shipped two rules. Runtime 117 steps the threshold once per
+100-block epoch by 2.5% of the room to the easy cap. Runtime 118
+(quip-validator !87) eases every block in closed form. Past 100 blocks in a
+round it eases at twice the baseline rate. That doubling holds while the
+room to the easy cap exceeds the 40,000 milli floor crossover. Under the
+crossover both phases step 1,000 milli per epoch and the overdue term adds
+nothing. `DecayAlgorithm` names the two. `DecayModel` holds the stored base difficulty, the curve, the epoch
+length, and the rule, and answers the threshold at any elapsed block.
+
+`fetch_mining_snapshot` reads `state_getRuntimeVersion` at the snapshot
+block. `DecayAlgorithm::for_spec_version` picks the rule: continuous at
+spec 118 and later, stepwise before. The feeder builds the model at each
+reseed. On every poll it swaps the rule into the stash when the spec version
+changes. The stash keeps its candidates across the swap. The upgrade needs
+no restart.
+
+`WinStash::viability_block` finds the first block whose threshold exceeds a
+candidate's energy by binary search over 25,600 blocks. A candidate that
+does not clear inside that window is not held. The stash summary in
+`attempts.json` reports `decay_algorithm` so an operator can confirm which
+rule a round ran under.
+
 ## Routing and credits
 
 `Router` (`router.rs`) indexes miners by capability and holds a staged queue

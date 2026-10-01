@@ -1,6 +1,6 @@
 [package]
 name = "quip-coordinator"
-version = "0.3.5-rc8"
+version = "0.3.5-rc9"
 edition = "2021"
 
 [[bin]]
@@ -59,6 +59,10 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 toml = "0.8"
 blake3 = "1"
+# Pinned to the pallet's version so the decay projection matches the chain
+# bit for bit. libm is pure Rust; std's f64::powf and f64::ln call the platform
+# libm and may differ by an ulp, which the rounding turns into a milli.
+libm = "=0.2.16"
 getrandom = "0.2"
 async-trait = "0.1"
 # Stream type for RPC subscriptions. The transport trait returns a boxed

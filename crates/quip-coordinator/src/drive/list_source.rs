@@ -231,6 +231,7 @@ mod tests {
             max_energy_milli: i64::MAX,
             min_diversity_milli: 0,
             block_number: 0,
+            spec_version: 0,
         }
     }
 

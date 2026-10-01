@@ -444,6 +444,7 @@ mod tests {
             max_energy_milli: 0,
             min_diversity_milli: 0,
             block_number: 1,
+            spec_version: 117,
         };
         crate::lease::build_lease_job(&snap, [0; 32], start, 4, 1)
     }

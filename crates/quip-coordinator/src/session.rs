@@ -1312,6 +1312,7 @@ pub async fn serve_one_session_expecting(
             max_energy_milli: 0,
             min_diversity_milli: 0,
             block_number: 0,
+            spec_version: 117,
         },
         None,
     ));
@@ -1792,6 +1793,7 @@ mod tests {
             max_energy_milli: i64::MAX / 2,
             min_diversity_milli: 0,
             block_number: 42,
+            spec_version: 117,
         }
     }
 
@@ -1980,6 +1982,7 @@ mod tests {
             max_energy_milli: 0,
             min_diversity_milli: 0,
             block_number: 1,
+            spec_version: 117,
         };
         let job = crate::lease::build_lease_job(&snap, [0; 32], 21, 4, 1);
         st.dispatch_inflight("m", job.clone());

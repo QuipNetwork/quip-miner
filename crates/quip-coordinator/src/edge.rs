@@ -488,6 +488,7 @@ mod tests {
             max_energy_milli: 0,
             min_diversity_milli: 0,
             block_number: 1,
+            spec_version: 117,
         };
         let lease = crate::lease::build_lease_job(&snap, [0; 32], 1, 4, 1);
         assert!(v2_to_v1(CoordMsg {

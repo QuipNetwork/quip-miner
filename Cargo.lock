@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "quip-coordinator"
-version = "0.3.5-rc8"
+version = "0.3.5-rc9"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -3019,6 +3019,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hyper-util",
  "jsonrpsee",
+ "libm",
  "parity-scale-codec",
  "prost",
  "quantum-validation",

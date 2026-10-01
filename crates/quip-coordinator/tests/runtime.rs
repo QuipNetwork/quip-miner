@@ -66,6 +66,7 @@ fn trivial_snapshot() -> MiningSnapshot {
         max_energy_milli: 0,
         min_diversity_milli: 0,
         block_number: 0,
+        spec_version: 117,
     }
 }
 
@@ -174,6 +175,7 @@ fn ising_snapshot() -> MiningSnapshot {
         max_energy_milli: i64::MAX / 2,
         min_diversity_milli: 0,
         block_number: 42,
+        spec_version: 117,
     }
 }
 
@@ -2158,10 +2160,19 @@ async fn feeder_holds_a_stashed_candidate_until_the_live_difficulty_admits_it() 
     assert!(armed, "feeder never reseeded the round");
     {
         let mut st = state.lock().await;
-        // A schedule that clears at step 0 makes the candidate due immediately,
-        // so the projection is never what withholds it.
+        // A flat model at i64::MAX clears every energy at elapsed 0, so the
+        // projection is never what withholds the candidate.
         let generation = st.generation;
-        st.stash.reset(generation, vec![i64::MAX], 0, 1);
+        st.stash.reset(
+            generation,
+            Some(quip_coordinator::decay::DecayModel {
+                base_max_energy_milli: i64::MAX,
+                curve: None,
+                epoch_length: 1,
+                algorithm: quip_coordinator::decay::DecayAlgorithm::Stepwise,
+            }),
+            0,
+        );
         assert!(
             st.stash.insert(due_candidate()),
             "candidate must be stashed"
@@ -2208,4 +2219,99 @@ async fn feeder_holds_a_stashed_candidate_until_the_live_difficulty_admits_it() 
         .await
         .expect("feeder did not stop")
         .expect("feeder task panicked");
+}
+
+/// A runtime upgrade to 118 takes effect mid-round. The feeder switches the
+/// stash projection to the continuous rule on the poll that reports the new
+/// spec version, keeps the stashed candidate, and projects it earlier.
+#[tokio::test]
+async fn feeder_switches_the_decay_projection_when_the_runtime_upgrades() {
+    use quip_coordinator::decay::{DecayAlgorithm, DecayModel, EnergyCurve};
+
+    let chain = Arc::new(FakeChain::new(gated_snapshot(-1500), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(2, 40),
+        stop_rx,
+    ));
+
+    let mut armed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if state.lock().await.target.is_some() {
+            armed = true;
+            break;
+        }
+    }
+    assert!(armed, "feeder never reseeded the round");
+
+    // Plant a stepwise model far in the future so the candidate is never due
+    // during the test: last proof at 1,000,000, epoch 10, thresholds -50000,
+    // -48775, ... so -49500 clears at block 1,000,010 under stepwise.
+    let stepwise = DecayModel {
+        base_max_energy_milli: -50_000,
+        curve: Some(EnergyCurve {
+            min_milli: -100_000,
+            knee_milli: -50_000,
+            max_milli: -1_000,
+        }),
+        epoch_length: 10,
+        algorithm: DecayAlgorithm::Stepwise,
+    };
+    {
+        let mut st = state.lock().await;
+        let generation = st.generation;
+        st.stash.reset(generation, Some(stepwise), 1_000_000);
+        let mut cand = due_candidate();
+        cand.best_energy_milli = -49_500;
+        assert!(st.stash.insert(cand), "candidate must be stashed");
+        let summary = st.stash.summary();
+        assert_eq!(summary.decay_algorithm, "stepwise");
+        assert_eq!(
+            summary.candidates.first().and_then(|c| c.viability_block),
+            Some(1_000_010)
+        );
+    }
+
+    // The upgrade takes effect: same head, spec 118.
+    let mut upgraded = gated_snapshot(-1500);
+    upgraded.spec_version = 118;
+    chain.set_snapshot(Some(upgraded));
+
+    let mut switched = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if state.lock().await.stash.algorithm() == Some(DecayAlgorithm::Continuous) {
+            switched = true;
+            break;
+        }
+    }
+    assert!(
+        switched,
+        "feeder never switched the projection to continuous"
+    );
+
+    let summary = state.lock().await.stash.summary();
+    assert_eq!(summary.decay_algorithm, "continuous");
+    assert_eq!(
+        summary.candidates.len(),
+        1,
+        "the candidate survives the switch"
+    );
+    let block = summary
+        .candidates
+        .first()
+        .and_then(|c| c.viability_block)
+        .unwrap_or(u64::MAX);
+    assert!(
+        1_000_000 < block && block < 1_000_010,
+        "continuous projection must land inside the first epoch, got {block}"
+    );
+
+    let _ = stop_tx.send(true);
+    let _ = feeder.await;
 }

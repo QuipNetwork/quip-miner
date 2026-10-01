@@ -394,14 +394,7 @@ impl RealChainClient {
         let rv = self
             .rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
             .await?;
-        let spec_version = u32::try_from(
-            rv.get("specVersion")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    ChainError::Decode("runtime specVersion missing/not a u64".into())
-                })?,
-        )
-        .map_err(|_| ChainError::Decode("specVersion exceeds u32".into()))?;
+        let spec_version = parse_spec_version(&rv)?;
         let transaction_version = u32::try_from(
             rv.get("transactionVersion")
                 .and_then(Value::as_u64)
@@ -902,7 +895,7 @@ impl ChainClient for RealChainClient {
         };
         let at_hex = hex_encode(&block_hash);
 
-        // Every read is pinned at `block_hash`, so the four round trips that
+        // Every read is pinned at `block_hash`, so the five round trips that
         // only depend on it run together. The topology itself is not among
         // them: it is fetched once per hash and cached (see `topology_meta`).
         // `LastProofBlock` at the head names the winning block one block
@@ -910,7 +903,7 @@ impl ChainClient for RealChainClient {
         // the zero hash when unset.
         let last_proof_block_key = last_proof_block_storage_key();
         let stored_root_key = last_proof_block_hash_storage_key();
-        let (header, topology_hash, last_proof_block, stored_root) = futures::try_join!(
+        let (header, topology_hash, last_proof_block, stored_root, runtime_version) = futures::try_join!(
             self.rpc_call(
                 "chain_getHeader",
                 Value::Array(vec![Value::String(at_hex.clone())]),
@@ -918,11 +911,16 @@ impl ChainClient for RealChainClient {
             self.snapshot_topology_hash(topology_hash, &at_hex),
             self.read_storage::<u32>(&last_proof_block_key, &at_hex),
             self.read_storage::<[u8; 32]>(&stored_root_key, &at_hex),
+            self.rpc_call(
+                "state_getRuntimeVersion",
+                Value::Array(vec![Value::String(at_hex.clone())]),
+            ),
         )?;
         let Some(topology_hash) = topology_hash else {
             return Ok(None);
         };
         let block_number = parse_block_number(&header)?;
+        let spec_version = parse_spec_version(&runtime_version)?;
 
         // Decayed difficulty for this block. `None` means the hash is not
         // registered, which is the same "nothing to mine" as no topology.
@@ -961,6 +959,7 @@ impl ChainClient for RealChainClient {
             max_energy_milli: difficulty.max_energy_milli,
             min_diversity_milli: difficulty.min_diversity_milli,
             block_number,
+            spec_version,
         };
 
         if let Ok(mut g) = self.last_snapshot.lock() {
@@ -1550,6 +1549,16 @@ fn parse_block_number(header: &Value) -> Result<u64, ChainError> {
     Err(ChainError::Decode("header.number unparseable".into()))
 }
 
+/// `specVersion` from a `state_getRuntimeVersion` response.
+pub(crate) fn parse_spec_version(rv: &Value) -> Result<u32, ChainError> {
+    u32::try_from(
+        rv.get("specVersion")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ChainError::Decode("runtime specVersion missing/not a u64".into()))?,
+    )
+    .map_err(|_| ChainError::Decode("specVersion exceeds u32".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::transport_jsonrpsee::{
@@ -1606,8 +1615,17 @@ mod tests {
         assert!(!lost_race, "winning it ourselves is not a lost race");
     }
     use super::{
-        classify_state_outcome, explain_proof_failure, hex_encode, RealChainClient, StateOutcome,
+        classify_state_outcome, explain_proof_failure, hex_encode, parse_spec_version,
+        RealChainClient, StateOutcome,
     };
+
+    #[test]
+    fn parse_spec_version_reads_the_number_and_rejects_absence() {
+        let rv = serde_json::json!({ "specName": "quip-runtime", "specVersion": 118 });
+        assert_eq!(parse_spec_version(&rv).map_err(|e| e.to_string()), Ok(118));
+        let missing = serde_json::json!({ "specName": "quip-runtime" });
+        assert!(parse_spec_version(&missing).is_err());
+    }
     use crate::chain::scale_types::MinerKind;
     use crate::chain::ChainError;
     use serde_json::Value as JsonValue;
@@ -1830,6 +1848,14 @@ mod tests {
                     assert_eq!(arg(0), hex_encode(&HEAD), "header read pinned at the head");
                     serde_json::json!({ "number": "0x10" })
                 }
+                "state_getRuntimeVersion" => {
+                    assert_eq!(
+                        arg(0),
+                        hex_encode(&HEAD),
+                        "runtime version read pinned at the head"
+                    );
+                    serde_json::json!({ "specName": "quip-runtime", "specVersion": 118 })
+                }
                 "state_getStorage" => {
                     assert_eq!(arg(1), hex_encode(&HEAD), "storage read pinned at the head");
                     let key = hex_decode(&arg(0)).expect("storage key hex");
@@ -1921,6 +1947,7 @@ mod tests {
             "the win was at block 10, so the stored hash is the root"
         );
         assert_eq!(snap.block_number, 16);
+        assert_eq!(snap.spec_version, 118);
         assert_eq!(snap.topology_hash, first.to_vec());
         assert_eq!(snap.nodes, vec![0, 1, 0x11]);
         assert_eq!(snap.edges, vec![(0, 1), (1, 0x11)]);
