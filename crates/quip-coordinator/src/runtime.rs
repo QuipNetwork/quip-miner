@@ -23,7 +23,6 @@ use crate::session::{coord, CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
 use crate::topology::Topology;
 use crate::validate::QualityGates;
-use quip_proto::v1::miner_service_server::MinerServiceServer;
 use quip_proto::v1::{coord_msg, SetTarget};
 use std::collections::HashMap;
 use std::future::Future;
@@ -194,6 +193,7 @@ fn stage_ceiling(num_nodes: usize, num_edges: usize, floor: usize) -> usize {
 /// Difficulty gates advertised to miners, from the snapshot.
 fn target_from_snapshot(snap: &MiningSnapshot) -> SetTarget {
     SetTarget {
+        max_proof_solutions: crate::validate::MAX_PROOF_SOLUTIONS_WIRE,
         max_energy_milli: snap.max_energy_milli,
         min_solutions: snap.min_solutions,
         min_diversity_milli: snap.min_diversity_milli,
@@ -599,6 +599,10 @@ async fn stage_mempool_orders<C: ChainClient>(
     clippy::too_many_lines,
     reason = "single feeder loop: reseed, top-up, win-time submit"
 )]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "salt counts per poll are far below 2^52"
+)]
 pub async fn feeder_loop<C>(
     chain: Arc<C>,
     state: Arc<Mutex<CoordinatorState>>,
@@ -615,6 +619,8 @@ pub async fn feeder_loop<C>(
     let start = std::time::Instant::now();
     // Per-miner smoothed jobs-consumed-per-poll, driving the adaptive window.
     let mut consumption_ema: HashMap<String, f64> = HashMap::new();
+    // Per-miner smoothed lease salts finished per poll, for lease sizing.
+    let mut salt_ema: HashMap<String, f64> = HashMap::new();
     // Last difficulty triple broadcast to miners, so we only re-push on change
     // within a round. A reseed always pushes Topology and SetTarget again.
     let mut last_broadcast: Option<(i64, u32, u32)> = None;
@@ -1008,38 +1014,72 @@ pub async fn feeder_loop<C>(
                     None => consumed,
                 };
                 let _ = consumption_ema.insert(id.clone(), ema);
-                let depth = adaptive_depth(ema, params.buffer_depth).min(stage_ceiling(
-                    snap.nodes.len(),
-                    snap.edges.len(),
-                    params.buffer_depth,
-                ));
-                while st.router.staged_len(&id) < depth {
-                    salt_ctr = salt_ctr.saturating_add(1);
-                    let salt = salt_from_counter(salt_ctr);
-                    let job = match derive_pow_job(
-                        &snap,
-                        params.miner_identity,
-                        salt,
-                        generation,
-                        0,
-                    ) {
-                        Ok(job) => job,
-                        Err(e) => {
-                            // The snapshot's allowed-value sets are validated at
-                            // fetch (`require_set_values`), so an empty set here is
-                            // an invariant violation, not routine. Stop topping up
-                            // this miner rather than crash the feeder.
-                            tracing::error!(error = %e, miner = %id, "feeder: cannot draw PoW job");
+                let lease_width = st
+                    .router
+                    .caps(&id)
+                    .filter(|c| c.accepts_leases())
+                    .map(|c| c.stream_width);
+                let depth = if let Some(stream_width) = lease_width {
+                    let finished = st.router.take_lease_salts(&id) as f64;
+                    let ema = match salt_ema.get(&id) {
+                        Some(&prev) => {
+                            CONSUMPTION_EMA_ALPHA * finished + (1.0 - CONSUMPTION_EMA_ALPHA) * prev
+                        }
+                        None => finished,
+                    };
+                    let _ = salt_ema.insert(id.clone(), ema);
+                    let rate = ema / params.poll_interval.as_secs_f64().max(f64::EPSILON);
+                    let count = crate::lease::lease_salt_count(rate, stream_width);
+                    while st.router.staged_len(&id) < crate::lease::LEASE_STAGE_DEPTH {
+                        let start = salt_ctr.saturating_add(1);
+                        let job = crate::lease::build_lease_job(
+                            &snap,
+                            params.miner_identity,
+                            start,
+                            count,
+                            generation,
+                        );
+                        if !st.router.stage_on(&id, job) {
                             break;
                         }
-                    };
-                    let job_id = job.job_id.clone();
-                    if st.router.stage_on(&id, job) {
-                        st.record_salt(&job_id, salt);
-                    } else {
-                        break; // not capable for this shape — stop topping up
+                        salt_ctr = start.saturating_add(count - 1);
                     }
-                }
+                    crate::lease::LEASE_STAGE_DEPTH
+                } else {
+                    let depth = adaptive_depth(ema, params.buffer_depth).min(stage_ceiling(
+                        snap.nodes.len(),
+                        snap.edges.len(),
+                        params.buffer_depth,
+                    ));
+                    while st.router.staged_len(&id) < depth {
+                        salt_ctr = salt_ctr.saturating_add(1);
+                        let salt = salt_from_counter(salt_ctr);
+                        let job = match derive_pow_job(
+                            &snap,
+                            params.miner_identity,
+                            salt,
+                            generation,
+                            0,
+                        ) {
+                            Ok(job) => job,
+                            Err(e) => {
+                                // The snapshot's allowed-value sets are validated at
+                                // fetch (`require_set_values`), so an empty set here is
+                                // an invariant violation, not routine. Stop topping up
+                                // this miner rather than crash the feeder.
+                                tracing::error!(error = %e, miner = %id, "feeder: cannot draw PoW job");
+                                break;
+                            }
+                        };
+                        let job_id = job.job_id.clone();
+                        if st.router.stage_on(&id, job) {
+                            st.record_salt(&job_id, salt);
+                        } else {
+                            break; // not capable for this shape — stop topping up
+                        }
+                    }
+                    depth
+                };
                 // Wake the dispatcher now that work is staged. A miner grants
                 // its credits when it starts, which is normally before the
                 // first snapshot arrives, so that grant drained an empty queue
@@ -1338,7 +1378,7 @@ where
     };
     let server = tokio::spawn(
         Server::builder()
-            .add_service(MinerServiceServer::new(svc))
+            .add_service(crate::edge::DualMinerServer::new(svc))
             .serve_with_incoming(incoming),
     );
 

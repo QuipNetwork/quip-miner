@@ -22,7 +22,7 @@ async fn clean_exit_reclaims_and_reroutes_inflight() {
     use quip_coordinator::router::MinerCaps;
     use quip_coordinator::session::CoordinatorState;
     use quip_coordinator::supervisor::{supervise_miner, BackoffPolicy};
-    use quip_proto::v1::{Configure, IsingProblem, Job, JobKind, Provenance};
+    use quip_proto::v1::{Configure, Job, JobKind, Provenance};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{watch, Mutex};
@@ -31,16 +31,15 @@ async fn clean_exit_reclaims_and_reroutes_inflight() {
     fn job(job_id: &str, generation: u64, is_pow: bool) -> Job {
         Job {
             job_id: job_id.as_bytes().to_vec(),
+            generator: None,
             kind: JobKind::IsingSample as i32,
             generation,
             deadline_ms: 9_999_999,
-            ising: Some(IsingProblem {
-                graph: None,
-                h_milli_le32: vec![0; 8], // 2 nodes
-                j_milli_le32: vec![0; 4], // 1 edge
-                num_reads: 0,
-                num_sweeps: 0,
-                anneal_time_us: 0,
+            ising: Some({
+                let mut problem =
+                    quip_coordinator::producer::problem::milli_problem(None, &[0; 2], &[0; 1]);
+                problem.num_reads = 0;
+                problem
             }),
             provenance: Some(Provenance {
                 is_pow,
@@ -56,6 +55,7 @@ async fn clean_exit_reclaims_and_reroutes_inflight() {
             supported_kinds: vec![JobKind::IsingSample as i32],
             max_nodes: 1000,
             max_edges: 10000,
+            ..MinerCaps::default()
         }
     }
 

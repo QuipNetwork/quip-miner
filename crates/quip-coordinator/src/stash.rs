@@ -8,7 +8,7 @@
 //! threshold yet but will after enough decay, so they aren't discarded.
 
 use crate::decay::{DecayAlgorithm, DecayModel};
-use quip_proto::v1::Solution;
+use crate::validate::SpinRow;
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -32,7 +32,7 @@ pub struct Candidate {
     /// Count of gate-passing solutions retained.
     pub n_valid: u32,
     /// Solutions to resubmit when the candidate becomes viable.
-    pub solutions: Vec<Solution>,
+    pub solutions: Vec<SpinRow>,
     /// Whether the job was a `PoW` job.
     pub is_pow: bool,
     /// Mempool order id (empty for `PoW`).

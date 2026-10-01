@@ -57,7 +57,7 @@ pub struct Proof {
     /// Count of solutions that passed local gates.
     pub n_valid: u32,
     /// Valid solutions (spins + reported energies).
-    pub solutions: Vec<quip_proto::v1::Solution>,
+    pub solutions: Vec<crate::validate::SpinRow>,
     /// `true` when this is a `PoW` proof (not a mempool order).
     pub is_pow: bool,
     /// Mempool order id bytes; empty for pure `PoW`.

@@ -23,7 +23,8 @@ use quip_coordinator::router::MinerCaps;
 use quip_coordinator::runtime::{feeder_loop, run_runtime, FeederParams, RuntimeParams};
 use quip_coordinator::session::CoordinatorState;
 use quip_coordinator::supervisor::BackoffPolicy;
-use quip_proto::v1::{Configure, JobKind};
+use quip_proto::v1::{Configure, GeneratorAlgorithm, JobKind};
+use quip_protocol::derive::derive_nonce;
 use sp_core::crypto::{AccountId32, Ss58Codec};
 use std::sync::Arc;
 use std::time::Duration;
@@ -185,7 +186,88 @@ fn ising_caps() -> MinerCaps {
         supported_kinds: vec![JobKind::IsingSample as i32],
         max_nodes: 0,
         max_edges: 0,
+        ..MinerCaps::default()
     }
+}
+
+fn lease_caps() -> MinerCaps {
+    MinerCaps {
+        supported_kinds: vec![JobKind::IsingSample as i32, JobKind::IsingGenerate as i32],
+        generators: vec![GeneratorAlgorithm::Blake3Chacha8V1 as i32],
+        stream_width: 2,
+        ..ising_caps()
+    }
+}
+
+/// A lease miner gets salt ranges, not per-salt jobs. The ranges must not
+/// overlap, or two leases would draw and submit the same salt.
+#[tokio::test]
+async fn feeder_stages_disjoint_leases_for_a_lease_miner() {
+    let chain = Arc::new(FakeChain::new(ising_snapshot(), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", lease_caps());
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(4, 50),
+        stop_rx,
+    ));
+
+    let depth = quip_coordinator::lease::LEASE_STAGE_DEPTH;
+    let mut filled = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if state.lock().await.router.staged_len("cpu-0") == depth {
+            filled = true;
+            break;
+        }
+    }
+    assert!(filled, "feeder never staged {depth} leases");
+
+    let mut st = state.lock().await;
+    assert!(
+        st.salts.is_empty(),
+        "leases carry their salts; nothing is recorded per job"
+    );
+    assert_eq!(st.target.map(|t| t.max_proof_solutions), Some(32));
+    st.router.grant_credits("cpu-0", 8);
+    let mut ranges = Vec::new();
+    while let Some(job) = st.router.next_job("cpu-0") {
+        assert_eq!(job.kind, JobKind::IsingGenerate as i32);
+        let g = job.generator.expect("lease generator");
+        assert_eq!(
+            g.miner_account,
+            vec![0u8; 32],
+            "leases use the PoW identity"
+        );
+        ranges.push((g.salt_start, g.salt_start + g.salt_count));
+    }
+    ranges.sort_unstable();
+    assert!(
+        ranges.windows(2).all(|pair| {
+            let [(_, left_end), (right_start, _)] = pair else {
+                return false;
+            };
+            left_end <= right_start
+        }),
+        "overlapping ranges: {ranges:?}"
+    );
+    assert!(
+        ranges.iter().all(|(s, e)| e - s == 8),
+        "first lease holds 4 fills of width 2"
+    );
+    drop(st);
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
 }
 
 #[tokio::test]
@@ -252,8 +334,6 @@ async fn feeder_tops_up_to_buffer_depth_records_salts_and_sets_target() {
 /// `InvalidNonce`. Neither failure names the mix-up, so pin both routes here.
 #[tokio::test]
 async fn feeder_funds_the_account_and_derives_jobs_from_the_identity() {
-    use quip_protocol::derive::derive_nonce;
-
     const IDENTITY: [u8; 32] = [0x11; 32];
     const ACCOUNT: [u8; 32] = [0x22; 32];
     const HEAD: [u8; 32] = [0x33; 32];
@@ -265,6 +345,11 @@ async fn feeder_funds_the_account_and_derives_jobs_from_the_identity() {
         .await
         .router
         .register_miner("cpu-0", ising_caps());
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-1", lease_caps());
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let feeder = tokio::spawn(feeder_loop(
@@ -289,7 +374,8 @@ async fn feeder_funds_the_account_and_derives_jobs_from_the_identity() {
     let mut filled = false;
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(30)).await;
-        if state.lock().await.router.staged_len("cpu-0") >= 2 {
+        let st = state.lock().await;
+        if st.router.staged_len("cpu-0") >= 2 && st.router.staged_len("cpu-1") >= 2 {
             filled = true;
             break;
         }
@@ -303,7 +389,7 @@ async fn feeder_funds_the_account_and_derives_jobs_from_the_identity() {
         "funding must read the signing account, not the PoW identity: {checked:?}"
     );
 
-    let st = state.lock().await;
+    let mut st = state.lock().await;
     assert!(!st.salts.is_empty(), "no salts recorded for staged jobs");
     for (job_id, salt) in &st.salts {
         assert_eq!(
@@ -317,6 +403,11 @@ async fn feeder_funds_the_account_and_derives_jobs_from_the_identity() {
             "job nonce must not derive from the signing account"
         );
     }
+    st.router.grant_credits("cpu-1", 1);
+    let staged = st.router.next_job("cpu-1").expect("staged lease");
+    let generator = staged.generator.expect("lease generator");
+    assert_eq!(generator.miner_account, IDENTITY);
+    assert_ne!(generator.miner_account, ACCOUNT);
     drop(st);
 
     let _ = stop_tx.send(true);
@@ -1446,6 +1537,83 @@ async fn wait_participations(chain: &FakeChain, n: usize) -> bool {
     false
 }
 
+/// A real session with the lease-capable mock: the coordinator verifies a
+/// winning salt and submits it with the salt from inside the lease.
+#[tokio::test]
+async fn runtime_submits_a_verified_lease_winner() {
+    let miner = mock_miner();
+    let sock = format!("/tmp/quip-rt-lease-{}.sock", std::process::id());
+    let chain = Arc::new(FakeChain::new(ising_snapshot(), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let params = RuntimeParams {
+        max_submit_attempts: 5,
+        sock_path: sock,
+        grace_ms: 500,
+        backoff: BackoffPolicy::default(),
+        miner_identity: [0u8; 32],
+        miner_account: [0u8; 32],
+        buffer_depth: 1,
+        poll_interval_ms: 50,
+        dashboard: None,
+        log_level: quip_coordinator::logging::LogLevel::Info,
+        funding: quip_coordinator::funding::FundingParams::default(),
+        descriptor: quip_coordinator::config::DescriptorParams::default(),
+        descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        solver_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        identity: quip_coordinator::metrics::Identity::default(),
+    };
+    let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
+    let run = tokio::spawn(run_runtime(
+        vec![cpu_entry(miner)],
+        Arc::clone(&chain),
+        state,
+        params,
+        async move {
+            let _ = trigger_rx.await;
+        },
+    ));
+
+    let submitted = wait_for(|| !chain.submitted.lock().expect("submitted lock").is_empty()).await;
+    let participated = wait_participations(&chain, 1).await;
+
+    trigger_tx.send(()).expect("send shutdown trigger");
+    tokio::time::timeout(Duration::from_secs(6), run)
+        .await
+        .expect("run_runtime did not return after shutdown")
+        .expect("run_runtime task panicked")
+        .expect("run_runtime returned an error");
+
+    assert!(submitted, "no lease winner reached submit_proof");
+    assert!(participated, "a lease round must declare participation");
+    let proof = chain
+        .take_submitted()
+        .into_iter()
+        .next()
+        .expect("one proof");
+    assert_eq!(proof.salt.len(), 32);
+    let counter_bytes: [u8; 8] = proof
+        .salt
+        .get(..8)
+        .expect("8 salt counter bytes")
+        .try_into()
+        .expect("8 bytes");
+    let counter = u64::from_le_bytes(counter_bytes);
+    assert!(
+        counter >= 1,
+        "lease counters start after the feeder's first increment"
+    );
+    assert!(
+        proof
+            .salt
+            .get(8..)
+            .expect("base salt bytes")
+            .iter()
+            .all(|&b| b == 0),
+        "zero base salt"
+    );
+}
+
 /// Staging work is not participating. The declaration waits for a miner to
 /// return a Result for the round: a QPU that sits a round out by withholding
 /// credits (or any miner that is down) must not be recorded as a participant.
@@ -1925,27 +2093,21 @@ fn gated_snapshot(max_energy_milli: i64) -> MiningSnapshot {
     snap
 }
 
-/// Wire spin bytes: `+1 -> 0x01`, `-1 -> 0xFF`.
-fn spin_bytes(spins: &[i8]) -> Vec<u8> {
-    spins
-        .iter()
-        .map(|&s| if s > 0 { 0x01 } else { 0xFF })
-        .collect()
-}
-
 /// Three mutually distant rows, each pair at symmetric Hamming distance 2 of 4
 /// spins, so any two score 500 milli and all three score 500 milli.
-fn distant_rows() -> Vec<quip_proto::v1::Solution> {
+fn distant_rows() -> Vec<quip_coordinator::validate::SpinRow> {
     [
         (vec![1, 1, 1, 1], -3000),
         (vec![1, 1, -1, -1], -2000),
         (vec![1, -1, 1, -1], -1000),
     ]
     .into_iter()
-    .map(|(spins, energy_milli)| quip_proto::v1::Solution {
-        spins_bytes: spin_bytes(&spins),
-        energy_milli,
-    })
+    .map(
+        |(spins, energy_milli)| quip_coordinator::validate::SpinRow {
+            spins,
+            energy_milli,
+        },
+    )
     .collect()
 }
 

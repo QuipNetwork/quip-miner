@@ -475,6 +475,41 @@ liveness; `Shutdown` ends the session in-band. The harness owns credits, reject
 reasons, and liveness, so each backend only has to sample. `SPEC.md` in the
 quip-solver-core repo specifies this contract from the miner's side.
 
+### Protocol v1 and v2 edge
+
+The session edge serves protocol v1 and v2 miners on the same gRPC path. It
+classifies the first frame, then decodes and encodes messages with that
+protocol's schema. The edge translates v1 frames to the coordinator's v2
+messages and translates supported v2 responses back to v1.
+
+| Message | Translation at the edge |
+|---|---|
+| v1 `Hello` in | v2 `Hello` with v2 capabilities |
+| v1 `Result` spin bytes in | Packed spins in a v2 `Result` |
+| v2 plain `I32` job at scale 1000 out | v1 `Job` with little-endian milli coefficients |
+| v2 lease or other encoding out | No v1 form. The router does not send it to v1 miners |
+
+The edge reports a v1 peer as protocol v2 to the session handler after
+translation. Remove the edge and its v1 dependency after every miner repository
+releases a v2 build.
+
+## Salt lease staging
+
+The feeder stages `ISING_GENERATE` jobs only for miners that advertise the
+BLAKE3/ChaCha8 generator. D-Wave does not advertise that generator and keeps
+receiving plain jobs.
+
+The coordinator sizes each lease from a smoothed salts-per-second rate.
+`LEASE_TARGET_SECS` sets the four-second target. The floor is one pipeline fill
+based on `stream_width`. `LEASE_MAX_SALTS` caps a lease at 2²⁰ salts. Before the
+feeder has a usable rate, it stages four pipeline fills. `LEASE_STAGE_DEPTH`
+sets the two-lease staging limit per miner.
+
+The lease miner sends winners only. Near misses never reach the coordinator's
+win-time stash. A winner reaches that stash only when proof submission fails
+transiently. `LeaseDone` completes the lease. If `salts_done` is greater than
+zero, the miner counts as a round participant.
+
 ## Supervision and shutdown
 
 `supervise_miner` (`supervisor.rs`) owns one miner for the run. It spawns the

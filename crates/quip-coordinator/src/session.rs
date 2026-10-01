@@ -9,6 +9,7 @@ use crate::topology::Topology;
 use crate::validate::{beats_current, validate_result, ResolvedTopo};
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, Shutdown, Welcome};
+use quip_protocol::session::{backend_name, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -18,6 +19,7 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+use tokio_stream::StreamExt as _;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -146,6 +148,10 @@ pub struct CoordinatorState {
     pub configure: HashMap<String, Configure>,
     /// Active graph topology advertised to miners, if any.
     pub topology: Option<Topology>,
+    /// Dense-position view of `topology` that lease verification draws on.
+    /// Built once in [`CoordinatorState::set_topology`]. `None` without a
+    /// topology or when the topology cannot map its edges.
+    pub lease_topology: Option<Arc<quip_protocol::lease::TopologyView>>,
     /// Position-indexed scoring form of `topology`, resolved once via
     /// [`CoordinatorState::set_topology`]. A run constant every result borrows
     /// by `Arc`, so the graph is never rebuilt per result.
@@ -226,6 +232,7 @@ impl CoordinatorState {
             expected_tokens: HashMap::new(),
             configure: HashMap::new(),
             topology: None,
+            lease_topology: None,
             resolved_topo: Arc::new(ResolvedTopo::default()),
             target: None,
             router: Router::new(),
@@ -255,6 +262,12 @@ impl CoordinatorState {
     /// once. Both drive and production go through here so `validate_result`
     /// never rebuilds the graph per result.
     pub fn set_topology(&mut self, topology: Option<Topology>) {
+        self.lease_topology = topology.as_ref().and_then(|t| {
+            quip_protocol::lease::TopologyView::from_proto(&t.to_proto())
+                .map_err(|e| tracing::error!(error = ?e, "topology cannot back lease verification"))
+                .ok()
+                .map(Arc::new)
+        });
         self.resolved_topo = Arc::new(
             topology
                 .as_ref()
@@ -403,26 +416,382 @@ pub struct CoordinatorService<C: ChainClient + 'static> {
     pub submit_notify: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
-#[tonic::async_trait]
-impl<C: ChainClient + 'static> MinerService for CoordinatorService<C> {
-    type SessionStream = ReceiverStream<Result<CoordMsg, Status>>;
-
-    async fn session(
+impl<C: ChainClient + 'static> CoordinatorService<C> {
+    /// Serve one miner session from raw frames. The first frame picks the
+    /// protocol, see [`crate::edge::classify`].
+    #[expect(
+        clippy::result_large_err,
+        reason = "tonic streams require Status errors"
+    )]
+    pub(crate) async fn session_frames(
         &self,
-        request: Request<Streaming<MinerMsg>>,
-    ) -> Result<Response<Self::SessionStream>, Status> {
-        let mut inbound = request.into_inner();
+        mut inbound: Streaming<bytes::Bytes>,
+    ) -> Result<Response<crate::edge::FrameStream>, Status> {
+        use prost::Message as _;
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("stream closed before Hello"))?;
+        let (peer, hello) = crate::edge::classify(&first);
         let (tx, rx) = mpsc::channel::<Result<CoordMsg, Status>>(64);
         let state = Arc::clone(&self.state);
         let chain = Arc::clone(&self.chain);
         let submit_notify = Arc::clone(&self.submit_notify);
-
+        let decode = match peer {
+            crate::edge::PeerProtocol::V1 => crate::edge::decode_v1,
+            crate::edge::PeerProtocol::V2 => crate::edge::decode_v2,
+        };
+        let rest = inbound.map(move |frame| frame.and_then(|b| decode(&b)));
+        let mut msgs = Box::pin(tokio_stream::once(hello).chain(rest));
         drop(tokio::spawn(async move {
-            run_session(&mut inbound, &tx, state, chain, submit_notify).await;
+            run_session(&mut msgs, &tx, state, chain, submit_notify, peer).await;
         }));
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let out = ReceiverStream::new(rx);
+        let frames: crate::edge::FrameStream = match peer {
+            crate::edge::PeerProtocol::V2 => {
+                Box::pin(out.map(|r| r.map(|m| bytes::Bytes::from(m.encode_to_vec()))))
+            }
+            crate::edge::PeerProtocol::V1 => Box::pin(out.filter_map(|r| match r {
+                Ok(m) => {
+                    crate::edge::v2_to_v1(m).map(|o| Ok(bytes::Bytes::from(o.encode_to_vec())))
+                }
+                Err(s) => Some(Err(s)),
+            })),
+        };
+        Ok(Response::new(frames))
     }
+}
+
+/// One validated proof-of-work outcome to settle.
+pub(crate) struct PowOutcome<'a> {
+    /// Miner that produced the result.
+    pub miner_id: &'a str,
+    /// The dispatched job: a plain job, or the lease the winner came from.
+    pub job: &'a quip_proto::v1::Job,
+    /// Attempt identifier: the nonce for proof-of-work.
+    pub job_id: &'a [u8],
+    /// Salt the nonce was derived from, required by live submit.
+    pub salt: Option<[u8; 32]>,
+    /// Scored rows and gate verdict.
+    pub validated: crate::validate::Validated,
+    /// Gates the verdict used.
+    pub gates: crate::validate::QualityGates,
+    /// Round best before this outcome.
+    pub current_best_milli: Option<i64>,
+    /// Device time the miner reported.
+    pub device_access_time_us: u64,
+}
+
+/// Submit an accepted outcome that beats the round best, keep a transient
+/// submit failure for the win-time retry, stash a sub-threshold outcome, and
+/// record the attempt.
+#[expect(
+    clippy::too_many_lines,
+    reason = "settling a proof preserves submit, stash, and attempt ordering"
+)]
+pub(crate) async fn settle_pow_result<C: ChainClient>(
+    chain: &C,
+    state: &Arc<Mutex<CoordinatorState>>,
+    submit_notify: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    outcome: PowOutcome<'_>,
+) {
+    let PowOutcome {
+        miner_id,
+        job,
+        job_id,
+        salt,
+        validated,
+        gates,
+        current_best_milli: best,
+        device_access_time_us,
+    } = outcome;
+    let mut submitted = false;
+    // Set when an accepted proof fails to submit for a
+    // transient reason: keep it for the win-time retry loop
+    // instead of dropping a genuine winner.
+    let mut retain_for_retry = false;
+    // Chain detail of the submit attempt, kept for the
+    // attempt record below; `None` when this result never
+    // reached the gate that triggers a submit.
+    let mut receipt: Option<Result<SubmitReceipt, ChainError>> = None;
+    if validated.accepted && beats_current(validated.best_energy_milli, best) {
+        let proof = Proof {
+            job_id: job_id.to_vec(),
+            best_energy_milli: validated.best_energy_milli,
+            diversity_milli: validated.diversity_milli,
+            n_valid: validated.n_valid,
+            // Diverse gate-passing subset, capped at the
+            // pallet's MAX_PROOF_SOLUTIONS (not all raw rows,
+            // which would fail bounded-vec decode).
+            solutions: validated.selected_solutions.clone(),
+            is_pow: job.provenance.as_ref().is_some_and(|p| p.is_pow),
+            order_id: job
+                .provenance
+                .as_ref()
+                .map(|p| p.order_id.clone())
+                .unwrap_or_default(),
+            generation: job.generation,
+            // Salt is chosen by the feeder when the PoW job
+            // is derived and remembered by job_id; the live
+            // RealChainClient submit requires 32 bytes.
+            salt: salt.map_or_else(Vec::new, |s| s.to_vec()),
+            device_access_time_us,
+        };
+        let job_hex = crate::chain::extrinsic::hex_encode(job_id);
+        let submit_result = chain.submit_proof(&proof).await;
+        match submit_result.as_ref().map(|r| r.action) {
+            Ok(SubmitAction::Success) => {
+                let mut st = state.lock().await;
+                st.current_best_milli = Some(validated.best_energy_milli);
+                st.metrics.record_proof_submitted(miner_id);
+                if let Some(n) = submit_notify.lock().await.take() {
+                    let _ = n.send(());
+                }
+                submitted = true;
+            }
+            Ok(SubmitAction::Retry) => {
+                tracing::warn!(job = %job_hex, "session submit rejected (retryable); retaining accepted candidate for win-time retry");
+                state.lock().await.metrics.record_submission_error(miner_id);
+                retain_for_retry = true;
+            }
+            Ok(SubmitAction::StopRoundStale) => {
+                tracing::info!(job = %job_hex, "session submit stale for round; dropping candidate");
+                state.lock().await.metrics.record_stale_drop(miner_id);
+            }
+            Ok(SubmitAction::StopFatal) => {
+                tracing::error!(job = %job_hex, "session submit fatally rejected by pallet; dropping candidate");
+                state.lock().await.metrics.record_submission_error(miner_id);
+            }
+            Err(e) => {
+                tracing::error!(job = %job_hex, error = %e, "session submit failed (transient); retaining accepted candidate for win-time retry");
+                state.lock().await.metrics.record_submission_error(miner_id);
+                retain_for_retry = true;
+            }
+        }
+        receipt = Some(submit_result);
+    }
+    // Record the attempt; stash sub-threshold candidates so
+    // the easing difficulty can still win them; refresh the
+    // per-qblock summary when the stash or a submit changed.
+    {
+        let mut st = state.lock().await;
+        st.results_validated += 1;
+        let qblock_id = st.qblock_id;
+        let device_us = device_access_time_us;
+
+        // A solution below the current threshold is submitted
+        // immediately (above); one not yet viable is stashed
+        // if the projection says the decay will clear it. An
+        // accepted candidate whose submit failed transiently
+        // (`retain_for_retry`) is also stashed so the win-time
+        // loop resubmits it instead of losing a winner.
+        let mut stash_changed = false;
+        if !validated.accepted || retain_for_retry {
+            let is_pow = job.provenance.as_ref().is_some_and(|p| p.is_pow);
+            let order_id = job
+                .provenance
+                .as_ref()
+                .map(|p| p.order_id.clone())
+                .unwrap_or_default();
+            stash_changed = st.stash.insert(crate::stash::Candidate {
+                job_id: job_id.to_vec(),
+                salt,
+                generation: job.generation,
+                // Raw best (gate-agnostic) so the decay
+                // projection can decide when the easing gate
+                // admits it. The rows resubmitted with it are
+                // `stash_solutions`: the prefix-safe subset
+                // (≤ MAX_PROOF_SOLUTIONS) that keeps clearing
+                // the chain's diversity gate however tight the
+                // ceiling is when the proof lands.
+                best_energy_milli: validated.raw_best_energy_milli,
+                diversity_milli: validated.diversity_milli,
+                n_valid: validated.n_valid,
+                solutions: validated.stash_solutions.clone(),
+                is_pow,
+                order_id,
+                device_access_time_us: device_us,
+                submitted: false,
+            });
+            let decision = if stash_changed {
+                "stashed"
+            } else {
+                "discarded"
+            };
+            let stash_txt = match st.stash.summary().retained_band_milli() {
+                None => "empty".to_owned(),
+                Some((worst, best)) => format!(
+                    "{} -> {}",
+                    crate::logging::energy_units(worst),
+                    crate::logging::energy_units(best)
+                ),
+            };
+            let target_txt =
+                crate::logging::display_energy(st.target.as_ref().map(|t| t.max_energy_milli));
+            tracing::info!(
+                "[quip-miner-{miner_id}] attempt {}: {decision} (stash: {stash_txt}, target <= {target_txt})",
+                short_job_id(job_id),
+            );
+        }
+
+        let pow_sequence = submitted
+            .then(|| st.metrics.chain().miner_info.map(|i| i.proofs_submitted))
+            .flatten();
+        let ctx = crate::attempt::AttemptContext {
+            miner_type: st.miner_types.get(miner_id).cloned().unwrap_or_default(),
+            // The ceiling the coordinator checked this
+            // result against, not the base difficulty: the
+            // gate is what decided accept or reject.
+            threshold_milli: gates.min_energy_milli,
+            last_proof_block_hash: st.last_proof_block_hash.clone(),
+            extrinsic_hash: receipt
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|r| r.extrinsic_hash)
+                .map(|h| crate::chain::extrinsic::hex_encode(&h)),
+            chain_block_hash: receipt
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|r| r.block_hash)
+                .map(|h| crate::chain::extrinsic::hex_encode(&h)),
+            chain_block_number: receipt
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|r| r.block_number),
+            pow_sequence,
+            device_access_time_us: device_us,
+        };
+        let attempt = crate::attempt::AttemptRecord::new(
+            qblock_id, miner_id, job_id, job, &validated, submitted, &ctx,
+        );
+        let summary = (stash_changed || submitted).then(|| {
+            crate::attempt::summary_body(
+                qblock_id,
+                st.current_best_milli,
+                st.results_validated,
+                st.stash.summary(),
+            )
+        });
+        if let Some(tx) = st.attempt_tx.as_ref() {
+            let _ = tx.send(crate::attempt::WriterMsg::Attempt(Box::new(attempt)));
+            if let Some(body) = summary {
+                let _ = tx.send(crate::attempt::WriterMsg::Summary { qblock_id, body });
+            }
+        }
+    }
+}
+
+/// Verify one lease winner and settle it like a plain proof-of-work result.
+///
+/// The lease stays in flight: only `LeaseDone` completes it. A result for an
+/// unknown or cancelled lease, a result that fails verification, and a result
+/// that arrives before a target exists are dropped with a log line.
+pub(crate) async fn handle_lease_result<C: ChainClient>(
+    chain: &C,
+    state: &Arc<Mutex<CoordinatorState>>,
+    submit_notify: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    miner_id: &str,
+    result: quip_proto::v1::Result,
+) {
+    let (job, view, target, best) = {
+        let st = state.lock().await;
+        st.metrics.record_result_received(miner_id);
+        let job = st.inflight.get(&result.job_id).cloned();
+        if job.is_none() {
+            st.metrics.record_duplicate_result_drop(miner_id);
+        }
+        (
+            job,
+            st.lease_topology.clone(),
+            st.target,
+            st.current_best_milli,
+        )
+    };
+    let Some(job) = job else { return };
+    let (Some(generator), Some(view), Some(target)) = (job.generator.as_ref(), view, target) else {
+        tracing::warn!(miner = %miner_id, "lease result before topology or target; dropping");
+        return;
+    };
+    let wire_target = quip_protocol::target::Target::from_proto(&target);
+    let verified = match quip_protocol::lease::verify_lease_result(
+        generator,
+        &view,
+        &wire_target,
+        &result,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(miner = %miner_id, error = %e, "lease result failed verification; dropping");
+            return;
+        }
+    };
+    state.lock().await.note_result(job.generation);
+    // Verification decoded these rows already, so a decode failure here is
+    // unreachable. `filter_map` keeps the order of the proof.
+    let rows: Vec<crate::validate::SpinRow> = result
+        .solutions
+        .iter()
+        .filter_map(|s| {
+            quip_protocol::wire::decode_spins_packed(&s.spins, view.num_nodes)
+                .ok()
+                .map(|spins| crate::validate::SpinRow {
+                    spins,
+                    energy_milli: s.energy_milli,
+                })
+        })
+        .collect();
+    let stats = verified.stats;
+    let validated = crate::validate::Validated {
+        best_energy_milli: stats.best_energy_milli,
+        diversity_milli: stats.diversity_milli,
+        n_valid: stats.valid_solution_count,
+        accepted: true,
+        selected_solutions: rows.clone(),
+        raw_best_energy_milli: stats.best_energy_milli,
+        stash_solutions: rows,
+    };
+    settle_pow_result(
+        chain,
+        state,
+        submit_notify,
+        PowOutcome {
+            miner_id,
+            job: &job,
+            job_id: &verified.nonce,
+            salt: Some(verified.salt),
+            validated,
+            gates: crate::validate::gates_from_target(Some(&target)),
+            current_best_milli: best,
+            device_access_time_us: result.meta.as_ref().map_or(0, |m| m.device_access_time_us),
+        },
+    )
+    .await;
+}
+
+/// Complete a lease. Its salts count toward the miner's rate even when the
+/// lease was cancelled, and a lease that finished salts in the current round
+/// counts as mining, the same as a `Result`.
+pub(crate) fn handle_lease_done(
+    st: &mut CoordinatorState,
+    miner_id: &str,
+    done: &quip_proto::v1::LeaseDone,
+) {
+    st.router.record_lease_salts(miner_id, done.salts_done);
+    match st.complete_inflight(&done.job_id) {
+        Some(job) => {
+            st.router.record_completion(miner_id);
+            if done.salts_done > 0 {
+                st.note_result(job.generation);
+            }
+        }
+        None => st.metrics.record_duplicate_result_drop(miner_id),
+    }
+    tracing::debug!(
+        miner = %miner_id,
+        salts_done = done.salts_done,
+        best_energy = %crate::logging::display_energy((done.best_energy_milli != i64::MAX).then_some(done.best_energy_milli)),
+        "lease done"
+    );
 }
 
 #[expect(
@@ -430,21 +799,24 @@ impl<C: ChainClient + 'static> MinerService for CoordinatorService<C> {
     reason = "session loop is one cohesive handshake + message dispatch"
 )]
 async fn run_session<C: ChainClient>(
-    inbound: &mut Streaming<MinerMsg>,
+    inbound: &mut (impl tokio_stream::Stream<Item = Result<MinerMsg, Status>> + Unpin),
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
     state: Arc<Mutex<CoordinatorState>>,
     chain: Arc<C>,
     submit_notify: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    peer: crate::edge::PeerProtocol,
 ) {
     // 1. Hello
-    let Ok(Some(MinerMsg {
+    let Some(Ok(MinerMsg {
         msg: Some(miner_msg::Msg::Hello(hello)),
-    })) = inbound.message().await
+    })) = inbound.next().await
     else {
+        tracing::warn!(protocol = ?peer, "miner handshake rejected; expected Hello");
         return;
     };
 
     let miner_id = hello.miner_id.clone();
+    let caps = hello.capabilities.clone().unwrap_or_default();
     let (token_ok, protocol_ok, configure) = {
         let st = state.lock().await;
         let expected = st
@@ -453,7 +825,7 @@ async fn run_session<C: ChainClient>(
             .cloned()
             .unwrap_or_default();
         let token_ok = !expected.is_empty() && hello.session_token == expected;
-        let protocol_ok = hello.protocol_version == 1;
+        let protocol_ok = hello.capabilities.is_some() && caps.protocol_version == PROTOCOL_VERSION;
         let configure = st.configure.get(&miner_id).cloned().unwrap_or(Configure {
             queue_depth: 3,
             idle_timeout_s: 300,
@@ -472,38 +844,33 @@ async fn run_session<C: ChainClient>(
             miner = %miner_id,
             token_ok,
             protocol_ok,
-            offered_protocol = hello.protocol_version,
+            offered_protocol = caps.protocol_version,
             "miner handshake rejected; dropping session"
         );
         return;
     }
 
+    let miner_caps = MinerCaps::from_capabilities(&caps);
     {
         let mut st = state.lock().await;
-        st.router.register_miner(
-            miner_id.clone(),
-            MinerCaps {
-                backend: hello.backend.clone(),
-                algorithm: hello.algorithm.clone(),
-                supported_kinds: hello.supported_kinds.clone(),
-                max_nodes: hello.max_nodes,
-                max_edges: hello.max_edges,
-            },
-        );
+        st.router
+            .register_miner(miner_id.clone(), miner_caps.clone());
     }
     tracing::info!(
         miner = %miner_id,
-        backend = %hello.backend,
-        algorithm = %hello.algorithm,
-        max_nodes = hello.max_nodes,
-        max_edges = hello.max_edges,
+        backend = %miner_caps.backend,
+        algorithm = %miner_caps.algorithm,
+        max_nodes = miner_caps.max_nodes,
+        max_edges = miner_caps.max_edges,
+        stream_width = miner_caps.stream_width,
+        protocol = ?peer,
         "miner registered"
     );
 
     // 2. Welcome + Configure (+ Topology if cached)
     if tx
         .send(Ok(coord(coord_msg::Msg::Welcome(Welcome {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
         }))))
         .await
         .is_err()
@@ -566,7 +933,7 @@ async fn run_session<C: ChainClient>(
 
     // 3. Message loop
     'session: loop {
-        let Ok(Some(msg)) = inbound.message().await else {
+        let Some(Ok(msg)) = inbound.next().await else {
             break;
         };
         match msg.msg {
@@ -587,6 +954,17 @@ async fn run_session<C: ChainClient>(
                 }
             }
             Some(miner_msg::Msg::Result(result)) => {
+                let is_lease = state
+                    .lock()
+                    .await
+                    .inflight
+                    .get(&result.job_id)
+                    .is_some_and(crate::lease::is_lease);
+                if is_lease {
+                    handle_lease_result(chain.as_ref(), &state, &submit_notify, &miner_id, result)
+                        .await;
+                    continue 'session;
+                }
                 let (job, salt, topo, best, gates, generation) = {
                     let mut st = state.lock().await;
                     st.metrics.record_result_received(&miner_id);
@@ -629,211 +1007,25 @@ async fn run_session<C: ChainClient>(
                     }
                     if let Some(ising) = job.ising.as_ref() {
                         let validated = validate_result(ising, &result.solutions, &gates, &topo);
-                        let mut submitted = false;
-                        // Set when an accepted proof fails to submit for a
-                        // transient reason: keep it for the win-time retry loop
-                        // instead of dropping a genuine winner.
-                        let mut retain_for_retry = false;
-                        // Chain detail of the submit attempt, kept for the
-                        // attempt record below; `None` when this result never
-                        // reached the gate that triggers a submit.
-                        let mut receipt: Option<Result<SubmitReceipt, ChainError>> = None;
-                        if validated.accepted && beats_current(validated.best_energy_milli, best) {
-                            let proof = Proof {
-                                job_id: result.job_id.clone(),
-                                best_energy_milli: validated.best_energy_milli,
-                                diversity_milli: validated.diversity_milli,
-                                n_valid: validated.n_valid,
-                                // Diverse gate-passing subset, capped at the
-                                // pallet's MAX_PROOF_SOLUTIONS (not all raw rows,
-                                // which would fail bounded-vec decode).
-                                solutions: validated.selected_solutions.clone(),
-                                is_pow: job.provenance.as_ref().is_some_and(|p| p.is_pow),
-                                order_id: job
-                                    .provenance
-                                    .as_ref()
-                                    .map(|p| p.order_id.clone())
-                                    .unwrap_or_default(),
-                                generation: job.generation,
-                                // Salt is chosen by the feeder when the PoW job
-                                // is derived and remembered by job_id; the live
-                                // RealChainClient submit requires 32 bytes.
-                                salt: salt.map_or_else(Vec::new, |s| s.to_vec()),
+                        settle_pow_result(
+                            chain.as_ref(),
+                            &state,
+                            &submit_notify,
+                            PowOutcome {
+                                miner_id: &miner_id,
+                                job: &job,
+                                job_id: &result.job_id,
+                                salt,
+                                validated,
+                                gates,
+                                current_best_milli: best,
                                 device_access_time_us: result
                                     .meta
                                     .as_ref()
                                     .map_or(0, |m| m.device_access_time_us),
-                            };
-                            let job_hex = crate::chain::extrinsic::hex_encode(&result.job_id);
-                            let submit_result = chain.submit_proof(&proof).await;
-                            match submit_result.as_ref().map(|r| r.action) {
-                                Ok(SubmitAction::Success) => {
-                                    let mut st = state.lock().await;
-                                    st.current_best_milli = Some(validated.best_energy_milli);
-                                    st.metrics.record_proof_submitted(&miner_id);
-                                    if let Some(n) = submit_notify.lock().await.take() {
-                                        let _ = n.send(());
-                                    }
-                                    submitted = true;
-                                }
-                                Ok(SubmitAction::Retry) => {
-                                    tracing::warn!(job = %job_hex, "session submit rejected (retryable); retaining accepted candidate for win-time retry");
-                                    state
-                                        .lock()
-                                        .await
-                                        .metrics
-                                        .record_submission_error(&miner_id);
-                                    retain_for_retry = true;
-                                }
-                                Ok(SubmitAction::StopRoundStale) => {
-                                    tracing::info!(job = %job_hex, "session submit stale for round; dropping candidate");
-                                    state.lock().await.metrics.record_stale_drop(&miner_id);
-                                }
-                                Ok(SubmitAction::StopFatal) => {
-                                    tracing::error!(job = %job_hex, "session submit fatally rejected by pallet; dropping candidate");
-                                    state
-                                        .lock()
-                                        .await
-                                        .metrics
-                                        .record_submission_error(&miner_id);
-                                }
-                                Err(e) => {
-                                    tracing::error!(job = %job_hex, error = %e, "session submit failed (transient); retaining accepted candidate for win-time retry");
-                                    state
-                                        .lock()
-                                        .await
-                                        .metrics
-                                        .record_submission_error(&miner_id);
-                                    retain_for_retry = true;
-                                }
-                            }
-                            receipt = Some(submit_result);
-                        }
-                        // Record the attempt; stash sub-threshold candidates so
-                        // the easing difficulty can still win them; refresh the
-                        // per-qblock summary when the stash or a submit changed.
-                        {
-                            let mut st = state.lock().await;
-                            st.results_validated += 1;
-                            let qblock_id = st.qblock_id;
-                            let device_us =
-                                result.meta.as_ref().map_or(0, |m| m.device_access_time_us);
-
-                            // A solution below the current threshold is submitted
-                            // immediately (above); one not yet viable is stashed
-                            // if the projection says the decay will clear it. An
-                            // accepted candidate whose submit failed transiently
-                            // (`retain_for_retry`) is also stashed so the win-time
-                            // loop resubmits it instead of losing a winner.
-                            let mut stash_changed = false;
-                            if !validated.accepted || retain_for_retry {
-                                let is_pow = job.provenance.as_ref().is_some_and(|p| p.is_pow);
-                                let order_id = job
-                                    .provenance
-                                    .as_ref()
-                                    .map(|p| p.order_id.clone())
-                                    .unwrap_or_default();
-                                stash_changed = st.stash.insert(crate::stash::Candidate {
-                                    job_id: result.job_id.clone(),
-                                    salt,
-                                    generation: job.generation,
-                                    // Raw best (gate-agnostic) so the decay
-                                    // projection can decide when the easing gate
-                                    // admits it. The rows resubmitted with it are
-                                    // `stash_solutions`: the prefix-safe subset
-                                    // (≤ MAX_PROOF_SOLUTIONS) that keeps clearing
-                                    // the chain's diversity gate however tight the
-                                    // ceiling is when the proof lands.
-                                    best_energy_milli: validated.raw_best_energy_milli,
-                                    diversity_milli: validated.diversity_milli,
-                                    n_valid: validated.n_valid,
-                                    solutions: validated.stash_solutions.clone(),
-                                    is_pow,
-                                    order_id,
-                                    device_access_time_us: device_us,
-                                    submitted: false,
-                                });
-                                let decision = if stash_changed {
-                                    "stashed"
-                                } else {
-                                    "discarded"
-                                };
-                                let stash_txt = match st.stash.summary().retained_band_milli() {
-                                    None => "empty".to_owned(),
-                                    Some((worst, best)) => format!(
-                                        "{} -> {}",
-                                        crate::logging::energy_units(worst),
-                                        crate::logging::energy_units(best)
-                                    ),
-                                };
-                                let target_txt = crate::logging::display_energy(
-                                    st.target.as_ref().map(|t| t.max_energy_milli),
-                                );
-                                tracing::info!(
-                                    "[quip-miner-{miner_id}] attempt {}: {decision} (stash: {stash_txt}, target <= {target_txt})",
-                                    short_job_id(&result.job_id),
-                                );
-                            }
-
-                            let pow_sequence = submitted
-                                .then(|| st.metrics.chain().miner_info.map(|i| i.proofs_submitted))
-                                .flatten();
-                            let ctx = crate::attempt::AttemptContext {
-                                miner_type: st
-                                    .miner_types
-                                    .get(&miner_id)
-                                    .cloned()
-                                    .unwrap_or_default(),
-                                // The ceiling the coordinator checked this
-                                // result against, not the base difficulty: the
-                                // gate is what decided accept or reject.
-                                threshold_milli: gates.min_energy_milli,
-                                last_proof_block_hash: st.last_proof_block_hash.clone(),
-                                extrinsic_hash: receipt
-                                    .as_ref()
-                                    .and_then(|r| r.as_ref().ok())
-                                    .and_then(|r| r.extrinsic_hash)
-                                    .map(|h| crate::chain::extrinsic::hex_encode(&h)),
-                                chain_block_hash: receipt
-                                    .as_ref()
-                                    .and_then(|r| r.as_ref().ok())
-                                    .and_then(|r| r.block_hash)
-                                    .map(|h| crate::chain::extrinsic::hex_encode(&h)),
-                                chain_block_number: receipt
-                                    .as_ref()
-                                    .and_then(|r| r.as_ref().ok())
-                                    .and_then(|r| r.block_number),
-                                pow_sequence,
-                                device_access_time_us: device_us,
-                            };
-                            let attempt = crate::attempt::AttemptRecord::new(
-                                qblock_id,
-                                &miner_id,
-                                &result.job_id,
-                                &job,
-                                &validated,
-                                submitted,
-                                &ctx,
-                            );
-                            let summary = (stash_changed || submitted).then(|| {
-                                crate::attempt::summary_body(
-                                    qblock_id,
-                                    st.current_best_milli,
-                                    st.results_validated,
-                                    st.stash.summary(),
-                                )
-                            });
-                            if let Some(tx) = st.attempt_tx.as_ref() {
-                                let _ =
-                                    tx.send(crate::attempt::WriterMsg::Attempt(Box::new(attempt)));
-                                if let Some(body) = summary {
-                                    let _ = tx.send(crate::attempt::WriterMsg::Summary {
-                                        qblock_id,
-                                        body,
-                                    });
-                                }
-                            }
-                        }
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -890,11 +1082,15 @@ async fn run_session<C: ChainClient>(
             Some(miner_msg::Msg::Capabilities(caps)) => {
                 tracing::debug!(
                     miner = %miner_id,
-                    backend = %caps.backend,
+                    backend = %backend_name(caps.backend()),
                     max_nodes = caps.max_nodes,
                     stream_width = caps.stream_width,
                     "miner advertised capabilities; ignored (no capability routing)"
                 );
+            }
+            Some(miner_msg::Msg::LeaseDone(done)) => {
+                let mut st = state.lock().await;
+                handle_lease_done(&mut st, &miner_id, &done);
             }
             // An empty `msg` is a message this build cannot name: either a
             // field number the miner uses and this coordinator does not, or the
@@ -1128,7 +1324,7 @@ pub async fn serve_one_session_expecting(
     };
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(MinerServiceServer::new(svc))
+            .add_service(crate::edge::DualMinerServer::new(svc))
             .serve_with_incoming(incoming)
             .await
     });
@@ -1237,6 +1433,7 @@ pub async fn drive_pow_round<C: ChainClient + 'static>(p: DrivePowParams<'_, C>)
             supported_kinds: vec![quip_proto::v1::JobKind::IsingSample as i32],
             max_nodes: 0,
             max_edges: 0,
+            ..MinerCaps::default()
         },
     );
     // Route will re-register on Hello and overwrite caps; stage via direct insert
@@ -1364,6 +1561,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
             else {
                 return;
             };
+            let caps = hello.capabilities.clone().unwrap_or_default();
             {
                 let st = state.lock().await;
                 let expected = st
@@ -1371,22 +1569,17 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                     .get(&miner_id)
                     .cloned()
                     .unwrap_or_default();
-                if hello.session_token != expected || hello.protocol_version != 1 {
+                if hello.session_token != expected
+                    || hello.capabilities.is_none()
+                    || caps.protocol_version != PROTOCOL_VERSION
+                {
                     return;
                 }
             }
             {
                 let mut st = state.lock().await;
-                st.router.register_miner(
-                    miner_id.clone(),
-                    MinerCaps {
-                        backend: hello.backend,
-                        algorithm: hello.algorithm,
-                        supported_kinds: hello.supported_kinds,
-                        max_nodes: hello.max_nodes,
-                        max_edges: hello.max_edges,
-                    },
-                );
+                st.router
+                    .register_miner(miner_id.clone(), MinerCaps::from_capabilities(&caps));
                 // Stage pre-jobs now that the miner is registered.
                 let jobs = pre_jobs.lock().await.drain(..).collect::<Vec<_>>();
                 for j in jobs {
@@ -1408,7 +1601,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
             let seed_credits = configure.queue_depth.max(1);
             let _ = tx
                 .send(Ok(coord(coord_msg::Msg::Welcome(Welcome {
-                    protocol_version: 1,
+                    protocol_version: PROTOCOL_VERSION,
                 }))))
                 .await;
             let _ = tx
@@ -1575,23 +1768,247 @@ pub fn shutdown_msg(grace_ms: u32) -> CoordMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::FakeChain;
     use crate::router::MinerCaps;
-    use quip_proto::v1::{IsingProblem, Job, JobKind, Provenance};
+    use quip_proto::v1::{
+        Job, JobKind, LeaseDone, Provenance, Result as WireResult, SetTarget, Solution,
+    };
+    use quip_protocol::lease::{LeaseSpec, TopologyView};
+
+    fn lease_snapshot() -> crate::chain::snapshot::MiningSnapshot {
+        let nodes = vec![0, 1, 2, 3];
+        let edges = vec![(0, 1), (1, 2), (2, 3), (0, 3)];
+        let (h, j, spin) = (vec![-1000, 0, 1000], vec![-1000, 1000], vec![-1000, 1000]);
+        crate::chain::snapshot::MiningSnapshot {
+            head_hash: [0; 32],
+            last_proof_block_hash: [7; 32],
+            topology_hash: crate::topology::topology_hash_sets(&nodes, &edges, &h, &j, &spin)
+                .to_vec(),
+            nodes,
+            edges,
+            allowed_h_milli: h,
+            allowed_j_milli: j,
+            allowed_spin_milli: spin,
+            min_solutions: 1,
+            max_energy_milli: i64::MAX / 2,
+            min_diversity_milli: 0,
+            block_number: 42,
+            spec_version: 117,
+        }
+    }
+
+    /// State with one live lease of generation 1, its topology, and a target.
+    fn lease_state() -> (CoordinatorState, Job) {
+        let snap = lease_snapshot();
+        let mut st = CoordinatorState::new();
+        st.router.register_miner("m", MinerCaps::default());
+        st.generation = 1;
+        st.set_topology(Some(Topology::from_nodes_edges(
+            snap.nodes.clone(),
+            snap.edges.clone(),
+            &snap.allowed_h_milli,
+            &snap.allowed_j_milli,
+            &snap.allowed_spin_milli,
+        )));
+        st.target = Some(SetTarget {
+            max_energy_milli: i64::MAX / 2,
+            min_solutions: 1,
+            min_diversity_milli: 0,
+            max_proof_solutions: 32,
+            ..Default::default()
+        });
+        let job = crate::lease::build_lease_job(&snap, [1; 32], 100, 4, 1);
+        st.dispatch_inflight("m", job.clone());
+        (st, job)
+    }
+
+    /// All-+1 winner for salt index `i` of `job`, scored on the drawn problem.
+    fn winner(job: &Job, i: u64) -> WireResult {
+        let spec = LeaseSpec::from_proto(job.generator.as_ref().unwrap()).unwrap();
+        let snap = lease_snapshot();
+        let view = TopologyView {
+            num_nodes: snap.nodes.len(),
+            edges: snap
+                .edges
+                .iter()
+                .map(|&(u, v)| (u as usize, v as usize))
+                .collect(),
+            allowed_h_milli: snap.allowed_h_milli.clone(),
+            allowed_j_milli: snap.allowed_j_milli.clone(),
+        };
+        let nonce = spec.nonce(i).unwrap();
+        let (h, j) = view.draw(nonce).unwrap();
+        let spins = vec![1i8; view.num_nodes];
+        let energy = quip_protocol::scoring::energy_from_milli(&spins, &h, &j, &view.edges);
+        WireResult {
+            job_id: job.job_id.clone(),
+            solutions: vec![Solution {
+                spins: quip_protocol::wire::encode_spins_packed(&spins),
+                energy_milli: energy,
+            }],
+            meta: None,
+            salt: spec.salt(i).unwrap().to_vec(),
+            nonce: nonce.to_vec(),
+        }
+    }
+
+    fn notify() -> Arc<Mutex<Option<oneshot::Sender<()>>>> {
+        Arc::new(Mutex::new(None))
+    }
+
+    #[tokio::test]
+    async fn verified_lease_winner_is_submitted_with_its_salt() {
+        let (st, job) = lease_state();
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        let r = winner(&job, 2);
+        handle_lease_result(&chain, &state, &notify(), "m", r.clone()).await;
+        let submitted = chain.take_submitted();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted.first().map(|proof| &proof.salt), Some(&r.salt));
+        assert_eq!(
+            submitted.first().map(|proof| &proof.job_id),
+            Some(&r.nonce),
+            "attempt id is the nonce"
+        );
+        assert!(
+            state.lock().await.inflight.contains_key(&job.job_id),
+            "a lease stays live until LeaseDone"
+        );
+        assert!(state.lock().await.round_mined());
+    }
+
+    #[tokio::test]
+    async fn lease_result_with_a_wrong_energy_is_not_submitted() {
+        let (st, job) = lease_state();
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        let mut r = winner(&job, 0);
+        r.solutions
+            .iter_mut()
+            .for_each(|solution| solution.energy_milli -= 1);
+        handle_lease_result(&chain, &state, &notify(), "m", r).await;
+        assert!(chain.take_submitted().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_result_after_cancel_is_dropped() {
+        let (mut st, job) = lease_state();
+        let _ = st.cancel_inflight(1);
+        st.generation = 2;
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        handle_lease_result(&chain, &state, &notify(), "m", winner(&job, 1)).await;
+        assert!(chain.take_submitted().is_empty());
+        let mut st = state.lock().await;
+        handle_lease_done(
+            &mut st,
+            "m",
+            &LeaseDone {
+                job_id: job.job_id,
+                salts_done: 3,
+                best_energy_milli: 0,
+            },
+        );
+        assert_eq!(
+            st.router.take_lease_salts("m"),
+            3,
+            "cancelled salts still count toward the rate"
+        );
+        assert!(!st.round_mined());
+    }
+
+    #[tokio::test]
+    async fn lease_result_without_target_is_dropped() {
+        let (mut st, job) = lease_state();
+        st.target = None;
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        handle_lease_result(&chain, &state, &notify(), "m", winner(&job, 0)).await;
+        assert!(chain.take_submitted().is_empty());
+    }
+
+    #[test]
+    fn lease_done_with_salts_marks_the_round_mined() {
+        let (mut st, job) = lease_state();
+        handle_lease_done(
+            &mut st,
+            "m",
+            &LeaseDone {
+                job_id: job.job_id.clone(),
+                salts_done: 4,
+                best_energy_milli: -5,
+            },
+        );
+        assert!(st.round_mined());
+        assert!(!st.inflight.contains_key(&job.job_id));
+        assert_eq!(st.router.take_lease_salts("m"), 4);
+    }
+
+    #[test]
+    fn lease_done_with_no_salts_does_not_mark_the_round() {
+        let (mut st, job) = lease_state();
+        handle_lease_done(
+            &mut st,
+            "m",
+            &LeaseDone {
+                job_id: job.job_id,
+                salts_done: 0,
+                best_energy_milli: i64::MAX,
+            },
+        );
+        assert!(!st.round_mined());
+    }
+
+    #[test]
+    fn reclaimed_lease_restages_with_same_range() {
+        let mut st = CoordinatorState::new();
+        let caps = MinerCaps {
+            supported_kinds: vec![JobKind::IsingGenerate as i32],
+            generators: vec![quip_proto::v1::GeneratorAlgorithm::Blake3Chacha8V1 as i32],
+            ..MinerCaps::default()
+        };
+        st.router.register_miner("m", caps);
+        let snap = crate::chain::snapshot::MiningSnapshot {
+            head_hash: [0; 32],
+            last_proof_block_hash: [7; 32],
+            topology_hash: vec![9; 32],
+            nodes: vec![0, 1],
+            edges: vec![(0, 1)],
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![1000],
+            allowed_spin_milli: vec![-1000, 1000],
+            min_solutions: 1,
+            max_energy_milli: 0,
+            min_diversity_milli: 0,
+            block_number: 1,
+            spec_version: 117,
+        };
+        let job = crate::lease::build_lease_job(&snap, [0; 32], 21, 4, 1);
+        st.dispatch_inflight("m", job.clone());
+        let reclaimed = st.reclaim_miner("m");
+        assert_eq!(reclaimed, vec![job.clone()]);
+        assert_eq!(
+            st.router
+                .route(reclaimed.first().cloned().expect("one reclaimed lease"))
+                .as_deref(),
+            Some("m")
+        );
+        st.router.grant_credits("m", 1);
+        let staged = st.router.next_job("m").expect("restaged lease");
+        assert_eq!(staged.generator, job.generator);
+    }
 
     fn job(id: &[u8]) -> Job {
         Job {
             job_id: id.to_vec(),
+            generator: None,
             kind: JobKind::IsingSample as i32,
             generation: 1,
             deadline_ms: 0,
-            ising: Some(IsingProblem {
-                graph: None,
-                h_milli_le32: vec![0; 8], // 2 nodes
-                j_milli_le32: vec![0; 4], // 1 edge
-                num_reads: 0,
-                num_sweeps: 0,
-                anneal_time_us: 0,
-            }),
+            ising: Some(crate::producer::problem::milli_problem(
+                None, &[0; 2], &[0; 1],
+            )),
             provenance: Some(Provenance {
                 is_pow: true,
                 order_id: vec![],
@@ -1606,6 +2023,7 @@ mod tests {
             supported_kinds: vec![JobKind::IsingSample as i32],
             max_nodes: 0, // unlimited
             max_edges: 0,
+            ..MinerCaps::default()
         }
     }
 

@@ -12,13 +12,25 @@ Both shapes are specified and documented in the
 [quip-solver-core](https://gitlab.com/quip.network/quip-solver-core)
 repository: `SPEC.md` is the contract, the crate README covers the Rust
 `Sampler` path, and `examples/` holds a conformant mock solver in Rust, C++,
-Python, and TypeScript. Depend on `quip-solver-core = "0.0.0"` from crates.io
+Python, and TypeScript. Depend on `quip-solver-core = "0.0.2-rc3"` from crates.io
 for the Rust path, or on the `quip-solver-core` PyPI wheel for Python. A
 solver is conformant when the repo's `quip-solver-drive` binary reports a
 conformant session against it.
 
 This guide covers what stays coordinator-side: naming, wiring the backend into
 the coordinator, publishing releases, and testing against this coordinator.
+
+## Salt leases
+
+A Rust miner built on quip-solver-core 0.0.2-rc3 receives leases through the
+default session loop when it advertises the BLAKE3/ChaCha8 generator. The
+session loop draws each problem and passes it to the sampler. It scores the
+returned samples and sends winners to the coordinator. A miner that does not
+advertise `ISING_GENERATE` continues to receive plain jobs.
+
+A miner that generates problems on its device, such as an msa miner, must add
+`generates_locally` and `sample_lease` in its repository. Those hooks are not
+part of this coordinator repository.
 
 ## Naming and algorithm variants
 
@@ -59,6 +71,9 @@ Publish one asset per architecture named `<binary>-<arch>`
 `<binary>-<arch>` and saves it under the clean name `<binary>`, which is what
 `config.toml`'s `binary` field and the coordinator's `PATH` lookup expect. A
 real fetch stays inert until the miner repository has cut its first release.
+
+Release this coordinator before any miner repository publishes a v2 build.
+During that rollout, the session edge accepts both v1 and v2 miners.
 
 ## Testing a new miner
 

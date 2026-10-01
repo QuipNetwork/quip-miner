@@ -6,15 +6,15 @@
 use clap::Parser;
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{
-    coord_msg, ising_problem, miner_msg, Capabilities, CoordMsg, Fatal, IsingProblem, Job, JobKind,
-    JobRequest, MinerMsg, Ready, Reject, RejectReason, Result as JobResult, SamplerMeta, Solution,
-    Status, Topology,
+    coord_msg, ising_problem, miner_msg, Algorithm, Backend, Capabilities, CoefficientEncoding,
+    CoordMsg, Fatal, IsingProblem, Job, JobKind, JobRequest, MinerMsg, Ready, Reject, RejectReason,
+    Result as JobResult, SamplerMeta, SetTarget, Solution, Status, Topology,
 };
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::session::{
-    build_hello, check_welcome, BackendCaps, ExitCode, SessionConfig, SessionError,
+    build_hello, check_welcome, ExitCode, SessionConfig, PROTOCOL_VERSION,
 };
-use quip_protocol::wire::decode_i32_le;
+use quip_protocol::wire::{decode_i32_le, encode_spins_packed};
 use std::process::ExitCode as ProcessExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -22,7 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Endpoint, Uri};
 
 #[derive(Parser)]
-#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 2"))]
 struct Cli {
     #[arg(long)]
     quip_coordinator: Option<String>,
@@ -46,6 +46,23 @@ fn print_capabilities() {
         println!(
             r#"{{"backend":"mock","algorithm":"sa","supported_kinds":["ISING_SAMPLE"],"max_nodes":100000,"max_edges":1000000}}"#
         );
+    }
+}
+
+/// The envelope this mock advertises in `Hello` and on `GetCapabilities`.
+fn mock_capabilities() -> Capabilities {
+    Capabilities {
+        supported_kinds: vec![JobKind::IsingSample as i32, JobKind::IsingGenerate as i32],
+        max_nodes: 100_000,
+        max_edges: 1_000_000,
+        features: vec![],
+        protocol_version: PROTOCOL_VERSION,
+        stream_width: 1,
+        native_topology_hash: None,
+        encodings: vec![CoefficientEncoding::I32 as i32],
+        generators: vec![quip_proto::v1::GeneratorAlgorithm::Blake3Chacha8V1 as i32],
+        backend: Backend::Mock as i32,
+        algorithm: Algorithm::Sa as i32,
     }
 }
 
@@ -218,13 +235,17 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
 
     let ising = job.ising.unwrap_or_default();
 
+    if ising.encoding != CoefficientEncoding::I32 as i32 || ising.scale != 1000 {
+        return reject_and_replace(job_id, RejectReason::Malformed);
+    }
+
     // MALFORMED: h field is not a valid i32-LE array (length not a multiple of 4).
-    let Ok(h) = decode_milli_f64(&ising.h_milli_le32) else {
+    let Ok(h) = decode_milli_f64(&ising.h) else {
         return reject_and_replace(job_id, RejectReason::Malformed);
     };
 
     // MALFORMED: j field must also be a valid i32-LE array (mirror h handling).
-    let Ok(j) = decode_milli_f64(&ising.j_milli_le32) else {
+    let Ok(j) = decode_milli_f64(&ising.j) else {
         return reject_and_replace(job_id, RejectReason::Malformed);
     };
 
@@ -252,9 +273,11 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
     let result = JobResult {
         job_id,
         solutions: vec![Solution {
-            spins_bytes: vec![0x01u8; n],
+            spins: encode_spins_packed(&spins),
             energy_milli: energy,
         }],
+        salt: vec![],
+        nonce: vec![],
         // The reference miner produces a single trivial read with no annealing;
         // report that faithfully so results carry SamplerMeta like real miners.
         meta: Some(SamplerMeta {
@@ -270,25 +293,87 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
     ]
 }
 
+/// Run a lease the way the default rc3 session does: draw each salt's
+/// problem, sample it (all +1), keep a winner that meets the target, then
+/// report `LeaseDone` and refund the lease's credit.
+fn handle_lease(job: Job, topo: Option<&Topology>, target: Option<&SetTarget>) -> Vec<MinerMsg> {
+    use quip_protocol::lease::{LeaseSpec, TopologyView};
+    use quip_protocol::target::{meets_target, Target};
+
+    let Job {
+        job_id, generator, ..
+    } = job;
+    let Some(target) = target.filter(|t| t.max_proof_solutions > 0) else {
+        return reject_and_replace(job_id, RejectReason::TargetMissing);
+    };
+    let Some(topo) = topo else {
+        return reject_and_replace(job_id, RejectReason::TopologyMissing);
+    };
+    let Some(spec) = generator
+        .as_ref()
+        .and_then(|g| LeaseSpec::from_proto(g).ok())
+    else {
+        return reject_and_replace(job_id, RejectReason::Malformed);
+    };
+    if generator
+        .as_ref()
+        .is_some_and(|g| g.topology_hash != topo.hash)
+    {
+        return reject_and_replace(job_id, RejectReason::TopologyMismatch);
+    }
+    let Ok(view) = TopologyView::from_proto(topo) else {
+        return reject_and_replace(job_id, RejectReason::Malformed);
+    };
+    let target = Target::from_proto(target);
+    let mut out = Vec::new();
+    let mut best = i64::MAX;
+    let mut done = 0u64;
+    for i in 0..spec.salt_count {
+        let (Some(salt), Some(nonce)) = (spec.salt(i), spec.nonce(i)) else {
+            break;
+        };
+        let Ok((h, j)) = view.draw(nonce) else {
+            return reject_and_replace(job_id, RejectReason::Malformed);
+        };
+        let spins = vec![1i8; view.num_nodes];
+        let energy = quip_protocol::scoring::energy_from_milli(&spins, &h, &j, &view.edges);
+        done += 1;
+        best = best.min(energy);
+        if meets_target(&[(spins.as_slice(), energy)], &target).is_ok() {
+            out.push(miner(miner_msg::Msg::Result(JobResult {
+                job_id: job_id.clone(),
+                solutions: vec![Solution {
+                    spins: encode_spins_packed(&spins),
+                    energy_milli: energy,
+                }],
+                meta: Some(SamplerMeta {
+                    reads: 1,
+                    ..Default::default()
+                }),
+                salt: salt.to_vec(),
+                nonce: nonce.to_vec(),
+            })));
+        }
+    }
+    out.push(miner(miner_msg::Msg::LeaseDone(
+        quip_proto::v1::LeaseDone {
+            job_id,
+            salts_done: done,
+            best_energy_milli: best,
+        },
+    )));
+    out.push(miner(miner_msg::Msg::JobRequest(JobRequest { credits: 1 })));
+    out
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "session loop kept as one linear match over CoordMsg for clarity"
+    reason = "the session loop dispatches coordinator messages and flushes replies"
 )]
 async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
     // Resolve token before any network I/O so a missing QUIP_SESSION_TOKEN
     // always maps to exit 77 (never InternalFatal from a connect failure).
-    let hello = build_hello(
-        miner_id,
-        "mock",
-        "sa",
-        &[JobKind::IsingSample],
-        &[],
-        BackendCaps {
-            max_nodes: 0,
-            max_edges: 0,
-        },
-    )
-    .map_err(|e: SessionError| ExitCode::from(e))?;
+    let hello = build_hello(miner_id, mock_capabilities()).map_err(ExitCode::from)?;
 
     let path = uri.strip_prefix("unix://").unwrap_or(uri).to_string();
     let channel = Endpoint::try_from("http://[::]:50051") // dummy authority, unused for UDS
@@ -321,6 +406,8 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
     let mut grace_ms: u64 = 5000;
     let mut session_err: Option<ExitCode> = None;
     let mut session_topo: Option<SessionTopo> = None;
+    let mut raw_topo: Option<Topology> = None;
+    let mut session_target: Option<SetTarget> = None;
     loop {
         let idle = u64::from(config.as_ref().map_or(300, |c| c.idle_timeout_s));
         let next = tokio::time::timeout(Duration::from_secs(idle), inbound.message()).await;
@@ -348,9 +435,15 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
             }
             Some(coord_msg::Msg::Topology(t)) => {
                 session_topo = Some(SessionTopo::from_proto(&t));
+                raw_topo = Some(t);
             }
             Some(coord_msg::Msg::Job(job)) => {
-                for reply in handle_job(job, session_topo.as_ref()) {
+                let replies = if job.kind == JobKind::IsingGenerate as i32 {
+                    handle_lease(job, raw_topo.as_ref(), session_target.as_ref())
+                } else {
+                    handle_job(job, session_topo.as_ref())
+                };
+                for reply in replies {
                     tx.send(reply).await.map_err(|_| ExitCode::InternalFatal)?;
                 }
             }
@@ -367,19 +460,9 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
             }
             // Answer with the same permissive envelope --capabilities prints.
             Some(coord_msg::Msg::GetCapabilities(_)) => {
-                tx.send(miner(miner_msg::Msg::Capabilities(Capabilities {
-                    backend: "mock".into(),
-                    algorithm: "sa".into(),
-                    supported_kinds: vec![JobKind::IsingSample as i32],
-                    max_nodes: 100_000,
-                    max_edges: 1_000_000,
-                    features: vec![],
-                    protocol_version: 1,
-                    stream_width: 1,
-                    native_topology_hash: None,
-                })))
-                .await
-                .map_err(|_| ExitCode::InternalFatal)?;
+                tx.send(miner(miner_msg::Msg::Capabilities(mock_capabilities())))
+                    .await
+                    .map_err(|_| ExitCode::InternalFatal)?;
             }
             Some(coord_msg::Msg::Shutdown(s)) => {
                 grace_ms = if s.grace_ms == 0 {
@@ -389,8 +472,8 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
                 };
                 break;
             }
-            // SetTarget and empty oneof: nothing to do in this reference miner.
-            Some(coord_msg::Msg::SetTarget(_)) | None => {}
+            Some(coord_msg::Msg::SetTarget(target)) => session_target = Some(target),
+            None => {}
         }
     }
     // Signal end-of-outbound so tonic flushes every buffered reply, then drain
@@ -415,22 +498,105 @@ mod tests {
     use super::*;
     use quip_protocol::wire::encode_i32_le;
 
+    fn lease_topology() -> Topology {
+        Topology {
+            hash: vec![9; 32],
+            nodes: vec![0, 1, 2, 3],
+            edges: Some(quip_proto::v1::EdgeList {
+                u: vec![0, 1, 2, 0],
+                v: vec![1, 2, 3, 3],
+            }),
+            allowed_h_milli: vec![-1000, 0, 1000],
+            allowed_j_milli: vec![-1000, 1000],
+        }
+    }
+
+    fn lease(count: u64) -> Job {
+        Job {
+            job_id: b"lease:x".to_vec(),
+            kind: JobKind::IsingGenerate as i32,
+            generation: 1,
+            generator: Some(quip_proto::v1::IsingProblemGenerator {
+                algorithm: quip_proto::v1::GeneratorAlgorithm::Blake3Chacha8V1 as i32,
+                topology_hash: vec![9; 32],
+                last_proof_block_hash: vec![7; 32],
+                miner_account: vec![1; 32],
+                base_salt: vec![0; 32],
+                salt_start: 5,
+                salt_count: count,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn open_target() -> SetTarget {
+        SetTarget {
+            max_energy_milli: i64::MAX / 2,
+            min_solutions: 1,
+            min_diversity_milli: 0,
+            max_proof_solutions: 32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lease_reports_each_winner_then_one_done_and_one_credit() {
+        let topo = lease_topology();
+        let msgs = handle_lease(lease(3), Some(&topo), Some(&open_target()));
+        let results = msgs
+            .iter()
+            .filter(|m| matches!(m.msg, Some(miner_msg::Msg::Result(_))))
+            .count();
+        assert_eq!(results, 3);
+        let n = msgs.len();
+        assert!(matches!(
+            &msgs.get(n.saturating_sub(2)).expect("LeaseDone message").msg,
+            Some(miner_msg::Msg::LeaseDone(d)) if d.salts_done == 3
+        ));
+        assert!(matches!(
+            &msgs.get(n.saturating_sub(1)).expect("credit message").msg,
+            Some(miner_msg::Msg::JobRequest(r)) if r.credits == 1
+        ));
+    }
+
+    #[test]
+    fn lease_without_target_is_rejected_target_missing() {
+        let msgs = handle_lease(lease(3), Some(&lease_topology()), None);
+        assert_eq!(
+            first_reject_reason(&msgs),
+            Some(RejectReason::TargetMissing as i32)
+        );
+    }
+
+    #[test]
+    fn lease_with_zero_salts_is_malformed() {
+        let msgs = handle_lease(lease(0), Some(&lease_topology()), Some(&open_target()));
+        assert_eq!(
+            first_reject_reason(&msgs),
+            Some(RejectReason::Malformed as i32)
+        );
+    }
+
     fn sample_job(job_id: &[u8], kind: JobKind, j_bytes: Vec<u8>) -> Job {
         Job {
             job_id: job_id.to_vec(),
+            generator: None,
             kind: kind as i32,
             generation: 1,
             deadline_ms: now_unix_ms() + 60_000,
             ising: Some(IsingProblem {
+                encoding: CoefficientEncoding::I32 as i32,
+                scale: 1000,
                 graph: Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
                     u: vec![0],
                     v: vec![1],
                 })),
-                h_milli_le32: encode_i32_le(&[1000, -1000]),
-                j_milli_le32: j_bytes,
+                h: encode_i32_le(&[1000, -1000]),
+                j: j_bytes,
                 num_reads: 1,
                 num_sweeps: 0,
                 anneal_time_us: 0,
+                ..Default::default()
             }),
             provenance: None,
         }

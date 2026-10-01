@@ -26,7 +26,7 @@ import higher ones.
 | `quip-coordinator` | The `quip-coordinator` binary: chain access, feeder, router, supervisor | `quip-proto`, `quip-protocol` |
 | `quip-mock-miner` | Miner test double | `quip-proto`, `quip-protocol` |
 
-Three dependencies come from crates.io at v0.0.0, published from the
+Three dependencies come from crates.io at v0.0.2-rc3, published from the
 quip-solver-core repository: `quip-proto` (generated protocol types and gRPC
 service), `quip-protocol` (consensus primitives: `wire`, `session`, `scoring`,
 `derive`, `chacha8`), and `quip-solver-core` (the `Sampler` trait, session
@@ -102,20 +102,21 @@ to a JSON model, execs a configured external solver (by file or stdin), and
 parses the solver's JSON solutions back over the same session protocol. One part
 of the target design still differs from the source:
 
-- The random and file job sources (the driver for benchmarking without a chain)
+- The random, file, and lease job sources (the driver for benchmarking without a chain)
   live coordinator-side under `drive/` (`drive/random_source.rs`,
-  `drive/list_source.rs`, `drive/harness.rs`), reached through the `drive`
-  subcommand. They generate jobs, so the coordinator is their natural home, and
-  the miner stays a pure solver.
+  `drive/list_source.rs`, `drive/lease_source.rs`, `drive/harness.rs`), reached
+  through the `drive` subcommand. They generate jobs, so the coordinator is
+  their natural home, and the miner stays a pure solver.
 
 ### 5. Miners are isolated solvers
 
-`quip-solver-core` carries no chain or consensus logic. From `quip-protocol`
-it imports the wire codec and the session handshake, nothing else. A miner
-cannot reach the node, directly or transitively. It receives an Ising problem,
-samples it, and returns spins with energies. This isolation is why the
-contract could move to its own repository: the solver side depends on the
-chain through nothing but the wire.
+`quip-solver-core` carries no chain or consensus logic. A lease miner draws
+problems from the chain-derived nonce in its generator specification, but it
+uses `quip-protocol` for wire, session, and lease primitives. A miner cannot
+directly or transitively reach the node. It
+receives an Ising problem and samples it. It returns spins with energies. This
+isolation is why the contract could move to its own repository: the solver side
+depends on the chain through nothing but the wire.
 
 ## Job lifecycle
 
@@ -148,11 +149,22 @@ A proof-of-work job flows through the system in one pass:
    mempool set goes to `QuantumComputeMempool.submit_solution` with its
    `order_id`, and never touches the round best energy or the win-time stash.
 
-Jobs carry a `job_id`, a `generation`, an optional `deadline_ms`, the Ising
-problem (edge list or CSR, plus little-endian `h` and `j` fields), and a
-`provenance` marking proof-of-work versus mempool with the source `order_id`.
-The identifiers that matter are `job_id`, the mempool `order_id`, and the
-`generation` counter that gates cancellation.
+For a miner that advertises the BLAKE3/ChaCha8 generator, the feeder stages
+`ISING_GENERATE` leases instead of plain proof-of-work jobs. Each lease names a
+range of salts. The miner draws, samples, and scores one problem per salt, then
+returns only winners. The coordinator checks every winner with
+`quip_protocol::lease::verify_lease_result`. Each winner that passes verification
+uses the same proof submission path as a plain result. `LeaseDone` completes
+the lease after its result messages arrive. A completed lease with positive
+`salts_done` counts as round participation.
+
+Jobs carry a `job_id`, a `generation`, an optional `deadline_ms`, an optional
+`generator`, an optional Ising problem, and a `provenance` field. A plain Ising
+problem has an edge-list or CSR graph. Its coefficients use `encoding`,
+`scale`, `h`, and `j`. A lease carries a generator and no Ising problem. The generator names
+the algorithm, topology, round hash, miner account, base salt, and salt range.
+Provenance marks proof-of-work or mempool work and carries the source
+`order_id` for mempool jobs.
 
 ## Parameters and where they live
 

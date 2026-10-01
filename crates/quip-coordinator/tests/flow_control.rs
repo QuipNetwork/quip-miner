@@ -22,8 +22,7 @@
 
 use quip_coordinator::config::LaunchEntry;
 use quip_coordinator::drive::{DriveManyParams, JobRow};
-use quip_proto::v1::{ising_problem, Configure, EdgeList, IsingProblem, Job, JobKind};
-use quip_protocol::wire::encode_i32_le;
+use quip_proto::v1::{ising_problem, Configure, EdgeList, Job, JobKind};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Sibling `quip-mock-miner` binary (not same package → no `CARGO_BIN_EXE_*`).
@@ -62,19 +61,21 @@ fn ring_jobs(count: usize, nodes: usize) -> Vec<Job> {
     (0..count)
         .map(|n| Job {
             job_id: format!("job-{n}").into_bytes(),
+            generator: None,
             kind: JobKind::IsingSample as i32,
             generation: 0,
             deadline_ms: deadline,
-            ising: Some(IsingProblem {
-                graph: Some(ising_problem::Graph::Edges(EdgeList {
-                    u: u.clone(),
-                    v: v.clone(),
-                })),
-                h_milli_le32: encode_i32_le(&h),
-                j_milli_le32: encode_i32_le(&j),
-                num_reads: 1,
-                num_sweeps: 1,
-                anneal_time_us: 0,
+            ising: Some({
+                let mut problem = quip_coordinator::producer::problem::milli_problem(
+                    Some(ising_problem::Graph::Edges(EdgeList {
+                        u: u.clone(),
+                        v: v.clone(),
+                    })),
+                    &h,
+                    &j,
+                );
+                problem.num_reads = 1;
+                problem
             }),
             provenance: None,
         })

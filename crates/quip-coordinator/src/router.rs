@@ -1,12 +1,11 @@
 //! Capability index, per-miner staged queue, credit accounting, cancel, reject.
 
-use quip_proto::v1::ising_problem;
-use quip_proto::v1::{Job, RejectReason};
+use quip_proto::v1::{ising_problem, Capabilities, Job, JobKind, RejectReason};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Capability envelope advertised in `Hello`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MinerCaps {
     /// Backend name (e.g. `"cpu"`, `"cuda"`).
     pub backend: String,
@@ -18,6 +17,39 @@ pub struct MinerCaps {
     pub max_nodes: u32,
     /// Maximum edges; `0` means unlimited.
     pub max_edges: u32,
+    /// Problem generators this miner runs for `ISING_GENERATE` leases.
+    pub generators: Vec<i32>,
+    /// Problems the miner keeps in flight. `0` means unknown until the device opens.
+    pub stream_width: u32,
+}
+
+impl MinerCaps {
+    /// Whether this miner takes `ISING_GENERATE` leases with the generator
+    /// this coordinator issues. The upgrade guide sends leases only to a peer
+    /// that advertises both.
+    #[must_use]
+    pub fn accepts_leases(&self) -> bool {
+        self.supported_kinds
+            .contains(&(JobKind::IsingGenerate as i32))
+            && self
+                .generators
+                .contains(&(quip_proto::v1::GeneratorAlgorithm::Blake3Chacha8V1 as i32))
+    }
+
+    /// Index a v2 `Capabilities` message.
+    #[must_use]
+    pub fn from_capabilities(c: &Capabilities) -> Self {
+        use quip_protocol::session::{algorithm_name, backend_name};
+        Self {
+            backend: backend_name(c.backend()).to_owned(),
+            algorithm: algorithm_name(c.algorithm()).to_owned(),
+            supported_kinds: c.supported_kinds.clone(),
+            max_nodes: c.max_nodes,
+            max_edges: c.max_edges,
+            generators: c.generators.clone(),
+            stream_width: c.stream_width,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -36,6 +68,8 @@ struct MinerQueue {
     /// The feeder reads-and-resets this each poll to size the adaptive staging
     /// window from the miner's observed drain rate (see `feeder_loop`).
     consumed_since_poll: u32,
+    /// Lease salts the miner finished since the last `take_lease_salts`. The feeder turns this into a salts-per-second rate for lease sizing.
+    salts_since_poll: u64,
     /// Jobs this miner finished (Result or Reject) since it registered.
     /// The heartbeat reads this total. Polls do not reset it.
     completed: u64,
@@ -88,6 +122,7 @@ impl Router {
                 q.caps = caps;
                 q.granted_credits = 0;
                 q.consumed_since_poll = 0;
+                q.salts_since_poll = 0;
                 q.unsupported_kinds.clear();
             }
             None => {
@@ -98,6 +133,7 @@ impl Router {
                         staged: VecDeque::new(),
                         granted_credits: 0,
                         consumed_since_poll: 0,
+                        salts_since_poll: 0,
                         completed: 0,
                         unsupported_kinds: HashSet::new(),
                     },
@@ -144,6 +180,20 @@ impl Router {
         if let Some(q) = self.miners.get_mut(miner_id) {
             q.granted_credits = q.granted_credits.saturating_add(credits);
         }
+    }
+
+    /// Add salts a miner reported finished in a `LeaseDone`.
+    pub fn record_lease_salts(&mut self, miner_id: &str, salts: u64) {
+        if let Some(q) = self.miners.get_mut(miner_id) {
+            q.salts_since_poll = q.salts_since_poll.saturating_add(salts);
+        }
+    }
+
+    /// Read and reset the finished-salt count since the last call.
+    pub fn take_lease_salts(&mut self, miner_id: &str) -> u64 {
+        self.miners
+            .get_mut(miner_id)
+            .map_or(0, |q| std::mem::take(&mut q.salts_since_poll))
     }
 
     /// Pop the next staged job, spending one credit. Returns `None` when the
@@ -315,6 +365,9 @@ fn capable(q: &MinerQueue, kind: i32, n_nodes: u32, n_edges: u32) -> bool {
     if !q.caps.supported_kinds.is_empty() && !q.caps.supported_kinds.contains(&kind) {
         return false;
     }
+    if kind == JobKind::IsingGenerate as i32 && !q.caps.accepts_leases() {
+        return false;
+    }
     // max_nodes/max_edges of 0 means unlimited (Hello default when unset).
     if q.caps.max_nodes > 0 && n_nodes > q.caps.max_nodes {
         return false;
@@ -334,7 +387,8 @@ fn job_node_count(job: &Job) -> u32 {
         return 0;
     };
     // h field length / 4 = node count
-    (ising.h_milli_le32.len() / 4) as u32
+    // Coordinator-authored problems are always `I32`, four bytes per element.
+    (ising.h.len() / 4) as u32
 }
 
 #[expect(
@@ -347,14 +401,14 @@ fn job_edge_count(job: &Job) -> u32 {
     };
     match &ising.graph {
         Some(ising_problem::Graph::Edges(e)) => e.u.len() as u32,
-        _ => (ising.j_milli_le32.len() / 4) as u32,
+        _ => (ising.j.len() / 4) as u32,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_proto::v1::{IsingProblem, JobKind, Provenance};
+    use quip_proto::v1::{JobKind, Provenance};
 
     fn caps_ising() -> MinerCaps {
         MinerCaps {
@@ -363,23 +417,78 @@ mod tests {
             supported_kinds: vec![JobKind::IsingSample as i32],
             max_nodes: 1000,
             max_edges: 10000,
+            ..MinerCaps::default()
         }
+    }
+
+    fn caps_lease() -> MinerCaps {
+        MinerCaps {
+            supported_kinds: vec![JobKind::IsingSample as i32, JobKind::IsingGenerate as i32],
+            generators: vec![quip_proto::v1::GeneratorAlgorithm::Blake3Chacha8V1 as i32],
+            stream_width: 4,
+            ..caps_ising()
+        }
+    }
+
+    fn lease_job(start: u64) -> Job {
+        let snap = crate::chain::snapshot::MiningSnapshot {
+            head_hash: [0; 32],
+            last_proof_block_hash: [7; 32],
+            topology_hash: vec![9; 32],
+            nodes: vec![0, 1],
+            edges: vec![(0, 1)],
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![1000],
+            allowed_spin_milli: vec![-1000, 1000],
+            min_solutions: 1,
+            max_energy_milli: 0,
+            min_diversity_milli: 0,
+            block_number: 1,
+            spec_version: 117,
+        };
+        crate::lease::build_lease_job(&snap, [0; 32], start, 4, 1)
+    }
+
+    #[test]
+    fn lease_routes_only_to_a_miner_with_the_generator() {
+        let mut r = Router::new();
+        r.register_miner("plain", caps_ising());
+        assert_eq!(r.route(lease_job(1)), None);
+        r.register_miner("lease", caps_lease());
+        assert_eq!(r.route(lease_job(1)).as_deref(), Some("lease"));
+    }
+
+    #[test]
+    fn kind_without_generator_does_not_accept_leases() {
+        let caps = MinerCaps {
+            generators: vec![],
+            ..caps_lease()
+        };
+        assert!(!caps.accepts_leases());
+        assert!(caps_lease().accepts_leases());
+    }
+
+    #[test]
+    fn lease_salts_read_and_reset() {
+        let mut r = Router::new();
+        r.register_miner("lease", caps_lease());
+        r.record_lease_salts("lease", 7);
+        r.record_lease_salts("lease", 3);
+        assert_eq!(r.take_lease_salts("lease"), 10);
+        assert_eq!(r.take_lease_salts("lease"), 0);
+        assert_eq!(r.take_lease_salts("unknown"), 0);
     }
 
     fn make_job(generation: u64, kind: JobKind) -> Job {
         Job {
             job_id: format!("g{generation}").into_bytes(),
+            generator: None,
             kind: kind as i32,
             generation,
             deadline_ms: 9_999_999,
-            ising: Some(IsingProblem {
-                graph: None,
-                h_milli_le32: vec![0; 8], // 2 nodes
-                j_milli_le32: vec![0; 4], // 1 edge
-                num_reads: 0,
-                num_sweeps: 0,
-                anneal_time_us: 0,
-            }),
+            ising: Some(crate::producer::problem::milli_problem(
+                None, &[0; 2], &[0; 1],
+            )),
             provenance: Some(Provenance {
                 is_pow: generation != 0,
                 order_id: vec![],
@@ -516,6 +625,7 @@ mod tests {
                 supported_kinds: vec![JobKind::IsingSample as i32],
                 max_nodes: 1000,
                 max_edges: 10000,
+                ..MinerCaps::default()
             },
         );
         let job = make_job(1, JobKind::IsingSample);

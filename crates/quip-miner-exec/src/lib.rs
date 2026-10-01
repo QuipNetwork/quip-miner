@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn model_json_serializes_expected_fields() {
-        let graph = IsingGraph::new(vec![1.0, -1.0], vec![1.0], vec![(0, 1)]);
+        let graph = IsingGraph::new(vec![1.0, -1.0], vec![1.5], vec![(0, 1)]);
         let params = SampleParams {
             num_reads: 8,
             num_sweeps: 64,
@@ -349,6 +349,7 @@ mod tests {
         )]
         {
             assert_eq!(v["h"], serde_json::json!([1.0, -1.0]));
+            assert_eq!(v["j"], serde_json::json!([1.5]));
             assert_eq!(v["edges"], serde_json::json!([[0, 1]]));
             assert_eq!(v["num_reads"], 8);
             assert_eq!(v["beta_range"], serde_json::json!([0.1, 3.0]));

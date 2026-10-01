@@ -60,8 +60,6 @@ use quip_coordinator::chain::{ChainClient, JobOrder, RealChainClient};
 use quip_coordinator::drive::parse_topology_spec;
 use quip_coordinator::presets::preset_spec;
 use quip_coordinator::validate::MAX_PROOF_SOLUTIONS;
-use quip_proto::v1::Solution;
-use quip_protocol::wire::encode_spins;
 use quip_transaction_crypto::{account_id_from_public, HybridPair};
 use sp_core::Pair;
 
@@ -586,8 +584,8 @@ async fn devnet_submit_proof_end_to_end() {
         n_valid: valid.len() as u32,
         solutions: valid
             .iter()
-            .map(|(s, e)| Solution {
-                spins_bytes: encode_spins(s),
+            .map(|(s, e)| quip_coordinator::validate::SpinRow {
+                spins: s.clone(),
                 energy_milli: *e,
             })
             .collect(),
