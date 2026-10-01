@@ -1,6 +1,6 @@
 [package]
 name = "quip-coordinator"
-version = "0.3.0"
+version = "0.3.5-rc9"
 edition = "2021"
 
 [[bin]]
@@ -12,14 +12,15 @@ name = "quip_coordinator"
 path = "src/lib.rs"
 
 [dependencies]
+quip-proto-v1 = { package = "quip-proto", version = "=0.0.1" }
+bytes = "1"
 rayon = "1.10"
-bytemuck = "1"
-quip-proto = { path = "../quip-proto" }
-quip-protocol = { path = "../quip-protocol" }
-quantum-validation = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", rev = "5841672bf8d0f1908a6c455030efba08d0b44ad6" }
-quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", rev = "5841672bf8d0f1908a6c455030efba08d0b44ad6" }
+quip-proto = "0.0.2-rc3"
+quip-protocol = "0.0.2-rc3"
+quantum-validation = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "7754efa2bbc42cfcf60bb21af8d22b29bd30b67c", version = ">=0.3.0" }
+quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "7754efa2bbc42cfcf60bb21af8d22b29bd30b67c", version = ">=0.3.0" }
 parity-scale-codec = { version = "3.7.5", default-features = false, features = ["derive", "std"] }
-sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", branch = "v0.2", default-features = false, features = ["std"] }
+sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", rev = "30810786a6610de8798594bbc5d4f00670744c6d", default-features = false, features = ["std"] }
 blake2 = "0.10"
 twox-hash = "1.6"
 jsonrpsee = { version = "0.24", features = [
@@ -28,11 +29,16 @@ jsonrpsee = { version = "0.24", features = [
     "client-ws-transport-tls",
     "macros",
 ] }
-# Metadata-aware event decoding for the mempool live-scan (QuantumComputeMempool
-# JobProposed). Read-only: submit stays on the hybrid-signed jsonrpsee path.
-subxt = "0.50.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Faucet auto-funding is a plain HTTPS POST with a JSON body. jsonrpsee only
+# speaks JSON-RPC and hyper has no TLS layer wired here, so there is no existing
+# client to reuse. rustls-tls keeps OpenSSL out of the slim runtime image and
+# reuses the rustls already in Cargo.lock.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
 tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true, features = [
@@ -53,19 +59,27 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 toml = "0.8"
 blake3 = "1"
+# Pinned to the pallet's version so the decay projection matches the chain
+# bit for bit. libm is pure Rust; std's f64::powf and f64::ln call the platform
+# libm and may differ by an ulp, which the rounding turns into a milli.
+libm = "=0.2.16"
 getrandom = "0.2"
 async-trait = "0.1"
+# Stream type for RPC subscriptions. The transport trait returns a boxed
+# stream so it stays object safe across native and WebAssembly builds.
+futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
-quantum-validation = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", rev = "5841672bf8d0f1908a6c455030efba08d0b44ad6" }
-quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-protocol-rs.git", rev = "5841672bf8d0f1908a6c455030efba08d0b44ad6" }
-quip-protocol = { path = "../quip-protocol" }
-quip-proto = { path = "../quip-proto" }
-sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", branch = "v0.2", default-features = false, features = ["std"] }
+quantum-validation = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "7754efa2bbc42cfcf60bb21af8d22b29bd30b67c", version = ">=0.3.0" }
+quip-transaction-crypto = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "7754efa2bbc42cfcf60bb21af8d22b29bd30b67c", version = ">=0.3.0" }
+quip-transaction-crypto-core = { git = "https://gitlab.com/quip.network/quip-validator.git", rev = "7754efa2bbc42cfcf60bb21af8d22b29bd30b67c", version = ">=0.1.0" }
+quip-protocol = "0.0.2-rc3"
+quip-proto = "0.0.2-rc3"
+sp-core = { git = "https://github.com/QuipNetwork/polkadot-sdk.git", rev = "30810786a6610de8798594bbc5d4f00670744c6d", default-features = false, features = ["std"] }
 parity-scale-codec = { version = "3.7.5", default-features = false, features = ["derive", "std"] }
 jsonrpsee = { version = "0.24", features = ["ws-client", "client-ws-transport-tls", "macros"] }
 blake2 = "0.10"

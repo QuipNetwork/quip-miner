@@ -9,7 +9,7 @@ never see the chain.
 The crate is `crates/quip-coordinator`. This document describes the modules and
 how they fit together. For build and run commands, see `AGENTS.md`.
 
-## Two run modes
+## Run modes
 
 `main.rs` parses one CLI:
 
@@ -20,6 +20,104 @@ how they fit together. For build and run commands, see `AGENTS.md`.
 - `quip-coordinator drive …` — a synthetic driver (`drive` module). Spawns one
   miner and feeds it generated or replayed problems with no chain and no submit.
   Used for benchmarking and matched-condition parity runs.
+- `quip-coordinator seed-chain …` — registers a default topology and sets its
+  difficulty on a fresh chain. You can seed a chain only once. Wipe the chain
+  data and restart the validator if `DefaultTopology` is already set.
+
+## Logging
+
+`logging.rs` installs the subscriber, and `main` calls it first. The `tracing`
+macros only dispatch to an installed subscriber. Without that call every log
+statement in the process does nothing and `RUST_LOG` has no effect.
+
+Verbosity comes from `--log-level {trace,debug,info,warn,error}`, default
+`info`. An explicit flag wins over `RUST_LOG`. When the flag is absent,
+`RUST_LOG` applies. The default filter holds third-party crates at
+`warn` and this crate's targets at the chosen level, so `--log-level debug`
+stays readable. Use `RUST_LOG` when you need jsonrpsee or subxt internals.
+
+All output goes to stderr, because `drive` prints its timing table to stdout.
+Color is on only when stderr is a terminal, so a captured log file stays plain
+text.
+
+Spawned miners inherit these streams and log for themselves, so miner lines
+appear alongside the coordinator's own. Both spawn paths — supervised and
+`drive` — pass `--log-level` through to the child. The quip-solver-core repo
+describes what a miner logs at each level.
+
+What each level carries:
+
+- `info` — startup and the validator runtime, round transitions, miner spawn
+  and registration, submit outcomes, and a one-minute throughput heartbeat.
+- `debug` — per-poll feeder detail, difficulty changes, validator failover.
+- `trace` — every RPC call.
+
+The feeder logs state changes on transition, not per poll. It polls once a
+second, so a validator that goes away logs one warning and then stays quiet
+until reachability changes. The round machine logs each state at `trace` on
+entry, once per transition, with the generation. A state held more than 10
+seconds warns once.
+
+## Startup checks
+
+`main` refuses to start on three operator errors, all exit 64:
+
+- **No backend section.** A config with no `[cpu]`, `[cuda.N]`, `[metal]`, or
+  `[dwave]`/`[qpu]` launches no miners and can never mine. The error names the
+  v0.2 `quip-miner` format when it sees that format's keys, because the two
+  configs are not interchangeable.
+- **An incompatible validator.** `chain::preflight` reads the runtime version
+  and checks `QuantumPowApi`. The coordinator drives version 2 or newer, the
+  version that added `difficulty_for`, which every poll calls.
+- **An unfunded miner account.** `funding.rs` reads the account balance and,
+  when the balance is below `min_balance_plancks` (2 UNIT), requests a top up
+  from `faucet_url`. It retries with backoff for `funding_timeout_s` (10
+  minutes by default), then gives up. An account that cannot pay transaction
+  fees mines normally and fails every submit, which reads as a mining bug
+  rather than an empty wallet.
+
+The on-chain balance is the source of truth for funding, not the faucet's
+reply. A faucet that answers 403 (already at its cap) or rate-limits is not a
+failure by itself. Only HTTP 400 is permanent, because retrying a malformed
+request cannot help. Set `faucet_url = ""` to turn autofunding off and fund
+the account yourself.
+
+An unreachable validator is not an error. The node manager starts the
+coordinator and its validator together, so exiting because the node is still
+booting would only crash-loop. The coordinator warns, starts, and retries.
+
+## Waiting for the validator to sync
+
+State 2 of the round machine waits until the node catches up. Every chain read
+resolves against the node's best block. While the node imports history, that
+block is far behind the real head. The miner account then reads as empty even
+after the faucet has paid it, and any snapshot describes a round that ended
+long ago.
+
+`wait_until_synced` polls `system_health` every 5 seconds and warns with the
+block from `system_syncState` every 30 seconds:
+
+```
+WARN validator is syncing at block 1108021 of 1240333 (132312 behind); waiting
+     before funding and mining peers=8 waited_s=0
+```
+
+The wait has no ceiling while the node reports progress, because an initial
+sync runs for hours and the funding budget is 10 minutes. Cutting it short is
+what produced the misleading "miner account is not funded" exit, which is exit
+64 and stops the supervisor respawning the coordinator.
+
+The gate opens on `isSyncing`, the same signal the node manager reports. A node
+flaps that flag near the tip, so the gate needs two consecutive clear polls once
+it has seen a sync. The first answer settles a node that was never syncing, so a
+normal start waits for nothing. When the node answers nothing at all for a
+minute, the coordinator warns, starts, and leaves the retry to the feeder. Zero
+peers on a node that expects peers draws its own warning, because that node has
+no chain to catch up to.
+
+`[miner].validators` is an ordered failover list, tried in order on every call.
+When the key is absent it defaults to `["ws://quip-validator:9944",
+"ws://127.0.0.1:9944"]`, matching v0.2. An explicit empty list stays empty.
 
 ## Runtime wiring
 
@@ -42,53 +140,309 @@ difficulty `target`, per-miner `Configure`, and the salt→job bookkeeping.
 
 ## The blockchain seam
 
-All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`), with
-three methods:
+All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
 
 - `fetch_mining_snapshot` — the mining inputs at a block: topology
   (nodes/edges, allowed h/J/spin ranges), difficulty gates
   (`max_energy_milli`, `min_solutions`, `min_diversity_milli`), and the round
-  anchor (`last_proof_block_hash`).
+  anchor (`last_proof_block_hash`). The client pins every read at one head
+  hash. Each poll reads the difficulty and the root: `difficulty_for`, the
+  `LastProofBlock` and `LastProofBlockHash` values, the header, and
+  `DefaultTopology` when the caller names no topology. The client keeps the
+  last topology it read through `topology_meta` and reads again only when the
+  hash changes, because a topology never changes under its hash.
 - `fetch_mempool_orders` — open mempool orders eligible for this miner.
 - `submit_proof` — hybrid-sign and submit a proof extrinsic, then classify the
   receipt.
+- `declare_participation` — hybrid-sign and submit
+  `MinerRegistry.participate` for one qblock, then classify the pallet
+  error.
+- `file_descriptor` — hybrid-sign and submit
+  `MinerRegistry.set_descriptor` with a V2 payload, then classify the
+  pallet error.
+- `ensure_miner_registered` — read `QuantumPow.Miners` for the signing
+  account and, when the account is absent, submit
+  `QuantumPow.register_miner`.
+- `ensure_solver_registered` — read `QuantumComputeMempool.Solvers` for the
+  signing account. When the account is absent, submit `register_solver`. When
+  the stored type differs from the configured type, submit `deregister_solver`
+  first.
+- `submit_solution` — hybrid-sign and submit
+  `QuantumComputeMempool.submit_solution` for one order, then confirm that
+  `OrderSolutions` holds a submission from the inclusion block.
+
+One key produces two different 32-byte values, and they are not
+interchangeable. The **account** is `blake2b_256(domain ++ public_key)`: it
+signs, holds the balance, and keys every account storage map. The
+**identity** is `blake2_256(account.encode())`, one further hash of that
+account. The identity is the PoW nonce input, and it must equal what the
+pallet computes in `account_to_bytes`, or the pallet rejects the proof with
+`InvalidNonce`. Fund and look up the account. Derive nonces from the
+identity.
+
+The H3-to-H4 signing migration keeps the keystore format and 32-byte master
+seed unchanged, so existing keystore files still load. Account derivation is
+domain-separated over the suite's full hybrid public key, however, and H4
+derives different public bytes from the same seed. The resulting SS58 account
+therefore changes. Re-fund the new account from the faucet and submit a fresh
+`register_miner` before mining. `miner_identity_bytes` changes with the
+account because it is the pallet-matched hash of that account's SCALE encoding.
+
+### Confirming a submission
+
+The transaction status stream reports pool and inclusion progress only. It
+cannot say whether the dispatch inside the block succeeded, because that
+answer lives in the block events and decoding those needs runtime metadata
+this client does not carry. Each call instead names the storage entry its own
+success writes, and the client reads that entry back at the inclusion block.
+
+When the extrinsic is in the block but the storage entry is absent, the
+client reports why in the terms of that storage rather than as one generic
+failure. For a proof it reads `QuantumPow.QBlocks` at the inclusion block and
+compares the winner:
+
+| What the qblock slot holds | Meaning | Action |
+| --- | --- | --- |
+| Another account | Another miner won the race. The proof was sound. | `StopRoundStale`, logged at info |
+| The signing account | The read raced the write | `StopRoundStale` |
+| Nothing | The pallet rejected the proof itself. Check diversity, energy, and registration. | `classify_receipt` |
+
+A lost race is the one included-but-failed case that says nothing is wrong
+with the proof, so it must not appear as a rejection.
+
+`system_dryRun` cannot answer this question. At the chain head the nonce is
+already spent. At the parent block the replay leaves out whatever the block
+ordered ahead of the extrinsic, which is the exact thing that beats a proof.
+
+Naming the pallet error variant itself, such as `InsufficientDiversity`,
+still needs metadata decoding. `classify_receipt` matches those names, so it
+only ever sees them for errors the node reports before inclusion.
 
 `RealChainClient` (`chain/real.rs`) is the live client over Substrate
-JSON-RPC and subxt; `FakeChain` (`chain/fake.rs`) backs the tests. Supporting
-modules: `extrinsic` (hybrid sr25519 + ML-DSA-44 signing, `load_hybrid_pair`,
-`miner_identity_bytes`), `snapshot` (`MiningSnapshot`, `DecayParams`),
+JSON-RPC. `FakeChain` (`chain/fake.rs`) backs the tests. Supporting
+modules: `extrinsic` (H4 hybrid sr25519 + FN-DSA-512 signing, `load_hybrid_pair`,
+`miner_identity_bytes`, `signer_account_bytes`), `snapshot`
+(`MiningSnapshot`, `DecayParams`),
 `mempool` (`JobOrder`), `submit` (`Proof`, `classify_receipt`, `SubmitAction`),
 plus `proof_encode` and `scale_types` for SCALE codec. Nothing outside
 `chain/` talks to the node directly.
 
 ## Job production — the feeder
 
-`feeder_loop` (in `runtime.rs`) runs one poll every `poll_interval_ms`:
+`feeder_loop` (in `runtime.rs`) runs one poll every `poll_interval_ms`
+(1000 ms in production). The poll runs every 250 ms when the miners are
+stopped for a pending win. A win is visible on the next poll, so the
+worst-case delay before `Cancel` is one poll interval plus the snapshot RPC.
 
-- **Follow the head.** It fetches the snapshot. When `last_proof_block_hash`
-  changes, a new round has started: it bumps a generation counter, cancels the
-  prior generation's staged jobs, refreshes the topology and difficulty target
-  in `CoordinatorState`, and clears the salt map.
-- **Stage PoW work.** For each registered miner it derives fresh jobs
-  (`producer::derive_pow_job`) from the snapshot, the miner account, and a
-  unique salt per attempt, and stages them until the miner's queue reaches its
-  adaptive depth. Each distinct salt derives a distinct nonce, so every attempt
-  is a fresh draw.
+The round key is `last_proof_block_hash`. `fetch_mining_snapshot` computes it
+from `LastProofBlock` at the head. At the block that includes the winning
+proof, the key is that block's hash. The pallet stores the same value one
+block later. The coordinator starts the next round one block early. A proof
+built on it is valid from the next block on. If a reorg replaces the winning
+block, the key changes again and the feeder restarts the round on the
+replacement.
 
-Mempool jobs carry generation `0` (`producer::mempool::job_order_to_job`) and
-are preserved across reseeds; PoW jobs carry the live generation and are
-dropped when their round ends.
+When `last_proof_block_hash` changes, the feeder drives the round state
+machine. Startup drives the same machine. Mining is the last state. A new
+qblock head in any state returns the machine to the first state.
+
+### Round state machine
+
+The states, in order:
+
+1. **Stop mining.** The feeder raises the generation, drops staged and
+   in-flight PoW jobs of the dead generation, and broadcasts
+   `Cancel{max_generation}`. Miners stay connected and idle. The gRPC server
+   is not blocked.
+2. **Validator is synced.** The feeder calls `wait_until_synced`.
+3. **Account is funded.** The feeder calls `ensure_funded` with the signing
+   account. One balance read is the common case. A mid-run failure is not
+   fatal. The feeder warns, holds this state, and retries. It does not exit.
+4. **Miner registered.** The coordinator reads `QuantumPow.Miners` for the
+   signing account. If the account is absent, the coordinator submits
+   `QuantumPow.register_miner`, which reserves the miner deposit from that
+   account. Later rounds skip both the read and the submit. Three transient
+   failures warn and hold this state. The pallet rejects every proof from an
+   unregistered account, so mining waits until registration succeeds.
+5. **Requirements for the next qblock downloaded.** Topology, energy target,
+   required solution count, and diversity come from a fresh snapshot after
+   sync and funding.
+6. **Descriptor filed.** On the first walk after the process starts, the
+   coordinator submits `MinerRegistry.set_descriptor` with a V2 payload.
+   Later rounds skip the submit and log at `trace`. A missing required
+   value, a pallet rejection, or three transient failures warn and advance.
+   This state never holds mining.
+7. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
+   the new round, then stages jobs. A job of the new generation cannot leave
+   before those two messages.
+8. **Awaiting qblock.** Off the walk. On each poll in state 7 the feeder
+   reads `author_pendingExtrinsics`, decodes every signed
+   `QuantumPow.submit_proof`, and replays the pallet gates against the
+   snapshot (`pool_watch::judge_pending_proof`). If one clears, the feeder
+   raises the generation and cancels the miners. It then enters this state. It
+   stages nothing here. It leaves on a new root, or it resumes on the same
+   root when no clearing proof is pending for two polls or two blocks pass.
+   A proof that held the miners and produced no qblock is ignored, by signer
+   and nonce, for the rest of the root. A failed pool read counts toward neither exit.
+   The pool is one node's view, so this stop is best effort.
+
+Participation is not a walk step. The feeder submits
+`MinerRegistry.participate` for the candidate qblock on the first poll after
+a miner returns a `Result` for the round. See "Participation" below.
+
+### Node descriptor
+
+`set_descriptor` is pallet 13, call 0. The coordinator files schema V2.
+
+Values come from `[miner]`:
+
+| Field | Config key | Default |
+| --- | --- | --- |
+| `node_id` | `[miner].node_id` | 64-char hex of the miner account |
+| `node_name` | `[miner].node_name` | SS58 address of the miner account |
+| `public_host` | `[miner].public_host` | required |
+| `public_port` | `[miner].public_port` | required |
+| `rpc_endpoints` | `[miner].validators` | the validator list the coordinator already reads |
+| `auto_mine` | `[miner].auto_mine` | `true` |
+| `log_level` | `[miner].log_level` | `info` |
+| `miners` | backend sections | one spec per launched miner |
+| `system_info` | — | none |
+| `runtime` | — | none |
+
+`[miner].log_level` is the advertised node log level. It does not change
+coordinator verbosity. Use `--log-level` or `RUST_LOG` for that.
+
+`rest_host` and `rest_port` are v0.2 keys. The coordinator does not map
+`rest_port` to `public_port`.
+
+You must set `public_host` and `public_port`. `parse_config` rejects a
+missing key. It also rejects a blank host and a port of 0.
+`public_port` is the port a peer uses to reach this node from outside the
+host. In the reference deployment that is the public front door, not the
+validator peer port and not the dashboard port.
+
+If `[miner].node_name` is missing or blank, the node uses the miner account's
+SS58 address as its name. This is the same address shown in the dashboard.
+Set `node_name` to use your own name. A custom `node_id` does not change the
+default name.
+
+The pallet reserves `DescriptorDepositBase` plus
+`DescriptorDepositPerByte` times the payload length. The runtime sets those
+to 1 milliUNIT and 1 microUNIT. A typical coordinator descriptor costs about
+0.001 UNIT. The funding floor is 2 UNIT (`min_balance_plancks`). The deposit
+fits under that floor.
+
+### Participation
+
+The node manager reads `MinerRegistry::LatestParticipation` and compares it
+to `QuantumPow::QBlockCount`. The coordinator must call
+`MinerRegistry.participate` once per mined qblock or that check stays behind.
+
+The coordinator declares participation only after a miner has mined the
+round. The evidence is the first `Result` for a job of the current
+generation. Staged work is not evidence: a QPU sits a round out by
+withholding credits and rejecting what the coordinator sends, and a miner
+that is down returns nothing. A `Reject` never counts. A late `Result` for a
+cancelled generation never counts. A round with no `Result` is not declared.
+
+The pallet accepts only the current candidate qblock. That id is one past
+`QuantumPowApi_latest_qblock_id`. The `new round` log line prints the last
+minted id. The declaration uses the candidate.
+
+`participate` takes one `MinerKind`. The coordinator derives that kind from
+the miners it starts. A mixed fleet declares the highest-capability kind:
+QPU, then ASIC, then Metal, then GPU, then CPU. The descriptor `miners`
+list still carries every launched backend.
+
+Pallet outcomes:
+
+| Outcome | Action |
+| --- | --- |
+| success or `DuplicateParticipation` | treat as declared. Do not retry. |
+| `InvalidQBlockId` | log at `debug`. Declare the new candidate next round. |
+| `DescriptorRequired` | log at `warn` once, name the account, keep mining |
+| transient chain error | warn and retry on the next poll |
+
+A descriptor or participation failure never calls `process::exit` and never
+holds mining.
+
+Transitions:
+
+| Current state | Event | Next state |
+| --- | --- | --- |
+| any | Shutdown | stop the machine |
+| any | NewHead | Stop mining |
+| any | Failed | same state (retry) |
+| Stop mining | Succeeded | Validator is synced |
+| Validator is synced | Succeeded | Account is funded |
+| Account is funded | Succeeded | Miner registered |
+| Miner registered | Succeeded | Requirements downloaded |
+| Requirements downloaded | Succeeded | Descriptor filed |
+| Descriptor filed | Succeeded | Start mining |
+| Start mining | Succeeded | Start mining |
+| Start mining | WinPending | Awaiting qblock |
+| Awaiting qblock | Succeeded | Awaiting qblock |
+| Awaiting qblock | Resume | Stop mining |
+| other | WinPending or Resume | same state |
+
+The feeder does the I/O. The transition function is pure. The feeder logs the
+state at `trace` on each entry, once per transition, with the generation. A
+state held more than 10 seconds warns once. An operator can read the current
+state and the reason that mining has not started.
+
+Startup drives states 2 through 6. A funding failure at startup is still exit
+64. A missing snapshot at startup is a warning. The feeder retries that
+download after miners connect.
+
+One `info` line names the new generation, the cancelled staged-job count, the
+miner count, and the refreshed target.
+
+Mempool jobs carry generation `0` (`producer::mempool::job_order_to_job`).
+Reseeds keep those jobs. PoW jobs carry the live generation. The feeder drops
+them when their round ends. A cancelled in-flight job is not re-queued, not
+scored, and not submitted. The miner refunds its credit with `JobRequest{1}`.
 
 ### Adaptive staging window
 
 The staged depth per miner tracks how fast that miner drains work, so a
-many-core backend stays saturated while a slow one doesn't hoard jobs. Each
-poll samples the miner's jobs-consumed counter (`Router::take_consumed`,
+many-core backend stays saturated while a slow one does not hoard jobs. Each
+poll samples the miner's dispatch counter (`Router::take_consumed`,
 read-and-reset), smooths it with an EMA (`α = 0.3`), and sizes the window to
 `ceil(ema × 2.0)` — about two poll-intervals of drain — with `buffer_depth` as
-the floor and no ceiling. The EMA is anchored to real completions, so the depth
-self-bounds to roughly headroom × actual throughput. The default floor is 256
-(`main.rs`), generous enough to keep every miner fed from the first poll.
+the floor and no ceiling. The EMA tracks queue drain. A job leaves the staged
+queue at dispatch, so that is the signal the feeder sizes against. The default
+floor is 256 (`main.rs`), generous enough to keep every miner fed from the
+first poll. The one-minute heartbeat reports completions, not this dispatch
+counter.
+
+### Decay projection and the win-time stash
+
+The chain eases `max_energy_milli` between wins. A solution that misses the
+threshold now may clear it later in the same round, so the session path
+stashes it and the feeder submits it at the projected block. `decay.rs`
+mirrors the chain's rule so the projection needs no per-block RPC.
+
+The chain has shipped two rules. Runtime 117 steps the threshold once per
+100-block epoch by 2.5% of the room to the easy cap. Runtime 118
+(quip-validator !87) eases every block in closed form. Past 100 blocks in a
+round it eases at twice the baseline rate. That doubling holds while the
+room to the easy cap exceeds the 40,000 milli floor crossover. Under the
+crossover both phases step 1,000 milli per epoch and the overdue term adds
+nothing. `DecayAlgorithm` names the two. `DecayModel` holds the stored base difficulty, the curve, the epoch
+length, and the rule, and answers the threshold at any elapsed block.
+
+`fetch_mining_snapshot` reads `state_getRuntimeVersion` at the snapshot
+block. `DecayAlgorithm::for_spec_version` picks the rule: continuous at
+spec 118 and later, stepwise before. The feeder builds the model at each
+reseed. On every poll it swaps the rule into the stash when the spec version
+changes. The stash keeps its candidates across the swap. The upgrade needs
+no restart.
+
+`WinStash::viability_block` finds the first block whose threshold exceeds a
+candidate's energy by binary search over 25,600 blocks. A candidate that
+does not clear inside that window is not held. The stash summary in
+`attempts.json` reports `decay_algorithm` so an operator can confirm which
+rule a round ran under.
 
 ## Routing and credits
 
@@ -118,16 +472,53 @@ coordinator dispatches staged `Job`s, and each `Result` or `Reject` is a
 terminal event that frees a credit and advances accounting. A periodic `Ping` (every 15s) draws a
 `Status` that reports how busy the miner is and surfaces paused or stale-round
 liveness; `Shutdown` ends the session in-band. The harness owns credits, reject
-reasons, and liveness, so each backend only has to sample. `MINER_PROTOCOL.md`
-specifies this contract from the miner's side.
+reasons, and liveness, so each backend only has to sample. `SPEC.md` in the
+quip-solver-core repo specifies this contract from the miner's side.
+
+### Protocol v1 and v2 edge
+
+The session edge serves protocol v1 and v2 miners on the same gRPC path. It
+classifies the first frame, then decodes and encodes messages with that
+protocol's schema. The edge translates v1 frames to the coordinator's v2
+messages and translates supported v2 responses back to v1.
+
+| Message | Translation at the edge |
+|---|---|
+| v1 `Hello` in | v2 `Hello` with v2 capabilities |
+| v1 `Result` spin bytes in | Packed spins in a v2 `Result` |
+| v2 plain `I32` job at scale 1000 out | v1 `Job` with little-endian milli coefficients |
+| v2 lease or other encoding out | No v1 form. The router does not send it to v1 miners |
+
+The edge reports a v1 peer as protocol v2 to the session handler after
+translation. Remove the edge and its v1 dependency after every miner repository
+releases a v2 build.
+
+## Salt lease staging
+
+The feeder stages `ISING_GENERATE` jobs only for miners that advertise the
+BLAKE3/ChaCha8 generator. D-Wave does not advertise that generator and keeps
+receiving plain jobs.
+
+The coordinator sizes each lease from a smoothed salts-per-second rate.
+`LEASE_TARGET_SECS` sets the four-second target. The floor is one pipeline fill
+based on `stream_width`. `LEASE_MAX_SALTS` caps a lease at 2²⁰ salts. Before the
+feeder has a usable rate, it stages four pipeline fills. `LEASE_STAGE_DEPTH`
+sets the two-lease staging limit per miner.
+
+The lease miner sends winners only. Near misses never reach the coordinator's
+win-time stash. A winner reaches that stash only when proof submission fails
+transiently. `LeaseDone` completes the lease. If `salts_done` is greater than
+zero, the miner counts as a round participant.
 
 ## Supervision and shutdown
 
 `supervise_miner` (`supervisor.rs`) owns one miner for the run. It spawns the
 binary with the session token in the `QUIP_SESSION_TOKEN` environment variable
-(never argv) and two arguments — `--quip-coordinator <socket-uri>` and
-`--miner-id <id>` — sets `kill_on_drop`, and merges the child's stderr (miners
-emit JSON log lines) into the coordinator's log tagged by miner id.
+(never argv) and three arguments — `--quip-coordinator <socket-uri>`,
+`--miner-id <id>`, and `--log-level <level>` — and sets `kill_on_drop`. The
+child inherits the coordinator's stdout and stderr, so its log lines appear
+directly in the coordinator's output. `--log-level` keeps the child's verbosity
+matched, because those bytes never pass through the coordinator's own filter.
 
 Restarts follow the child's exit code (`restart_policy`):
 
@@ -144,9 +535,12 @@ the grace period (`grace_ms`).
 ## Config to launch plan
 
 `parse_config` (`config.rs`) turns `config.toml` into a `CoordinatorConfig`:
-the `[miner]` section gives `validators` and `signer_key`; each backend section
+the `[miner]` section gives `validators`, `signer_key`, the required
+descriptor keys (`public_host`, `public_port`), and the optional keys
+(`node_name`, `log_level`, `node_id`, `auto_mine`). Each backend section
 becomes one `LaunchEntry`. Section names map to miner ids `[cpu]`→`cpu-0`,
-`[cuda.N]`→`cuda-N`, `[metal]`→`metal-0`, `[dwave]`/`[qpu]`→`qpu-0`.
+`[cuda.N]`→`cuda-N`, `[metal]`→`metal-0`, `[dwave]`/`[qpu]`→`qpu-0`. The
+backend name stays on the entry so the coordinator can derive `MinerKind`.
 
 `binary` selects the executable, defaulting to `quip-<backend>-sa` (and
 `quip-dwave-qa` for D-Wave). The coordinator-owned keys (`binary`,
@@ -155,13 +549,83 @@ fields of the `Configure` message; every other key passes through verbatim in
 `Configure.backend_toml`, which the coordinator forwards to the miner. This is
 how a backend receives its own settings without the coordinator knowing them.
 
+For CUDA, N is the device ordinal as well as the miner id. The coordinator
+forwards it on the child argv as `--device N`. The id and the flag come from the
+same parsed number, so they cannot disagree. The ordinal also reaches the
+on-chain descriptor as `device_id`, which is how an operator confirms the
+binding remotely. `quip-coordinator drive` has no config sections, so it takes
+the ordinal from its own `--device` flag and defaults to GPU 0 without one. A `[cuda.N]` *section* whose key is
+not a non-negative integer, and two sections that resolve to one ordinal
+(`[cuda.1]` and `[cuda.01]`), are config errors. A non-table key under `[cuda]`
+is ignored, as before.
+
+**Upgrading:** two behaviors change for configs written against earlier
+releases. `[cuda.N]` now binds GPU N, so miners that all shared GPU 0 on a
+multi-GPU host spread across cards; throughput and thermals change with them.
+Check `nvidia-smi -L | wc -l` against the highest `[cuda.N]` first, because a
+section naming a GPU the host does not have now fails at device open (exit 69,
+never restarted) instead of mining on GPU 0. A non-numeric section such as
+`[cuda.gpu0]`, which used to launch a miner named `cuda-gpu0` on GPU 0, is now
+a startup error: rename the key to the device ordinal. `[cuda]` is the only
+indexed backend, so `[metal.N]` and `[cpu.N]` are startup errors too: they used
+to launch as `metal-0`/`cpu-0` on device 0 with the nested table leaking into
+the miner's `backend_toml` and the `binary` key under it ignored. Write
+`[metal]` or `[cpu]`. The `device_index` key
+was never read and is gone from `config.toml.example`; leaving it in an
+existing config costs one "unknown field" warning from the miner.
+
+A backend key travels on the child argv only when the miner must know it
+*before* it opens its device. Every other key travels in
+`Configure.backend_toml`. `--device` is the only key that meets this test: the
+CUDA context is created inside the miner `open` closure, before any wire byte is
+read, while `apply_config` runs after the handshake. Keys such as `utilization`
+and `yielding` are therefore never forwarded on argv from the supervised path.
+They already arrive in `backend_toml`, and sending them twice would put one
+operator value into two channels.
+
+## Dashboard and REST surface
+
+The optional `[dashboard]` section starts a read-only HTTP server. `listen`
+gives the bind address. `data_dir` gives the directory that holds the
+mining-attempt records. The coordinator writes every solved model as JSONL
+under `data_dir/<qblock_id>/attempts.jsonl`. Omit the section to turn the
+server off.
+
+| Route | Response |
+|-------|----------|
+| `GET /healthz` | `ok` |
+| `GET /qblocks` | JSON array of the available qblock ids |
+| `GET /api/v1/status` | indexer status envelope |
+| `GET /api/v1/stats` | indexer stats envelope |
+| `GET /api/v1/mining/attempts?solution_number=N` | submission and attempts for one solution |
+| anything else | static files under `data_dir` |
+
+Add `&limit=N` to the attempts route to receive only the newest N attempts by
+timestamp. The response then also carries a `totals` object for the whole
+trail. `totals` holds four fields: `attempt_count`, the lowest
+`best_energy_milli`, the summed `qpu_access_time_us`, and `num_valid` from
+the newest submitted attempt.
+
+A long qblock records thousands of attempts, and the full trail reaches
+megabytes, so a client that shows a bounded tail can poll the route without
+downloading every row.
+
+Without `limit`, the response carries every attempt and no `totals`. That is
+the behavior every client had before the parameter existed.
+
+The server serves reads only. It exposes no control endpoint. Bind it to an
+address the operator trusts, because it applies no authentication.
+
 ## Drive mode
 
 `quip-coordinator drive` (the `drive` module and `DriveService` in `session.rs`)
 spawns one miner and feeds it synthetic work with no chain and no submit. Jobs
-come from a golden random draw (`--source random`, optionally against a topology
-preset under `crates/quip-coordinator/fixtures/drive/`) or a JSONL replay
-(`--source list`). It reports per-job and aggregate timing, and can pin
+come from a golden random draw (`--source random`, optionally with a topology
+preset embedded in the binary) or a JSONL replay (`--source list`). Drive reports
+per-job and total timing, and can pin
 `num_reads`/`num_sweeps` through the `SetTarget` control-plane override to run
 matched-condition throughput and parity comparisons. This is the path used for
 CPU-versus-CUDA benchmarking.
+
+The preset JSON stays under `crates/quip-coordinator/fixtures/drive/` as the
+readable source. The binary copies each file in at compile time.

@@ -3,98 +3,34 @@
 A miner is a standalone program that solves Ising problems and speaks the gRPC
 miner protocol to the coordinator. You can add one two ways:
 
-- **A native backend on `quip-miner-core`** — the shape the CPU, CUDA, and Metal
-  miners use. You write a `Sampler` and the harness does the rest. This is the
-  recommended path and most of this guide.
-- **A client in another language** — speak the protocol directly with the
-  `quip_proto` SDK. This is the shape the D-Wave miner uses from Python. See the
-  last section.
+- **A native backend on `quip-solver-core`** — the shape the CPU, CUDA, and
+  Metal miners use. You write a `Sampler` and the harness does the rest.
+- **A solver in another language** — speak the protocol directly. This is the
+  shape the D-Wave miner uses from Python.
 
-Read `MINER.md` first for the harness API this guide builds on.
+Both shapes are specified and documented in the
+[quip-solver-core](https://gitlab.com/quip.network/quip-solver-core)
+repository: `SPEC.md` is the contract, the crate README covers the Rust
+`Sampler` path, and `examples/` holds a conformant mock solver in Rust, C++,
+Python, and TypeScript. Depend on `quip-solver-core = "0.0.2-rc3"` from crates.io
+for the Rust path, or on the `quip-solver-core` PyPI wheel for Python. A
+solver is conformant when the repo's `quip-solver-drive` binary reports a
+conformant session against it.
 
-## A native backend
+This guide covers what stays coordinator-side: naming, wiring the backend into
+the coordinator, publishing releases, and testing against this coordinator.
 
-### 1. Start a crate
+## Salt leases
 
-A miner lives in its own repository (the released ones are
-`quip.network/quip-miner-{cpu,cuda,metal}`). Depend on `quip-miner-core` as a
-git dependency and on `quip-proto` for the wire types. The crate is a binary,
-not a workspace member of `quip-protocol`.
+A Rust miner built on quip-solver-core 0.0.2-rc3 receives leases through the
+default session loop when it advertises the BLAKE3/ChaCha8 generator. The
+session loop draws each problem and passes it to the sampler. It scores the
+returned samples and sends winners to the coordinator. A miner that does not
+advertise `ISING_GENERATE` continues to receive plain jobs.
 
-### 2. Write the `Sampler`
-
-Only `sample` is required:
-
-```rust
-use quip_miner_core::{IsingGraph, SampleParams, SamplerResult, Sampler};
-use quip_proto::v1::RejectReason;
-
-struct MyBackend { /* device handle */ }
-
-impl Sampler for MyBackend {
-    fn sample(&self, graph: &IsingGraph, params: &SampleParams)
-        -> Result<Vec<SamplerResult>, RejectReason>
-    {
-        // Solve `graph` `params.num_reads` times; return one SamplerResult per
-        // read (spins in {-1,+1} and the consensus energy_milli). Map a device
-        // failure to a RejectReason (Overloaded, TooLarge, …).
-        todo!()
-    }
-}
-```
-
-Override the other trait methods only where your device differs from a serial
-CPU:
-
-- `sample_stream` and `stream_width` — run a batch of models at once instead of
-  the default serial loop.
-- `utilization` and `should_throttle` — report load and apply backpressure if
-  the backend runs a governor.
-- `max_reads` — reject a `num_reads` above a device-memory bound.
-- `apply_config` — read this backend's settings from `Configure.backend_toml`.
-
-Use `SamplerResult.energy_milli` from the shared scoring path so the score
-matches every other backend. GPU backends build a `CsrGraph` and a beta ladder
-from the helpers in `quip-miner-core`; a CPU-style backend can use `IsingGraph`
-directly.
-
-### 3. Write the binary
-
-Flatten `CommonArgs` into your `clap` parser, add any device flags, build a
-`BackendIdentity`, and call `run`:
-
-```rust
-use clap::Parser;
-use quip_miner_core::{run, BackendIdentity, CommonArgs, OpenError};
-
-#[derive(Parser)]
-struct Cli {
-    #[command(flatten)]
-    common: CommonArgs,
-    #[arg(long)]
-    device_index: Option<u32>,
-}
-
-fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
-    let id = BackendIdentity { backend: "mybackend".into(), algorithm: "sa".into() };
-    run(id, &cli.common, || open_device(&cli).map_err(OpenError))
-}
-```
-
-`run` handles `--capabilities` and `--check` itself, and in session mode it
-opens the device, connects to `--quip-coordinator`, and runs the whole session.
-The coordinator passes the session token in the environment; the harness reads
-it during the handshake, so your binary never handles authentication.
-
-### 4. Configuration
-
-The coordinator forwards each miner its own `config.toml` subsection verbatim in
-`Configure.backend_toml`. Parse it in `apply_config` against your own schema and
-use the shared helpers: `config_override` for config-over-CLI precedence with a
-warning only on a real change, and `warn_unknown_fields` to surface a typo'd key
-rather than dropping it. The session loop consumes a few keys itself (listed in
-`SESSION_KEYS`), so don't warn about those.
+A miner that generates problems on its device, such as an msa miner, must add
+`generates_locally` and `sample_lease` in its repository. Those hooks are not
+part of this coordinator repository.
 
 ## Naming and algorithm variants
 
@@ -118,33 +54,34 @@ edits:
 - **`crates/quip-coordinator/tools/fetch-miners.sh`** — add a `fetch` call for
   your repository's assets and handle the backend in the `MINER_SET`/`auto`
   logic. The container images call this script, so they need no separate change.
+  `fetch` takes the mode first: `required` fails the run when an asset is
+  missing, `optional` reports the miss and carries on. Use `optional` only for a
+  binary a release may legitimately not carry.
 
 ## Publishing releases
 
 `fetch-miners.sh` pulls each miner from its repository's GitLab generic-package
-registry at `MINERS_TAG`. Publish one asset per architecture named
-`<binary>-<arch>` (`quip-mybackend-sa-amd64` for the amd64 build). The script downloads
+registry. It resolves each repository's newest release on its own, so a miner
+reaches the images and the host install as soon as it cuts a release, and
+nobody has to bump a pin here. Set the matching `<BACKEND>_MINERS_TAG` variable
+to hold one miner at a specific tag.
+
+Publish one asset per architecture named `<binary>-<arch>`
+(`quip-mybackend-sa-amd64` for the amd64 build). The script downloads
 `<binary>-<arch>` and saves it under the clean name `<binary>`, which is what
 `config.toml`'s `binary` field and the coordinator's `PATH` lookup expect. A
-real fetch stays inert until the miner repository has cut a release at the tag.
+real fetch stays inert until the miner repository has cut its first release.
 
-## A non-Rust backend
-
-A miner in another language speaks the same gRPC `MinerService` protocol
-directly — `MINER_PROTOCOL.md` is the contract to implement against.
-Use the `quip_proto` SDK: the generated `quip.v1` stubs for the wire,
-and `quip_proto.scoring`/`quip_proto.wire` for the consensus math, so your
-energies match the Rust path exactly (the Rust in `quip-protocol` is the source
-of truth, exposed through PyO3). This is how the D-Wave miner works from Python.
-Package it so the coordinator can launch it — the D-Wave miner ships as a pip
-wheel whose console entry point is the configured `binary` (default
-`quip-dwave-qa`).
+Release this coordinator before any miner repository publishes a v2 build.
+During that rollout, the session edge accepts both v1 and v2 miners.
 
 ## Testing a new miner
 
+- Run `quip-solver-drive <your-binary> unix:///tmp/quip-check.sock` from the
+  quip-solver-core repo. Exit code 0 means the solver is conformant.
 - `your-binary --capabilities` prints the capability JSON; `your-binary --check`
   probes that the device is runnable. Both exit without connecting.
-- Drive mode runs the miner end to end with no chain:
+- Drive mode runs the miner end to end against this coordinator with no chain:
 
   ```bash
   quip-coordinator drive --miner ./your-binary --source random \
@@ -154,5 +91,5 @@ wheel whose console entry point is the configured `binary` (default
   It spawns the binary, feeds it generated problems, and prints per-job and
   aggregate timing. Pin `--num-reads`/`--num-sweeps` for a fixed comparison.
 - If the backend adapts its own parameters, mirror the golden parity the other
-  backends hold to (`conformance/golden_adapt.json`), so the budget matches
-  across languages.
+  backends hold to (the `quip-solver-conformance` crate's adapt vectors), so
+  the budget matches across languages.

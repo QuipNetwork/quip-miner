@@ -321,6 +321,7 @@ mod tests {
         );
         let fake = FakeChain::new(
             crate::chain::snapshot::MiningSnapshot {
+                head_hash: [0u8; 32],
                 last_proof_block_hash: [0u8; 32],
                 topology_hash: vec![],
                 nodes: vec![],
@@ -332,6 +333,7 @@ mod tests {
                 max_energy_milli: 0,
                 min_diversity_milli: 0,
                 block_number: 0,
+                spec_version: 117,
             },
             None,
         );
@@ -379,6 +381,7 @@ mod tests {
         );
         let fake = FakeChain::new(
             crate::chain::snapshot::MiningSnapshot {
+                head_hash: [0u8; 32],
                 last_proof_block_hash: [0u8; 32],
                 topology_hash: vec![],
                 nodes: vec![],
@@ -390,6 +393,7 @@ mod tests {
                 max_energy_milli: 0,
                 min_diversity_milli: 0,
                 block_number: 0,
+                spec_version: 117,
             },
             None,
         );
@@ -421,6 +425,7 @@ mod tests {
     async fn all_selection_on_empty_chain_errors() {
         let fake = FakeChain::new(
             crate::chain::snapshot::MiningSnapshot {
+                head_hash: [0u8; 32],
                 last_proof_block_hash: [0u8; 32],
                 topology_hash: vec![],
                 nodes: vec![],
@@ -432,6 +437,7 @@ mod tests {
                 max_energy_milli: 0,
                 min_diversity_milli: 0,
                 block_number: 0,
+                spec_version: 117,
             },
             None,
         );
@@ -489,6 +495,7 @@ mod tests {
 
         let fake = FakeChain::new(
             crate::chain::snapshot::MiningSnapshot {
+                head_hash: [0u8; 32],
                 last_proof_block_hash: [0u8; 32],
                 topology_hash: vec![],
                 nodes: vec![],
@@ -500,6 +507,7 @@ mod tests {
                 max_energy_milli: 0,
                 min_diversity_milli: 0,
                 block_number: 0,
+                spec_version: 117,
             },
             None,
         );

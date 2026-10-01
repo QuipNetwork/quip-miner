@@ -7,14 +7,56 @@
 # /usr/local/bin). `binary` selects the sa vs chromatic-gibbs variant.
 
 [miner]
+# Optional display name. Defaults to the miner account's SS58 address.
+# node_name = "quip-cpu"
 # Ordered chain endpoints; live-rotated on disconnect.
 validators = ["ws://quip-validator:9944", "ws://127.0.0.1:9944"]
-# Hybrid sr25519 + ML-DSA-44 signer. Provide via a mounted keystore/secret.
-signer_key = ""
+# Faucet for auto-funding the miner account at startup. A miner that cannot pay
+# transaction fees mines normally and then fails every submit, so the
+# coordinator tops the account up here and refuses to start if it cannot.
+# Defaults to the public testnet faucet, which is correct for Quip Testnet and
+# wrong for mainnet — set it to your own faucet, or to "" to disable, when you
+# fund the account yourself. Empty means no auto-funding.
+faucet_url = "https://faucet.testnet.quip.network"
 
-# CPU miner (bundled: quip-cpu-sa, quip-cpu-gibbs).
+# Balance floor in plancks (2 UNIT). Below this the coordinator asks the faucet.
+# min_balance_plancks = 2000000000000
+# Amount requested per faucet attempt, in plancks (10 UNIT).
+# faucet_top_up_plancks = 10000000000000
+# How long to keep retrying the faucet before giving up, in seconds.
+# funding_timeout_s = 600
+
+# Consecutive failed submissions of one proof, inside one quantum block, before
+# the coordinator stops retrying it and reports loudly. Submit outcome comes
+# from chain state, which reports that a proof did not land but not why, so this
+# bound is what turns a permanently rejected proof into a visible stop rather
+# than an endless retry.
+# max_submit_attempts = 5
+
+# H4 hybrid sr25519 + FN-DSA-512 signer. The entrypoint generates a keystore at
+# exactly this path on first run when the file is missing, so a bare
+# `docker run` produces a miner whose proofs verify. Mount your own keystore
+# over /data/keystore.json to bring an existing key. BACK IT UP — the chain
+# key lives here.
+signer_key = "/data/keystore.json"
+
+# Host a peer uses to reach this node from outside the host. Required.
+# An empty string is not a host. Set this to the address peers can reach.
+public_host = "203.0.113.10"
+# Port a peer uses to reach this node from outside the host. Required.
+# This is the public front door, not the validator peer port (9944) and
+# not the dashboard port (9090). Zero is not a valid port.
+public_port = 20050
+
+# CPU miner. Bundled production binaries: quip-cpu-sa (simulated annealing),
+# quip-cpu-gibbs (chromatic Gibbs), quip-cpu-sb (discrete Simulated
+# Bifurcation). The image also carries quip-miner-cpu's experimental kernels
+# when that release publishes them — bsb, hdsb, hbsb, gbsb, gdsb, tedsb, sbqa,
+# ggdsb, fsa, msa, mps, mfa, flatiron. Name one here to run it; `ls
+# /usr/local/bin/quip-cpu-*` in the container shows what this image actually
+# has. Experimental kernels are unbenchmarked against consensus scoring.
 [cpu]
-binary = "quip-cpu-sa"   # or "quip-cpu-gibbs"
+binary = "quip-cpu-sa"
 
 # D-Wave QPU miner (bundled Python entry point quip-dwave-qa). Needs a Leap
 # token (DWAVE_API_TOKEN) for real hardware; omit the section to disable.
@@ -26,16 +68,34 @@ binary = "quip-cpu-sa"   # or "quip-cpu-gibbs"
 # min_block_budget, then bursts until the pool drains. Durations accept
 # s/m/h/d/w suffixes or a plain number of seconds. num_reads/anneal_time come
 # from the chain difficulty target (SetTarget), not this section.
+# budget_cap must be at or above min_block_budget: the pool cannot exceed the
+# cap, so a cap below the start threshold means the gate never opens and every
+# job is rejected. The miner lifts such a cap and logs an error naming both.
+#
+# The round strategy (quip-miner-dwave v0.3.4 and later) decides at each qblock
+# boundary whether to join the round or bank the budget for a faster hour of
+# the billing period. It ranks the rounds left in the period by the jobs each
+# would deliver, walks down until their cost exhausts the remaining allotment,
+# and joins when this round clears that bar. The two keys below tune it; the
+# defaults change nothing until the miner has recorded history.
 # [dwave]
 # binary = "quip-dwave-qa"
 # daily_budget = "30s"      # QPU access time granted per day
 # min_block_budget = "90s"  # start threshold; default min(90s, daily_budget)
 # budget_cap = "5m"         # max pool size; default uncapped
+# initial_budget = "90s"    # pool at process start; default min_block_budget
+# min_throughput_advantage = 0.25  # skip a round only when the bar sits more than 25% above its jobs
+# participation_chance = 0.10      # join this share of rounds regardless, so every slot keeps getting measured
 
-# Mining-attempt dashboard. Records every solved model as JSONL under
-# data_dir/<qblock_id>/attempts.jsonl and serves them read-only over HTTP
-# (GET /<qblock_id>/attempts.jsonl, GET /qblocks, GET /healthz). Omit to
-# disable. Use the mounted /data volume so history survives restarts.
-# [dashboard]
-# listen = "0.0.0.0:9090"
-# data_dir = "/data/attempts"
+# Mining-attempt dashboard and indexer REST surface. Records every solved
+# model as JSONL under data_dir/<qblock_id>/attempts.jsonl and serves:
+#   GET /healthz, GET /qblocks, GET /<qblock_id>/attempts.jsonl
+#   GET /api/v1/status, GET /api/v1/stats, GET /api/v1/mining/attempts
+# Listen on 0.0.0.0:20100 so host.docker.internal:20100 matches the Caddy
+# reverse_proxy for /api/v1/* (see
+# quip-node-manager/vendor/nodes.quip.network/caddy/Caddyfile — the miner's
+# rest_port default). Use the mounted /data volume so history survives
+# restarts. Omit the section to disable.
+[dashboard]
+listen = "0.0.0.0:20100"
+data_dir = "/data/attempts"

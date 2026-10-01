@@ -1,12 +1,12 @@
 //! JSONL model replay list: one entry per line, auto-detected as either a
 //! nonce-ref (re-derived via `draw_ising_milli` against a topology) or an
 //! explicit problem (used verbatim).
+use crate::producer::problem::milli_problem;
 
 use crate::chain::MiningSnapshot;
 use crate::drive::JobSource;
 use crate::producer::build_ising_job_from_nonce;
-use quip_proto::v1::{ising_problem, EdgeList, IsingProblem, Job, JobKind, Provenance};
-use quip_protocol::wire::encode_i32_le;
+use quip_proto::v1::{ising_problem, EdgeList, Job, JobKind, Provenance};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -102,14 +102,13 @@ fn build_explicit_job(entry: &ListEntryJson, generation: u64, deadline_ms: u64) 
         kind: JobKind::IsingSample as i32,
         generation,
         deadline_ms,
-        ising: Some(IsingProblem {
-            graph: Some(ising_problem::Graph::Edges(EdgeList { u, v })),
-            h_milli_le32: encode_i32_le(&h),
-            j_milli_le32: encode_i32_le(&j),
-            num_reads: entry.num_reads.unwrap_or(0),
-            num_sweeps: 0,
-            anneal_time_us: 0,
+        ising: Some({
+            let mut problem =
+                milli_problem(Some(ising_problem::Graph::Edges(EdgeList { u, v })), &h, &j);
+            problem.num_reads = entry.num_reads.unwrap_or(0);
+            problem
         }),
+        generator: None,
         provenance: Some(Provenance {
             is_pow: false,
             order_id: vec![],
@@ -216,10 +215,11 @@ impl JobSource for ListSource {
 mod tests {
     use super::*;
     use crate::drive::drain_all;
-    use quip_protocol::wire::decode_i32_le;
+    use crate::producer::problem::problem_milli;
 
     fn snapshot() -> MiningSnapshot {
         MiningSnapshot {
+            head_hash: [0u8; 32],
             last_proof_block_hash: [0u8; 32],
             topology_hash: vec![9u8; 32],
             nodes: vec![0, 1, 2, 3],
@@ -231,6 +231,7 @@ mod tests {
             max_energy_milli: i64::MAX,
             min_diversity_milli: 0,
             block_number: 0,
+            spec_version: 0,
         }
     }
 
@@ -242,10 +243,7 @@ mod tests {
         assert!(!job.provenance.unwrap().is_pow);
         let ising = job.ising.unwrap();
         assert!(matches!(ising.graph, Some(ising_problem::Graph::Edges(_))));
-        assert_eq!(
-            decode_i32_le(&ising.h_milli_le32).unwrap(),
-            vec![1000, -1000]
-        );
+        assert_eq!(problem_milli(&ising).unwrap().0, vec![1000, -1000]);
     }
 
     #[test]

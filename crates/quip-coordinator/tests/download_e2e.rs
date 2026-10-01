@@ -15,6 +15,7 @@
 #![expect(clippy::print_stderr, reason = "devnet test diagnostic output")]
 
 use quip_coordinator::chain::qblock::{QBlockRecord, TopologyInputs};
+use quip_coordinator::chain::scale_types::MinerKind;
 use quip_coordinator::chain::snapshot::MiningSnapshot;
 use quip_coordinator::chain::{ChainClient, FakeChain, RealChainClient};
 use quip_coordinator::download::record::hex_plain;
@@ -26,6 +27,7 @@ use quip_coordinator::topology::topology_hash_sets;
 
 fn empty_snapshot() -> MiningSnapshot {
     MiningSnapshot {
+        head_hash: [0u8; 32],
         last_proof_block_hash: [0u8; 32],
         topology_hash: vec![],
         nodes: vec![],
@@ -37,6 +39,7 @@ fn empty_snapshot() -> MiningSnapshot {
         max_energy_milli: 0,
         min_diversity_milli: 0,
         block_number: 0,
+        spec_version: 117,
     }
 }
 
@@ -103,6 +106,7 @@ async fn download_writes_dataset_that_reloads_via_list_source() {
     assert_eq!(summary.verified, 3);
 
     let snap = MiningSnapshot {
+        head_hash: [0u8; 32],
         last_proof_block_hash: [0u8; 32],
         topology_hash: hash.to_vec(),
         nodes: topo.nodes,
@@ -114,6 +118,7 @@ async fn download_writes_dataset_that_reloads_via_list_source() {
         max_energy_milli: i64::MAX,
         min_diversity_milli: 0,
         block_number: 0,
+        spec_version: 117,
     };
     let jsonl = dir.join(hex_plain(&hash)).join("instances.jsonl");
     let mut src = ListSource::load(&jsonl, Some(&snap), 0).expect("reload via --source list");
@@ -134,7 +139,7 @@ async fn devnet_download_qblocks_end_to_end() {
         eprintln!("QUIP_DEVNET unset; skipping live download e2e");
         return;
     };
-    let client = RealChainClient::new(vec![url.clone()], String::new());
+    let client = RealChainClient::new(vec![url.clone()], String::new(), MinerKind::Cpu);
     let latest = client
         .fetch_latest_qblock_id()
         .await

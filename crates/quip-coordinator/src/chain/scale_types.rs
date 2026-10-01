@@ -62,6 +62,27 @@ pub struct MiningSnapshotScale {
     pub allowed_spin_values: AllowedValueSpec<Vec<i32>>,
 }
 
+/// Runtime-API registered topology (matches pallet `TopologyMeta`).
+///
+/// Returned by `QuantumPowApi_topology_meta(hash)`. The hash is the content
+/// hash of every field but `registered_at`, so one hash names one topology
+/// for the life of the chain and the client caches it by hash.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct TopologyMetaScale {
+    /// Topology node ids.
+    pub nodes: Vec<u32>,
+    /// Topology undirected edges as `(u, v)` node-id pairs.
+    pub edges: Vec<(u32, u32)>,
+    /// Allowed linear-field values.
+    pub allowed_h_values: AllowedValueSpec<Vec<i32>>,
+    /// Allowed coupling values.
+    pub allowed_j_values: AllowedValueSpec<Vec<i32>>,
+    /// Allowed spin values.
+    pub allowed_spin_values: AllowedValueSpec<Vec<i32>>,
+    /// Block number the topology was registered at.
+    pub registered_at: u32,
+}
+
 /// Proof payload for `QuantumPow.submit_proof` (pallet index 10, call index 4).
 ///
 /// Energies / diversity are **not** sent — the chain recomputes them.
@@ -198,10 +219,318 @@ pub struct JobOrderScale {
     pub solution_count: u32,
 }
 
+/// SCALE mirror of `pallet_quantum_pow::MinerInfo<Balance, BlockNumber>` with
+/// the runtime's `Balance = u128` and `BlockNumber = u32`.
+///
+/// Field order is the pallet's and must not be reordered: SCALE carries no field
+/// names, so a swap decodes into a wrong number with no error.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct MinerInfoScale {
+    /// Block the account registered at.
+    pub registered_at: u32,
+    /// Reserved miner deposit, in plancks.
+    pub deposit: u128,
+    /// Lifetime accepted proofs.
+    pub proofs_submitted: u32,
+    /// Lifetime winning proofs.
+    pub proofs_won: u32,
+    /// Lifetime rewards, in plancks.
+    pub rewards_earned: u128,
+}
+
 /// Pallet index of `QuantumPow` in the runtime construct.
 pub const QUANTUM_POW_PALLET_INDEX: u8 = 10;
 /// Call index of `submit_proof` within `QuantumPow`.
 pub const SUBMIT_PROOF_CALL_INDEX: u8 = 4;
+/// `Sudo` pallet index in the runtime.
+pub const SUDO_PALLET_INDEX: u8 = 6;
+/// `pallet_sudo::Call::sudo` call index.
+pub const SUDO_CALL_INDEX: u8 = 0;
+/// `QuantumPow::register_miner` call index. Takes no arguments; the origin is
+/// the miner. `QuantumPow::submit_proof` rejects any account that has not made
+/// this call with `MinerNotRegistered`.
+pub const REGISTER_MINER_CALL_INDEX: u8 = 0;
+/// `QuantumPow::register_topology` call index.
+pub const REGISTER_TOPOLOGY_CALL_INDEX: u8 = 2;
+/// `QuantumPow::set_difficulty` call index.
+pub const SET_DIFFICULTY_CALL_INDEX: u8 = 3;
+
+/// Pallet index of `MinerRegistry` in the runtime construct.
+pub const MINER_REGISTRY_PALLET_INDEX: u8 = 13;
+/// Call index of `set_descriptor` within `MinerRegistry`.
+pub const SET_DESCRIPTOR_CALL_INDEX: u8 = 0;
+/// Call index of `participate` within `MinerRegistry`.
+pub const PARTICIPATE_CALL_INDEX: u8 = 2;
+
+/// Pallet index of `QuantumComputeMempool` in the runtime construct.
+pub const QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX: u8 = 9;
+/// `QuantumComputeMempool::register_solver(solver_type)` call index. Not
+/// idempotent: a second call fails with `SolverAlreadyRegistered`.
+pub const REGISTER_SOLVER_CALL_INDEX: u8 = 0;
+/// `QuantumComputeMempool::deregister_solver()` call index.
+pub const DEREGISTER_SOLVER_CALL_INDEX: u8 = 1;
+/// `QuantumComputeMempool::submit_solution(order_id, solutions)` call index.
+pub const SUBMIT_SOLUTION_CALL_INDEX: u8 = 4;
+/// Runtime `QuantumMaxSolutions`: the most rows one `submit_solution` carries.
+/// Smaller than the `PoW` bound, and checked before any energy filtering.
+pub const MAX_ORDER_SOLUTIONS: usize = 20;
+
+/// Pallet `MaxNodeIdBytes`.
+pub const MAX_NODE_ID_BYTES: usize = 64;
+/// Pallet `MaxNodeNameBytes`.
+pub const MAX_NODE_NAME_BYTES: usize = 64;
+/// Pallet `MaxPublicHostBytes`.
+pub const MAX_PUBLIC_HOST_BYTES: usize = 253;
+/// Pallet `MaxRpcEndpointBytes`.
+pub const MAX_RPC_ENDPOINT_BYTES: usize = 256;
+/// Pallet `MaxRpcEndpoints`.
+pub const MAX_RPC_ENDPOINTS: usize = 8;
+/// Pallet `MaxMinerSpecs`.
+pub const MAX_MINER_SPECS: usize = 16;
+/// Pallet `MaxMinerLabelBytes`.
+pub const MAX_MINER_LABEL_BYTES: usize = 64;
+/// Pallet `MaxMinerBackendBytes`.
+pub const MAX_MINER_BACKEND_BYTES: usize = 32;
+/// Pallet `MaxMinerDeviceIdBytes`.
+pub const MAX_MINER_DEVICE_ID_BYTES: usize = 128;
+
+// The V2 survey bounds below mirror the validator runtime at the rev already
+// pinned in Cargo.toml (`runtime/src/configs/mod.rs`). Nothing links them at
+// compile time, so a runtime upgrade that moves a bound is a coordinator
+// change too. Over-length is a SCALE decode failure rather than a pallet
+// error, so it never reaches `DESCRIPTOR_REJECT`; see `crate::survey`.
+
+/// Pallet `MaxOsStringBytes`. One bound for `os.system`, `os.release`, and
+/// `os.machine` alike.
+pub const MAX_OS_STRING_BYTES: usize = 64;
+/// Pallet `MaxCpuBrandBytes`.
+pub const MAX_CPU_BRAND_BYTES: usize = 96;
+/// Pallet `MaxArchBytes`.
+pub const MAX_ARCH_BYTES: usize = 16;
+/// Pallet `MaxGpuVendorBytes`.
+pub const MAX_GPU_VENDOR_BYTES: usize = 16;
+/// Pallet `MaxGpuNameBytes`.
+pub const MAX_GPU_NAME_BYTES: usize = 96;
+/// Pallet `MaxGpus`.
+pub const MAX_GPUS: usize = 16;
+/// Pallet `MaxRuntimeVersionBytes`. One bound for `python` and `quip_version`
+/// alike.
+pub const MAX_RUNTIME_VERSION_BYTES: usize = 48;
+/// Pallet `MaxDockerImageBytes`.
+pub const MAX_DOCKER_IMAGE_BYTES: usize = 256;
+
+/// SCALE tag order must match `pallet_miner_registry::MinerKind`.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub enum MinerKind {
+    /// CPU sampler.
+    Cpu,
+    /// Discrete GPU sampler.
+    Gpu,
+    /// D-Wave QPU.
+    QpuDwave,
+    /// IBM QPU.
+    QpuIbm,
+    /// `IonQ` QPU.
+    QpuIonq,
+    /// Pasqal QPU.
+    QpuPasqal,
+    /// ASIC sampler.
+    Asic,
+    /// Apple Metal GPU. Last so the earlier tags stay stable.
+    Metal,
+}
+
+/// SCALE tag order must match `pallet_quantum_compute_mempool::MinerType`.
+///
+/// Not [`MinerKind`]: the mempool pallet has no `Metal` tag, so encoding a
+/// `MinerKind::Metal` here would fail to decode on chain.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub enum SolverType {
+    /// CPU sampler.
+    Cpu,
+    /// GPU sampler, discrete or Apple Metal.
+    Gpu,
+    /// D-Wave QPU.
+    QpuDwave,
+    /// IBM QPU.
+    QpuIbm,
+    /// `IonQ` QPU.
+    QpuIonq,
+    /// Pasqal QPU.
+    QpuPasqal,
+    /// ASIC sampler.
+    Asic,
+}
+
+impl From<MinerKind> for SolverType {
+    fn from(kind: MinerKind) -> Self {
+        match kind {
+            MinerKind::Cpu => Self::Cpu,
+            MinerKind::Gpu | MinerKind::Metal => Self::Gpu,
+            MinerKind::QpuDwave => Self::QpuDwave,
+            MinerKind::QpuIbm => Self::QpuIbm,
+            MinerKind::QpuIonq => Self::QpuIonq,
+            MinerKind::QpuPasqal => Self::QpuPasqal,
+            MinerKind::Asic => Self::Asic,
+        }
+    }
+}
+
+/// SCALE mirror of `QuantumComputeMempool.Solvers[account]`
+/// (`SolverInfo<AccountId32, u128, u32>`). Field order is the pallet's.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct SolverInfoScale {
+    /// The registered account.
+    pub account: [u8; 32],
+    /// Type the account registered as. Bid orders filter on it.
+    pub solver_type: SolverType,
+    /// Block the account registered at.
+    pub registered_at: u32,
+    /// Lifetime accepted solutions.
+    pub solutions_submitted: u64,
+    /// Lifetime rewards, in plancks.
+    pub rewards_earned: u128,
+}
+
+/// SCALE mirror of `QuantumComputeMempool.OrderSolutions[order_id][account]`
+/// (`JobSolution<AccountId32, u32, BoundedVec<BoundedVec<i8>>>`).
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct JobSolutionScale {
+    /// The solving account.
+    pub solver: [u8; 32],
+    /// The solver's registered type.
+    pub solver_type: SolverType,
+    /// The diverse subset the pallet kept, as `±1` spins.
+    pub solutions: Vec<Vec<i8>>,
+    /// Best kept energy in milli units.
+    pub best_energy_milli: i64,
+    /// Diversity of the kept subset in milli units.
+    pub diversity_milli: u32,
+    /// Number of kept rows.
+    pub num_valid: u32,
+    /// Block that accepted this submission. A resubmission overwrites it.
+    pub submitted_at: u32,
+}
+
+/// SCALE tag order must match `pallet_miner_registry::LogLevel`.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub enum NodeLogLevel {
+    /// Pallet `Debug`. Also the mapping for coordinator `trace`.
+    Debug,
+    /// Pallet `Info`.
+    Info,
+    /// Pallet `Warning`. Also the mapping for coordinator `warn`.
+    Warning,
+    /// Pallet `Error`.
+    Error,
+}
+
+/// One advertised miner. `Vec<u8>` encodes like the pallet `BoundedVec`.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct MinerSpecScale {
+    /// Backend class.
+    pub kind: MinerKind,
+    /// Operator label, usually the miner id.
+    pub label: Option<Vec<u8>>,
+    /// Backend section name (`cpu`, `cuda`, `metal`, `dwave`).
+    pub backend: Option<Vec<u8>>,
+    /// Device id when the miner has one.
+    pub device_id: Option<Vec<u8>>,
+}
+
+/// Operating-system identity inside [`SystemInfoScale`].
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct OsInfoScale {
+    /// OS family.
+    pub system: Vec<u8>,
+    /// Kernel or build string.
+    pub release: Vec<u8>,
+    /// Machine architecture.
+    pub machine: Vec<u8>,
+}
+
+/// CPU identity inside [`SystemInfoScale`].
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct CpuInfoScale {
+    /// Logical core count.
+    pub logical_cores: Option<u32>,
+    /// Physical core count.
+    pub physical_cores: Option<u32>,
+    /// Brand string.
+    pub brand: Vec<u8>,
+    /// Instruction-set architecture.
+    pub arch: Vec<u8>,
+}
+
+/// One GPU inside [`SystemInfoScale`].
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct GpuInfoScale {
+    /// Enumeration index.
+    pub index: u8,
+    /// Vendor string.
+    pub vendor: Vec<u8>,
+    /// Product name.
+    pub name: Vec<u8>,
+    /// Device memory in MiB.
+    pub memory_mb: Option<u32>,
+    /// Utilization 0..=100.
+    pub utilization_pct: Option<u8>,
+}
+
+/// Optional hardware survey on a V2 descriptor.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct SystemInfoScale {
+    /// OS identity.
+    pub os: OsInfoScale,
+    /// CPU identity.
+    pub cpu: CpuInfoScale,
+    /// Host memory in MiB.
+    pub memory_mb: Option<u32>,
+    /// Attached GPUs.
+    pub gpus: Vec<GpuInfoScale>,
+}
+
+/// Optional node-software identity on a V2 descriptor.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct RuntimeInfoScale {
+    /// Python interpreter version.
+    pub python: Vec<u8>,
+    /// Node software version.
+    pub quip_version: Vec<u8>,
+    /// Protocol version number.
+    pub protocol_version: u32,
+    /// Whether the process is inside a container.
+    pub in_docker: bool,
+    /// Container image, when running in a container.
+    pub docker_image: Option<Vec<u8>>,
+}
+
+/// Caller-supplied V2 descriptor. This is the payload the coordinator files.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct NodeDescriptorV2Input {
+    /// Node identity bytes.
+    pub node_id: Vec<u8>,
+    /// Display name.
+    pub node_name: Vec<u8>,
+    /// Optional public host.
+    pub public_host: Option<Vec<u8>>,
+    /// Optional public port.
+    pub public_port: Option<u16>,
+    /// Validator RPC endpoints.
+    pub rpc_endpoints: Vec<Vec<u8>>,
+    /// Whether the node mines without a manual start.
+    pub auto_mine: bool,
+    /// Advertised log verbosity.
+    pub log_level: NodeLogLevel,
+    /// Miners on this node.
+    pub miners: Vec<MinerSpecScale>,
+    /// Optional hardware survey, from [`crate::survey::collect`]. `None` when
+    /// the probe missed its budget or left a pallet bound violated.
+    pub system_info: Option<SystemInfoScale>,
+    /// Optional node-software block, from [`crate::survey::collect`]. `None`
+    /// when the probe missed its budget or left a pallet bound violated.
+    pub runtime: Option<RuntimeInfoScale>,
+}
 
 /// SCALE-encode the `QuantumPow.submit_proof(proof)` call body.
 #[must_use]
@@ -211,6 +540,80 @@ pub fn encode_submit_proof_call(proof: &QuantumProof) -> Vec<u8> {
     out.push(SUBMIT_PROOF_CALL_INDEX);
     // Call args: single composite field `proof`.
     out.extend(proof.encode());
+    out
+}
+
+/// SCALE-encode the `QuantumPow.register_miner()` call body.
+///
+/// The call takes no arguments, so the body is the two dispatch indices. The
+/// deposit is reserved from the signing account.
+#[must_use]
+pub fn encode_register_miner_call() -> Vec<u8> {
+    vec![QUANTUM_POW_PALLET_INDEX, REGISTER_MINER_CALL_INDEX]
+}
+
+/// SCALE-encode `QuantumComputeMempool.register_solver(solver_type)`.
+#[must_use]
+pub fn encode_register_solver_call(solver_type: SolverType) -> Vec<u8> {
+    let mut out = vec![
+        QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+        REGISTER_SOLVER_CALL_INDEX,
+    ];
+    out.extend(solver_type.encode());
+    out
+}
+
+/// SCALE-encode `QuantumComputeMempool.deregister_solver()`.
+#[must_use]
+pub fn encode_deregister_solver_call() -> Vec<u8> {
+    vec![
+        QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+        DEREGISTER_SOLVER_CALL_INDEX,
+    ]
+}
+
+/// SCALE-encode `QuantumComputeMempool.submit_solution(order_id, solutions)`.
+///
+/// Each row is one `±1` spin per node, in node order. A `BoundedVec` encodes
+/// like a `Vec`, so the bounds are the caller's to respect
+/// ([`MAX_ORDER_SOLUTIONS`] rows).
+#[must_use]
+pub fn encode_submit_solution_call(order_id: u64, solutions: &[Vec<i8>]) -> Vec<u8> {
+    let mut out = vec![
+        QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+        SUBMIT_SOLUTION_CALL_INDEX,
+    ];
+    out.extend(order_id.encode());
+    out.extend(solutions.encode());
+    out
+}
+
+/// SCALE-encode `MinerRegistry.participate(qblock_id, kind, budget_seconds)`.
+#[must_use]
+pub fn encode_participate_call(
+    qblock_id: u64,
+    kind: MinerKind,
+    budget_seconds: Option<u32>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(MINER_REGISTRY_PALLET_INDEX);
+    out.push(PARTICIPATE_CALL_INDEX);
+    out.extend(qblock_id.encode());
+    out.extend(kind.encode());
+    out.extend(budget_seconds.encode());
+    out
+}
+
+/// SCALE-encode `MinerRegistry.set_descriptor(V2(descriptor))`.
+///
+/// The version tag is `1` so a V1 signed extrinsic (tag `0`) still decodes.
+#[must_use]
+pub fn encode_set_descriptor_call(descriptor: &NodeDescriptorV2Input) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(MINER_REGISTRY_PALLET_INDEX);
+    out.push(SET_DESCRIPTOR_CALL_INDEX);
+    out.push(1);
+    out.extend(descriptor.encode());
     out
 }
 
@@ -279,24 +682,6 @@ pub struct QBlockWithNonceScale {
     pub nonce: U256,
 }
 
-/// Registered topology definition (matches pallet
-/// `TopologyMeta<Nodes, Edges, AllowedValues, BlockNumber>`, `types.rs:79`).
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub struct TopologyMetaScale {
-    /// Topology node ids.
-    pub nodes: Vec<u32>,
-    /// Topology undirected edges as `(u, v)` node-id pairs.
-    pub edges: Vec<(u32, u32)>,
-    /// Allowed linear-field values.
-    pub allowed_h_values: AllowedValueSpec<Vec<i32>>,
-    /// Allowed coupling values.
-    pub allowed_j_values: AllowedValueSpec<Vec<i32>>,
-    /// Allowed spin values.
-    pub allowed_spin_values: AllowedValueSpec<Vec<i32>>,
-    /// Block number the topology was registered at.
-    pub registered_at: u32,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,21 +715,6 @@ mod tests {
     }
 
     #[test]
-    fn topology_meta_scale_roundtrip() {
-        let m = TopologyMetaScale {
-            nodes: vec![0, 1, 2, 3],
-            edges: vec![(0, 1), (1, 2), (2, 3), (0, 3)],
-            allowed_h_values: AllowedValueSpec::Set(vec![-1000, 0, 1000]),
-            allowed_j_values: AllowedValueSpec::Set(vec![-1000, 1000]),
-            allowed_spin_values: AllowedValueSpec::Set(vec![-1000, 1000]),
-            registered_at: 7,
-        };
-        let encoded = Some(m.clone()).encode();
-        let decoded: Option<TopologyMetaScale> = Decode::decode(&mut &encoded[..]).expect("decode");
-        assert_eq!(decoded, Some(m));
-    }
-
-    #[test]
     fn qblock_with_nonce_decode_rejects_truncated() {
         // Untrusted chain bytes: a chopped payload must Err, never panic.
         let qn = QBlockWithNonceScale {
@@ -372,6 +742,79 @@ mod tests {
         )]
         let truncated = &enc[..enc.len() - 4];
         assert!(QBlockWithNonceScale::decode(&mut &truncated[..]).is_err());
+    }
+
+    #[test]
+    fn register_solver_call_is_the_dispatch_indices_and_the_type_tag() {
+        assert_eq!(
+            encode_register_solver_call(SolverType::QpuDwave),
+            [
+                QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+                REGISTER_SOLVER_CALL_INDEX,
+                2
+            ]
+        );
+        assert_eq!(
+            encode_deregister_solver_call(),
+            [
+                QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+                DEREGISTER_SOLVER_CALL_INDEX
+            ]
+        );
+    }
+
+    /// The mempool pallet has no `Metal` tag. `MinerKind::Metal` is tag 7,
+    /// which the pallet cannot decode, so it must map onto `Gpu` (tag 1).
+    #[test]
+    fn metal_registers_as_a_gpu_solver() {
+        assert_eq!(SolverType::from(MinerKind::Metal), SolverType::Gpu);
+        assert_eq!(SolverType::from(MinerKind::Metal).encode(), [1]);
+        assert_eq!(SolverType::from(MinerKind::Asic).encode(), [6]);
+    }
+
+    #[test]
+    fn submit_solution_call_encodes_order_id_then_nested_spin_rows() {
+        let call = encode_submit_solution_call(0x0102, &[vec![1, -1], vec![-1, 1]]);
+        let mut expected = vec![
+            QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX,
+            SUBMIT_SOLUTION_CALL_INDEX,
+        ];
+        expected.extend_from_slice(&0x0102u64.to_le_bytes());
+        // Compact lengths: 2 rows, then 2 spins per row; -1 is 0xFF.
+        expected.extend_from_slice(&[0x08, 0x08, 0x01, 0xFF, 0x08, 0xFF, 0x01]);
+        assert_eq!(call, expected);
+    }
+
+    #[test]
+    fn solver_info_decodes_the_pallet_field_order() {
+        let mut blob = vec![0xAB; 32];
+        blob.push(1); // Gpu
+        blob.extend_from_slice(&7u32.to_le_bytes());
+        blob.extend_from_slice(&3u64.to_le_bytes());
+        blob.extend_from_slice(&9u128.to_le_bytes());
+        let info = SolverInfoScale::decode(&mut blob.as_slice()).unwrap();
+        assert_eq!(info.account, [0xAB; 32]);
+        assert_eq!(info.solver_type, SolverType::Gpu);
+        assert_eq!(info.registered_at, 7);
+        assert_eq!(info.solutions_submitted, 3);
+        assert_eq!(info.rewards_earned, 9);
+    }
+
+    #[test]
+    fn job_solution_decodes_the_pallet_field_order() {
+        let mut blob = vec![0x11; 32];
+        blob.push(0); // Cpu
+        blob.extend_from_slice(&[0x04, 0x08, 0x01, 0xFF]); // one row: [1, -1]
+        blob.extend_from_slice(&(-5i64).to_le_bytes());
+        blob.extend_from_slice(&250u32.to_le_bytes());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&188_000u32.to_le_bytes());
+        let sol = JobSolutionScale::decode(&mut blob.as_slice()).unwrap();
+        assert_eq!(sol.solutions, vec![vec![1, -1]]);
+        assert_eq!(sol.best_energy_milli, -5);
+        assert_eq!(sol.diversity_milli, 250);
+        assert_eq!(sol.num_valid, 1);
+        assert_eq!(sol.submitted_at, 188_000);
     }
 
     #[test]
@@ -432,6 +875,136 @@ mod tests {
         let decoded: Option<MiningSnapshotScale> =
             Decode::decode(&mut &encoded[..]).expect("decode");
         assert_eq!(decoded, Some(snap));
+    }
+
+    #[test]
+    fn topology_meta_scale_roundtrip() {
+        let meta = TopologyMetaScale {
+            nodes: vec![0, 1, 2],
+            edges: vec![(0, 1), (1, 2)],
+            allowed_h_values: AllowedValueSpec::Set(vec![-1000, 0, 1000]),
+            allowed_j_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            allowed_spin_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            registered_at: 7,
+        };
+        let encoded = Some(meta.clone()).encode();
+        let decoded: Option<TopologyMetaScale> = Decode::decode(&mut &encoded[..]).expect("decode");
+        assert_eq!(decoded, Some(meta));
+    }
+
+    #[test]
+    fn set_descriptor_call_encodes_pallet_call_and_v2_args() {
+        let v2 = NodeDescriptorV2Input {
+            node_id: b"n".to_vec(),
+            node_name: b"N".to_vec(),
+            public_host: None,
+            public_port: None,
+            rpc_endpoints: Vec::new(),
+            auto_mine: true,
+            log_level: NodeLogLevel::Info,
+            miners: vec![MinerSpecScale {
+                kind: MinerKind::Cpu,
+                label: None,
+                backend: None,
+                device_id: None,
+            }],
+            system_info: None,
+            runtime: None,
+        };
+        let call = encode_set_descriptor_call(&v2);
+        let mut expected = vec![MINER_REGISTRY_PALLET_INDEX, SET_DESCRIPTOR_CALL_INDEX, 1];
+        expected.extend(v2.encode());
+        assert_eq!(call, expected);
+        assert_eq!(call.first().copied(), Some(MINER_REGISTRY_PALLET_INDEX));
+        assert_eq!(call.get(1).copied(), Some(SET_DESCRIPTOR_CALL_INDEX));
+        assert_eq!(call.get(2).copied(), Some(1), "V2 variant index must be 1");
+        // Compact-len 1 + b'n', compact-len 1 + b'N', three Nones / empty,
+        // auto_mine=true, log_level=Info, one Cpu miner with three Nones,
+        // system_info=None, runtime=None.
+        assert_eq!(
+            call.get(2..),
+            Some([1, 4, b'n', 4, b'N', 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 0, 0].as_slice())
+        );
+    }
+
+    #[test]
+    fn set_descriptor_option_struct_is_not_unit() {
+        // Option<SystemInfo> must not collapse to Option<()>. A Some value
+        // starts with 0x01 then the inner struct, not a single unit byte.
+        let info = SystemInfoScale {
+            os: OsInfoScale {
+                system: b"Linux".to_vec(),
+                release: Vec::new(),
+                machine: Vec::new(),
+            },
+            cpu: CpuInfoScale {
+                logical_cores: None,
+                physical_cores: None,
+                brand: b"x".to_vec(),
+                arch: b"x".to_vec(),
+            },
+            memory_mb: None,
+            gpus: Vec::new(),
+        };
+        let some = Some(info.clone()).encode();
+        let none = Option::<SystemInfoScale>::None.encode();
+        assert_eq!(none, vec![0]);
+        assert_eq!(some.first().copied(), Some(1));
+        assert_eq!(some.get(1..), Some(info.encode().as_slice()));
+        assert_ne!(some, vec![1]);
+    }
+
+    #[test]
+    fn register_miner_call_is_the_two_dispatch_indices() {
+        let call = encode_register_miner_call();
+        assert_eq!(call, [QUANTUM_POW_PALLET_INDEX, REGISTER_MINER_CALL_INDEX]);
+        // The call takes no arguments, so anything longer is an encoding bug.
+        assert_eq!(call.len(), 2);
+        assert_ne!(REGISTER_MINER_CALL_INDEX, SUBMIT_PROOF_CALL_INDEX);
+    }
+
+    #[test]
+    fn participate_call_encodes_pallet_call_and_args() {
+        let call = encode_participate_call(5, MinerKind::Cpu, None);
+        assert_eq!(
+            call,
+            [
+                MINER_REGISTRY_PALLET_INDEX,
+                PARTICIPATE_CALL_INDEX,
+                5,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
+        let with_budget = encode_participate_call(1, MinerKind::Metal, Some(30));
+        assert_eq!(
+            with_budget,
+            [
+                MINER_REGISTRY_PALLET_INDEX,
+                PARTICIPATE_CALL_INDEX,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                7,
+                1,
+                30,
+                0,
+                0,
+                0,
+            ]
+        );
     }
 
     #[test]
@@ -538,6 +1111,73 @@ mod tests {
     #[test]
     fn job_order_decode_rejects_empty() {
         assert!(JobOrderScale::decode(&mut &[][..]).is_err());
+    }
+
+    /// SCALE field order must match `pallet_quantum_pow::MinerInfo`. A reordered
+    /// field decodes into the wrong number silently, so pin the byte layout.
+    #[test]
+    fn miner_info_decodes_the_pallet_field_order() {
+        let encoded = MinerInfoScale {
+            registered_at: 8_100,
+            deposit: 1_000_000_000_000,
+            proofs_submitted: 412,
+            proofs_won: 7,
+            rewards_earned: 70_000_000_000_000,
+        }
+        .encode();
+        assert_eq!(encoded.len(), 4 + 16 + 4 + 4 + 16);
+
+        let decoded = MinerInfoScale::decode(&mut &encoded[..]).unwrap();
+        assert_eq!(decoded.registered_at, 8_100);
+        assert_eq!(decoded.deposit, 1_000_000_000_000);
+        assert_eq!(decoded.proofs_submitted, 412);
+        assert_eq!(decoded.proofs_won, 7);
+        assert_eq!(decoded.rewards_earned, 70_000_000_000_000);
+    }
+
+    /// Fixture built from the pallet's declared layout directly, independent of
+    /// `MinerInfoScale`'s own field order. `miner_info_decodes_the_pallet_field_order`
+    /// above encodes and decodes with the same struct, so it round-trips even if
+    /// the struct's field order drifted from the pallet's — it cannot catch a
+    /// transposition. This test can, because the blob comes from
+    /// `quip-validator/pallets/quantum-pow/src/types.rs`'s
+    /// `MinerInfo<Balance, BlockNumber>` field order (`registered_at, deposit,
+    /// proofs_submitted, proofs_won, rewards_earned`), not from the struct.
+    /// Any change to that pallet layout must be mirrored here.
+    #[test]
+    fn miner_info_blob_built_from_the_pallet_layout_decodes_correctly() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1_234_u32.to_le_bytes()); // registered_at
+        blob.extend_from_slice(&1_000_000_000_000_u128.to_le_bytes()); // deposit
+        blob.extend_from_slice(&7_u32.to_le_bytes()); // proofs_submitted
+        blob.extend_from_slice(&3_u32.to_le_bytes()); // proofs_won
+        blob.extend_from_slice(&70_000_000_000_000_u128.to_le_bytes()); // rewards_earned
+        assert_eq!(blob.len(), 44);
+
+        let decoded = MinerInfoScale::decode(&mut &blob[..]).unwrap();
+        assert_eq!(decoded.registered_at, 1_234);
+        assert_eq!(decoded.deposit, 1_000_000_000_000);
+        assert_eq!(decoded.proofs_submitted, 7);
+        assert_eq!(decoded.proofs_won, 3);
+        assert_eq!(decoded.rewards_earned, 70_000_000_000_000);
+    }
+
+    #[test]
+    fn a_truncated_miner_info_blob_fails_to_decode() {
+        let encoded = MinerInfoScale {
+            registered_at: 1,
+            deposit: 2,
+            proofs_submitted: 3,
+            proofs_won: 4,
+            rewards_earned: 5,
+        }
+        .encode();
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "encoded is a full MinerInfoScale encode; len-1 is in bounds"
+        )]
+        let short = &encoded[..encoded.len() - 1];
+        assert!(MinerInfoScale::decode(&mut &short[..]).is_err());
     }
 
     #[test]

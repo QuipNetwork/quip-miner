@@ -5,46 +5,66 @@
 //! Methods return transport errors when no validator is reachable.
 
 use super::extrinsic::{
-    build_hybrid_signed_extrinsic, difficulties_storage_key, hex_decode, hex_encode,
-    job_orders_storage_key, last_proof_block_storage_key, load_hybrid_pair, miner_identity_bytes,
-    registered_topologies_prefix, topology_curve_c_storage_key, SignedExtensionContext,
+    build_hybrid_signed_extrinsic, default_topology_storage_key, difficulties_storage_key,
+    extrinsic_hash, hex_decode, hex_encode, job_orders_storage_key,
+    last_proof_block_hash_storage_key, last_proof_block_storage_key, load_hybrid_pair,
+    miner_identity_bytes, miners_storage_key, node_descriptors_storage_key,
+    order_solutions_storage_key, participants_by_qblock_storage_key, qblocks_storage_key,
+    registered_topologies_prefix, signer_account_bytes, solvers_storage_key,
+    topology_curve_c_storage_key, SignedExtensionContext,
 };
+use super::pool::{decode_pending_proof, PendingProof};
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
-    encode_submit_proof_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
-    MiningSnapshotScale, OrderStatus, QBlockWithNonceScale, TopologyMetaScale,
+    encode_deregister_solver_call, encode_participate_call, encode_register_miner_call,
+    encode_register_solver_call, encode_set_descriptor_call, encode_submit_proof_call,
+    encode_submit_solution_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
+    JobSolutionScale, MinerInfoScale, MinerKind, NodeDescriptorV2Input, OrderStatus, OrderTiming,
+    QBlockWithNonceScale, SolverInfoScale, SolverType, TopologyMetaScale,
 };
-use super::submit::{classify_receipt, Proof, SubmitAction};
+use super::submit::{
+    classify_descriptor, classify_participation, classify_receipt, classify_registration,
+    DescriptorOutcome, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
+    SubmitReceipt,
+};
+use super::transport::RpcTransport;
+use super::transport_jsonrpsee::JsonrpseeTransport;
+use super::watch::{parse_tx_status, TxStatus};
 use super::{
-    ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, QBlockRecord, TopologyInputs,
+    ChainClient, ChainError, DecayParams, JobOrder, MinerInfo, MiningSnapshot, QBlockRecord,
+    TopologyInputs,
 };
 use crate::decay::{
     DEFAULT_BASE_MAX_ENERGY_MILLI, DEFAULT_C_EASY_MILLI, DEFAULT_C_HARD_MILLI,
     DEFAULT_C_KNEE_MILLI, EPOCH_LENGTH_BLOCKS,
 };
 use async_trait::async_trait;
+use futures::StreamExt as _;
 use parity_scale_codec::{Decode, Encode};
 use quantum_validation::AllowedValueSpec;
-use quip_transaction_crypto::HybridPair;
+use quip_transaction_crypto::{account_id_from_public, HybridPair};
 use serde_json::Value;
 use sp_core::crypto::Ss58Codec;
 use sp_core::Pair as _;
-use std::sync::Mutex;
-use subxt::config::substrate::H256;
-use subxt::ext::scale_value::{Composite, Primitive, ValueDef};
-use subxt::transactions::TransactionStatus;
-use tokio::sync::OnceCell;
+use std::sync::{Arc, Mutex};
 
-/// subxt client for read-only, metadata-aware event decoding. Submit stays on
-/// the hybrid-signed jsonrpsee path — subxt is used only to decode mempool
-/// `JobProposed` events, which needs the runtime type registry.
-type SubxtClient = subxt::OnlineClient<subxt::SubstrateConfig>;
+/// Keys requested per `state_getKeysPaged` call when walking the order map.
+///
+/// The mempool holds tens of orders in practice. A page of 200 fetches them in
+/// one round trip while staying far below any node response limit.
+const ORDER_PAGE_SIZE: u32 = 200;
+
+/// A registered topology and the hash it was fetched under.
+struct CachedTopology {
+    hash: [u8; 32],
+    meta: TopologyMetaScale,
+}
 
 /// Production chain client (RPC + hybrid-signed submit).
 pub struct RealChainClient {
     /// Validator WebSocket / HTTP RPC URLs (primary first).
     pub validators: Vec<String>,
-    /// Hybrid keystore path, `//DevUri`, or 32-byte hex seed.
+    /// Hybrid keystore path, any substrate secret URI, or 32-byte hex seed.
     pub signer_key: String,
     /// Cached hybrid pair (loaded lazily from `signer_key`).
     pair: Mutex<Option<HybridPair>>,
@@ -53,34 +73,75 @@ pub struct RealChainClient {
     last_snapshot: Mutex<Option<MiningSnapshot>>,
     /// Last `allowed_spin` spec (full `AllowedValueSpec`, not just Set values).
     last_spin_spec: Mutex<Option<AllowedValueSpec<Vec<i32>>>>,
-    /// Lazily-connected subxt client for mempool `JobProposed` event decoding.
-    subxt: OnceCell<SubxtClient>,
+    /// The registered topology the last snapshot was built from, with its
+    /// hash. A topology never changes under its hash, so a poll on the same
+    /// hash reuses it and only the difficulty and root are read again. One
+    /// slot: a poll on another hash downloads that topology and replaces it.
+    topology: Mutex<Option<CachedTopology>>,
+    /// How this client reaches the validator. Boxed so a WebAssembly build can
+    /// supply a browser transport in place of the native one.
+    transport: Arc<dyn RpcTransport>,
+    /// Whether the last RPC round-trip reached the validator. `None` before the
+    /// first call. Every RPC builds a fresh client (see `rpc_http` / `rpc_ws`),
+    /// so a per-call "connected" line would run to thousands an hour; this
+    /// tracks reachability so only the *transitions* are reported.
+    reachable: Mutex<Option<bool>>,
+    /// Kind declared on `participate`. Derived from the miners this process starts.
+    participate_kind: MinerKind,
 }
 
 impl RealChainClient {
     /// Construct a client over the given validators and signer material.
     #[must_use]
-    pub fn new(validators: Vec<String>, signer_key: String) -> Self {
+    pub fn new(validators: Vec<String>, signer_key: String, participate_kind: MinerKind) -> Self {
         Self {
             validators,
             signer_key,
             pair: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             last_spin_spec: Mutex::new(None),
-            subxt: OnceCell::new(),
+            topology: Mutex::new(None),
+            transport: Arc::new(JsonrpseeTransport),
+            reachable: Mutex::new(None),
+            participate_kind,
         }
     }
 
-    /// Lazily connect the read-only subxt client to the primary validator.
-    async fn subxt_client(&self) -> Result<&SubxtClient, ChainError> {
-        let url = self.primary_url()?.to_string();
-        self.subxt
-            .get_or_try_init(|| async move {
-                SubxtClient::from_url(&url)
-                    .await
-                    .map_err(|e| ChainError::Unavailable(format!("subxt connect: {e}")))
-            })
-            .await
+    /// Construct a client over a caller-supplied transport.
+    #[must_use]
+    pub fn with_transport(
+        validators: Vec<String>,
+        signer_key: String,
+        participate_kind: MinerKind,
+        transport: Arc<dyn RpcTransport>,
+    ) -> Self {
+        let mut c = Self::new(validators, signer_key, participate_kind);
+        c.transport = transport;
+        c
+    }
+
+    /// Record the outcome of one RPC round-trip and log reachability changes.
+    ///
+    /// A validator that goes away (or comes back) is the single most common
+    /// reason a coordinator stops mining, and v0.2.1 narrated it on every
+    /// reconnect. Reporting only the edges keeps that signal without the
+    /// per-call volume.
+    fn note_reachability(&self, url: &str, outcome: Result<(), &ChainError>) {
+        let now = outcome.is_ok();
+        // Poisoned lock: reachability is advisory, never fail an RPC over it.
+        let Ok(mut guard) = self.reachable.lock() else {
+            return;
+        };
+        if *guard == Some(now) {
+            return;
+        }
+        match outcome {
+            Ok(()) => tracing::info!(url = %url, "validator RPC reachable"),
+            Err(e) => {
+                tracing::warn!(url = %url, error = %e, "validator RPC unreachable");
+            }
+        }
+        *guard = Some(now);
     }
 
     fn pair(&self) -> Result<HybridPair, ChainError> {
@@ -106,9 +167,71 @@ impl RealChainClient {
             .ok_or_else(|| ChainError::Unavailable("no validators configured".into()))
     }
 
+    /// Issue `method` against the configured validators in order, returning the
+    /// first success.
+    ///
+    /// `validators` is documented as an ordered failover list, and the default
+    /// pair leads with a container-network name that does not resolve on a host
+    /// install. Trying only the first entry makes that default unusable off
+    /// Docker, so every entry gets a turn before the call is called failed.
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value, ChainError> {
-        let url = self.primary_url()?;
-        rpc_request(url, method, params).await
+        if self.validators.is_empty() {
+            return Err(ChainError::Unavailable("no validators configured".into()));
+        }
+        let mut last: Option<ChainError> = None;
+        for url in &self.validators {
+            let out = self.transport.request(url, method, params.clone()).await;
+            tracing::trace!(url = %url, method = %method, ok = out.is_ok(), "rpc call");
+            match out {
+                Ok(v) => {
+                    // Lock only after the await: `reachable` is a std Mutex and
+                    // must never be held across a suspension point.
+                    self.note_reachability(url, Ok(()));
+                    return Ok(v);
+                }
+                Err(e) => {
+                    tracing::debug!(url = %url, method = %method, error = %e, "validator failed; trying next");
+                    last = Some(e);
+                }
+            }
+        }
+        // Every endpoint failed: report against the primary, which is the one an
+        // operator will look at first.
+        let err =
+            last.unwrap_or_else(|| ChainError::Unavailable("no validators configured".into()));
+        if let Some(primary) = self.validators.first() {
+            self.note_reachability(primary, Err(&err));
+        }
+        Err(err)
+    }
+
+    /// Raw `state_getRuntimeVersion` response, for the startup compatibility
+    /// check in [`super::preflight`].
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached.
+    pub(crate) async fn runtime_version_raw(&self) -> Result<Value, ChainError> {
+        self.rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
+            .await
+    }
+
+    /// Raw `system_health` response, for the startup sync gate in
+    /// [`super::sync`].
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached.
+    pub(crate) async fn system_health_raw(&self) -> Result<Value, ChainError> {
+        self.rpc_call("system_health", Value::Array(vec![])).await
+    }
+
+    /// Raw `system_syncState` response: the block heights the sync gate reports.
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached, or when
+    /// it does not serve this method.
+    pub(crate) async fn sync_state_raw(&self) -> Result<Value, ChainError> {
+        self.rpc_call("system_syncState", Value::Array(vec![]))
+            .await
     }
 
     /// Read + SCALE-decode a storage value at `at_hex`. `Ok(None)` when the key
@@ -134,6 +257,106 @@ impl RealChainClient {
         T::decode(&mut &bytes[..])
             .map(Some)
             .map_err(|e| ChainError::Decode(e.to_string()))
+    }
+
+    /// `state_call` a `QuantumPowApi` method that takes one `H256` and returns
+    /// an `Option`. `Ok(None)` when the runtime answers `None` or null.
+    async fn quantum_pow_call_by_hash<T: Decode>(
+        &self,
+        method: &str,
+        hash: &[u8; 32],
+        at_hex: &str,
+    ) -> Result<Option<T>, ChainError> {
+        let result = self
+            .rpc_call(
+                "state_call",
+                Value::Array(vec![
+                    Value::String(method.to_string()),
+                    Value::String(hex_encode(hash)),
+                    Value::String(at_hex.to_string()),
+                ]),
+            )
+            .await?;
+        let Some(hex) = result.as_str() else {
+            return Ok(None);
+        };
+        let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+        Option::<T>::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))
+    }
+
+    /// The topology the snapshot mines on: the caller's choice, else the
+    /// chain's `DefaultTopology` at `at_hex`. `Ok(None)` when neither names one.
+    async fn snapshot_topology_hash(
+        &self,
+        chosen: Option<[u8; 32]>,
+        at_hex: &str,
+    ) -> Result<Option<[u8; 32]>, ChainError> {
+        match chosen {
+            Some(hash) => Ok(Some(hash)),
+            None => {
+                self.read_storage::<[u8; 32]>(&default_topology_storage_key(), at_hex)
+                    .await
+            }
+        }
+    }
+
+    /// The registered topology under `hash`: the cached one when the last
+    /// snapshot used the same hash, else `QuantumPowApi_topology_meta`, whose
+    /// answer replaces the cache. `Ok(None)` when the hash is not registered.
+    async fn topology_meta(
+        &self,
+        hash: [u8; 32],
+        at_hex: &str,
+    ) -> Result<Option<TopologyMetaScale>, ChainError> {
+        let cached = self.topology.lock().ok().and_then(|g| {
+            g.as_ref()
+                .filter(|c| c.hash == hash)
+                .map(|c| c.meta.clone())
+        });
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        let meta = self
+            .quantum_pow_call_by_hash::<TopologyMetaScale>(
+                "QuantumPowApi_topology_meta",
+                &hash,
+                at_hex,
+            )
+            .await?;
+        if let Some(meta) = &meta {
+            tracing::info!(
+                topology = %hex_encode(&hash),
+                nodes = meta.nodes.len(),
+                edges = meta.edges.len(),
+                "topology downloaded"
+            );
+            if let Ok(mut g) = self.topology.lock() {
+                *g = Some(CachedTopology {
+                    hash,
+                    meta: meta.clone(),
+                });
+            }
+        }
+        Ok(meta)
+    }
+
+    /// Read `QuantumPow.DefaultTopology` at the current head.
+    ///
+    /// `Ok(None)` means no topology is registered, which is the state a fresh
+    /// chain starts in and the only state the seed path accepts.
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached, or a
+    /// decode error when the stored value is not a 32-byte hash.
+    pub(crate) async fn default_topology(&self) -> Result<Option<[u8; 32]>, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+        self.read_storage::<[u8; 32]>(&default_topology_storage_key(), at)
+            .await
     }
 
     /// Run a `QuantumPowApi` runtime call at best head with SCALE-encoded
@@ -249,6 +472,514 @@ impl RealChainClient {
         }
         Ok(hashes)
     }
+
+    /// Nonce, genesis hash, and runtime versions for a signed extrinsic.
+    async fn signed_extension_context(
+        &self,
+        pair: &HybridPair,
+    ) -> Result<SignedExtensionContext, ChainError> {
+        let account_ss58 = account_id_from_public(&pair.public()).to_ss58check();
+        let nonce_val = self
+            .rpc_call(
+                "system_accountNextIndex",
+                Value::Array(vec![Value::String(account_ss58)]),
+            )
+            .await?;
+        let account_nonce = u32::try_from(
+            nonce_val
+                .as_u64()
+                .ok_or_else(|| ChainError::Decode("system_accountNextIndex not a u64".into()))?,
+        )
+        .map_err(|_| ChainError::Decode("account nonce exceeds u32".into()))?;
+
+        let genesis = self
+            .rpc_call(
+                "chain_getBlockHash",
+                Value::Array(vec![Value::Number(0.into())]),
+            )
+            .await?;
+        let genesis_hex = genesis
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("genesis hash not a string".into()))?;
+        let genesis_bytes = hex_decode(genesis_hex).map_err(ChainError::Decode)?;
+        let mut genesis_hash = [0u8; 32];
+        if genesis_bytes.len() != 32 {
+            return Err(ChainError::Decode("genesis hash length".into()));
+        }
+        genesis_hash.copy_from_slice(&genesis_bytes);
+
+        let rv = self
+            .rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
+            .await?;
+        let spec_version = parse_spec_version(&rv)?;
+        let transaction_version = u32::try_from(
+            rv.get("transactionVersion")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ChainError::Decode("runtime transactionVersion missing/not a u64".into())
+                })?,
+        )
+        .map_err(|_| ChainError::Decode("transactionVersion exceeds u32".into()))?;
+
+        Ok(SignedExtensionContext {
+            account_nonce,
+            genesis_hash,
+            spec_version,
+            transaction_version,
+            tip: 0,
+        })
+    }
+
+    /// Hybrid-sign `call`, submit it, and confirm the result from chain state.
+    ///
+    /// The status subscription reports pool and inclusion progress only. It
+    /// cannot say whether the dispatch inside the block succeeded, because that
+    /// lives in the block's events and decoding those needs runtime metadata.
+    /// So each call names the storage entry its own success writes. Inclusion
+    /// is confirmed from the block body. Both reads are metadata-free.
+    pub(crate) async fn submit_signed_call(
+        &self,
+        call: &[u8],
+        confirmation: Confirmation,
+    ) -> Result<(SignedCallOutcome, [u8; 32]), ChainError> {
+        let pair = self.pair()?;
+        let signed_ctx = self.signed_extension_context(&pair).await?;
+        let ext = build_hybrid_signed_extrinsic(&pair, call, &signed_ctx);
+        let want_hash = extrinsic_hash(&ext);
+
+        let url = self.primary_url()?.to_string();
+        let mut stream = match self
+            .transport
+            .subscribe(
+                &url,
+                "author_submitAndWatchExtrinsic",
+                Value::Array(vec![Value::String(hex_encode(&ext))]),
+                "author_unwatchExtrinsic",
+            )
+            .await
+        {
+            Ok(s) => s,
+            // A node that answers the submit with a rejection is delivering a
+            // verdict about this extrinsic, not reporting a transport failure.
+            // Resubmitting the same bytes cannot change it. Returning an error
+            // here would let the caller read a permanent rejection as transient
+            // and retry the same proof forever, which is how a lost win hides.
+            Err(ChainError::Submit(message)) => {
+                return Ok((SignedCallOutcome::Invalid { message }, want_hash))
+            }
+            Err(e) => return Err(e),
+        };
+
+        while let Some(item) = stream.next().await {
+            let value = item?;
+            match parse_tx_status(&value) {
+                TxStatus::InBlock(block) | TxStatus::Finalized(block) => {
+                    let outcome = self
+                        .confirm_in_block(&block, &want_hash, confirmation)
+                        .await?;
+                    return Ok((outcome, want_hash));
+                }
+                TxStatus::Invalid(message) => {
+                    return Ok((SignedCallOutcome::Invalid { message }, want_hash))
+                }
+                TxStatus::Dropped(message) => {
+                    return Ok((SignedCallOutcome::Dropped { message }, want_hash))
+                }
+                TxStatus::Other(s) => {
+                    tracing::debug!(status = %s, "unmodelled transaction status");
+                }
+                TxStatus::Ready | TxStatus::Broadcast | TxStatus::Future => {}
+            }
+        }
+        Err(ChainError::Unavailable(
+            "transaction status stream ended before inclusion".into(),
+        ))
+    }
+
+    /// Read the block that claimed to include our extrinsic and decide.
+    async fn confirm_in_block(
+        &self,
+        block_hex: &str,
+        want_hash: &[u8; 32],
+        confirmation: Confirmation,
+    ) -> Result<SignedCallOutcome, ChainError> {
+        let included = self.block_contains(block_hex, want_hash).await?;
+        let confirmed = self.confirmation_present(block_hex, &confirmation).await?;
+        match classify_state_outcome(included, confirmed) {
+            StateOutcome::Won => {
+                let header = self
+                    .rpc_call(
+                        "chain_getHeader",
+                        Value::Array(vec![Value::String(block_hex.to_string())]),
+                    )
+                    .await?;
+                Ok(SignedCallOutcome::Success {
+                    block: block_hex.to_string(),
+                    number: parse_block_number(&header)?,
+                })
+            }
+            StateOutcome::IncludedButNotWon => {
+                let (error, lost_race) = self.explain_failure(block_hex, &confirmation).await;
+                Ok(SignedCallOutcome::DispatchFailed { error, lost_race })
+            }
+            StateOutcome::NotIncluded => Ok(SignedCallOutcome::Dropped {
+                message: format!("extrinsic absent from block {block_hex}"),
+            }),
+        }
+    }
+
+    /// Is our extrinsic in this block?
+    ///
+    /// `chain_getBlock` is in the safe RPC set. Each extrinsic comes back as a
+    /// hex blob, so inclusion is a hash comparison and needs no metadata.
+    async fn block_contains(
+        &self,
+        block_hex: &str,
+        want_hash: &[u8; 32],
+    ) -> Result<bool, ChainError> {
+        let body = self
+            .rpc_call(
+                "chain_getBlock",
+                Value::Array(vec![Value::String(block_hex.to_string())]),
+            )
+            .await?;
+        let Some(exts) = body
+            .get("block")
+            .and_then(|b| b.get("extrinsics"))
+            .and_then(Value::as_array)
+        else {
+            return Err(ChainError::Decode(
+                "chain_getBlock has no block.extrinsics array".into(),
+            ));
+        };
+        for e in exts {
+            let Some(hex) = e.as_str() else { continue };
+            let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+            if extrinsic_hash(&bytes) == *want_hash {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Is the storage entry this call should have written present at `block_hex`?
+    async fn confirmation_present(
+        &self,
+        block_hex: &str,
+        confirmation: &Confirmation,
+    ) -> Result<bool, ChainError> {
+        match *confirmation {
+            Confirmation::ProofWin { account } => self.proof_win_at(block_hex, &account).await,
+            Confirmation::Descriptor { account } => {
+                self.storage_value_present(&node_descriptors_storage_key(&account), block_hex)
+                    .await
+            }
+            Confirmation::MinerRegistered { account } => {
+                self.storage_value_present(&miners_storage_key(&account), block_hex)
+                    .await
+            }
+            Confirmation::Participation { qblock_id, account } => {
+                self.storage_value_present(
+                    &participants_by_qblock_storage_key(qblock_id, &account),
+                    block_hex,
+                )
+                .await
+            }
+            Confirmation::DefaultTopology => {
+                self.storage_value_present(&default_topology_storage_key(), block_hex)
+                    .await
+            }
+            Confirmation::Difficulty { topology_hash } => {
+                self.storage_value_present(&difficulties_storage_key(&topology_hash), block_hex)
+                    .await
+            }
+            Confirmation::SolverRegistered { account } => {
+                self.storage_value_present(&solvers_storage_key(&account), block_hex)
+                    .await
+            }
+            Confirmation::SolverDeregistered { account } => Ok(!self
+                .storage_value_present(&solvers_storage_key(&account), block_hex)
+                .await?),
+            Confirmation::SolutionAccepted { order_id, account } => {
+                let header = self
+                    .rpc_call(
+                        "chain_getHeader",
+                        Value::Array(vec![Value::String(block_hex.to_string())]),
+                    )
+                    .await?;
+                let number = parse_block_number(&header)?;
+                let stored = self
+                    .read_storage::<JobSolutionScale>(
+                        &order_solutions_storage_key(order_id, &account),
+                        block_hex,
+                    )
+                    .await?;
+                Ok(stored.is_some_and(|s| u64::from(s.submitted_at) == number))
+            }
+        }
+    }
+
+    /// Which account won the qblock recorded at `block_hex`, if any?
+    ///
+    /// `QuantumPow::QBlocks` is keyed by block number and its value begins with
+    /// the winning account, so this answers the question exactly. `None` means
+    /// no proof was accepted in this block at all.
+    async fn qblock_winner_at(&self, block_hex: &str) -> Result<Option<[u8; 32]>, ChainError> {
+        let header = self
+            .rpc_call(
+                "chain_getHeader",
+                Value::Array(vec![Value::String(block_hex.to_string())]),
+            )
+            .await?;
+        let block_number = u32::try_from(parse_block_number(&header)?)
+            .map_err(|_| ChainError::Decode("block number exceeds u32".into()))?;
+
+        let key = qblocks_storage_key(block_number);
+        let raw = self
+            .rpc_call(
+                "state_getStorage",
+                Value::Array(vec![
+                    Value::String(hex_encode(&key)),
+                    Value::String(block_hex.to_string()),
+                ]),
+            )
+            .await?;
+        let Some(hex) = raw.as_str() else {
+            return Ok(None);
+        };
+        let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+        // `miner` is the first field of `QBlock`, so it occupies the leading 32
+        // bytes. Reading only those survives the migrations that appended
+        // fields to the end of the struct.
+        let Some(miner) = bytes.get(..32) else {
+            return Err(ChainError::Decode(format!(
+                "QBlocks value is {} bytes, too short to hold an account",
+                bytes.len()
+            )));
+        };
+        let mut account = [0u8; 32];
+        account.copy_from_slice(miner);
+        Ok(Some(account))
+    }
+
+    /// Did this account win the qblock recorded at `block_hex`?
+    ///
+    /// Comparing `LastProofBlock` instead would report a false success whenever
+    /// another miner won the same block.
+    async fn proof_win_at(
+        &self,
+        block_hex: &str,
+        our_account: &[u8; 32],
+    ) -> Result<bool, ChainError> {
+        Ok(self.qblock_winner_at(block_hex).await? == Some(*our_account))
+    }
+
+    /// Is `account` already in `QuantumPow.Miners` at the current head?
+    async fn miner_is_registered(&self, account: &[u8; 32]) -> Result<bool, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+        self.storage_value_present(&miners_storage_key(account), at)
+            .await
+    }
+
+    /// Is any value stored at `key` in the block named by `at_hex`?
+    async fn storage_value_present(&self, key: &[u8], at_hex: &str) -> Result<bool, ChainError> {
+        let raw = self
+            .rpc_call(
+                "state_getStorage",
+                Value::Array(vec![
+                    Value::String(hex_encode(key)),
+                    Value::String(at_hex.to_string()),
+                ]),
+            )
+            .await?;
+        Ok(raw.as_str().is_some())
+    }
+
+    /// Best-effort reason for a dispatch that was included but did not take
+    /// effect.
+    ///
+    /// The pallet's own error variant lives in this block's `System.Events`,
+    /// and decoding those needs runtime metadata this client does not carry.
+    /// Replaying the extrinsic through `system_dryRun` cannot stand in for it:
+    /// at the head the nonce is already spent, and at the parent block the
+    /// replay omits whatever was ordered ahead of us inside the same block,
+    /// which is the very thing that beats a proof. So this reads the storage
+    /// the call competes for and reports what is actually there.
+    ///
+    /// The caller must treat this as log text only.
+    async fn explain_failure(
+        &self,
+        block_hex: &str,
+        confirmation: &Confirmation,
+    ) -> (String, bool) {
+        // Only a proof competes with other miners, so only a proof can lose a
+        // race. Every other call fails on its own merits.
+        if let Confirmation::ProofWin { account } = confirmation {
+            return match self.qblock_winner_at(block_hex).await {
+                Ok(winner) => explain_proof_failure(account, winner),
+                Err(e) => (
+                    format!("dispatch failed and the qblock winner could not be read: {e}"),
+                    false,
+                ),
+            };
+        }
+        let text = match confirmation {
+            // Handled above.
+            Confirmation::ProofWin { .. } => unreachable!(),
+            Confirmation::MinerRegistered { .. } => {
+                "dispatch failed and QuantumPow.Miners still has no entry for this account; \
+                 the deposit may be unaffordable"
+                    .to_string()
+            }
+            Confirmation::Descriptor { .. } => {
+                "dispatch failed and MinerRegistry.NodeDescriptors still has no entry for this \
+                 account"
+                    .to_string()
+            }
+            Confirmation::Participation { qblock_id, .. } => format!(
+                "dispatch failed and this account is absent from the participant set for qblock \
+                 {qblock_id}"
+            ),
+            Confirmation::DefaultTopology => {
+                "dispatch failed and QuantumPow.DefaultTopology is still unset".to_string()
+            }
+            Confirmation::Difficulty { .. } => {
+                "dispatch failed and QuantumPow.Difficulties has no entry for this topology"
+                    .to_string()
+            }
+            Confirmation::SolverRegistered { .. } => {
+                "dispatch failed and QuantumComputeMempool.Solvers still has no entry for this \
+                 account"
+                    .to_string()
+            }
+            Confirmation::SolverDeregistered { .. } => {
+                "dispatch failed and QuantumComputeMempool.Solvers still holds this account"
+                    .to_string()
+            }
+            Confirmation::SolutionAccepted { order_id, .. } => format!(
+                "dispatch failed and OrderSolutions for order {order_id} holds no submission from \
+                 this block; the order may have closed, or the solutions missed its gates"
+            ),
+        };
+        (text, false)
+    }
+}
+
+/// Turn the qblock winner recorded at a block into a reason and a race verdict.
+///
+/// Split from the RPC read so the verdict can be tested without a chain. The
+/// returned flag is true only when the qblock went to somebody else, which is
+/// the one failure that says nothing is wrong with our proof.
+fn explain_proof_failure(our_account: &[u8; 32], winner: Option<[u8; 32]>) -> (String, bool) {
+    match winner {
+        Some(w) if w != *our_account => (
+            format!(
+                "lost the qblock to miner {}; this proof was valid but arrived behind theirs",
+                hex_encode(&w)
+            ),
+            true,
+        ),
+        Some(_) => (
+            "we hold the qblock but the win was not observed at this block; treat as a read \
+             race, not a rejection"
+                .to_string(),
+            false,
+        ),
+        None => (
+            "no qblock was recorded at this block, so the pallet rejected the proof itself; \
+             check diversity, energy, and registration"
+                .to_string(),
+            false,
+        ),
+    }
+}
+
+/// What chain state proves a submitted call succeeded.
+///
+/// The status subscription reports pool and inclusion progress only. It cannot
+/// say whether the dispatch inside the block succeeded, because that lives in
+/// the block's events and decoding those needs runtime metadata. So each call
+/// names the storage entry its own success writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Confirmation {
+    /// `QuantumPow.QBlocks[block_number].miner` equals this account.
+    ProofWin { account: [u8; 32] },
+    /// `MinerRegistry.NodeDescriptors[account]` is present.
+    Descriptor { account: [u8; 32] },
+    /// `QuantumPow.Miners[account]` is present.
+    MinerRegistered { account: [u8; 32] },
+    /// `MinerRegistry.ParticipantsByQBlock[qblock_id][account]` is present.
+    Participation { qblock_id: u64, account: [u8; 32] },
+    /// `QuantumPow.DefaultTopology` is present. Used by seed-chain.
+    DefaultTopology,
+    /// `QuantumPow.Difficulties[topology_hash]` is present. Used by seed-chain.
+    Difficulty { topology_hash: [u8; 32] },
+    /// `QuantumComputeMempool.Solvers[account]` is present.
+    SolverRegistered { account: [u8; 32] },
+    /// `QuantumComputeMempool.Solvers[account]` is absent.
+    SolverDeregistered { account: [u8; 32] },
+    /// `QuantumComputeMempool.OrderSolutions[order_id][account]` was written by
+    /// this block. Presence alone is not enough: an earlier submission for the
+    /// same order would already be there.
+    SolutionAccepted { order_id: u64, account: [u8; 32] },
+}
+
+/// On-chain result of a hybrid-signed extrinsic, before pallet-specific classify.
+pub(crate) enum SignedCallOutcome {
+    /// Included and the dispatch succeeded.
+    Success {
+        /// `0x`-prefixed hash of the including block.
+        block: String,
+        /// Height of that block.
+        number: u64,
+    },
+    /// Included but the dispatch failed.
+    DispatchFailed {
+        error: String,
+        /// The call was sound and another miner simply took the qblock first.
+        /// Distinguished so a lost race is not reported as a rejection.
+        lost_race: bool,
+    },
+    /// The transaction pool rejected the extrinsic.
+    Invalid { message: String },
+    /// Dropped or errored before inclusion.
+    Dropped { message: String },
+}
+
+#[async_trait]
+impl crate::funding::BalanceSource for RealChainClient {
+    async fn free_balance(&self, account: [u8; 32]) -> Result<u128, String> {
+        let key = super::account::system_account_storage_key(&account);
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await
+            .map_err(|e| e.to_string())?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| "chain_getBlockHash did not return a string".to_string())?;
+        let raw = self
+            .rpc_call(
+                "state_getStorage",
+                Value::Array(vec![
+                    Value::String(hex_encode(&key)),
+                    Value::String(at.to_string()),
+                ]),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        // A null result means the account has never been touched on chain,
+        // which is a zero balance rather than a read failure.
+        let Some(hex) = raw.as_str() else {
+            return Ok(0);
+        };
+        let bytes = hex_decode(hex)?;
+        super::account::free_from_account_bytes(&bytes)
+    }
 }
 
 #[async_trait]
@@ -279,70 +1010,80 @@ impl ChainClient for RealChainClient {
             h.copy_from_slice(&bytes);
             h
         };
+        let at_hex = hex_encode(&block_hash);
 
-        // Parameter: Option<H256> SCALE-encoded.
-        let param = match topology_hash {
-            None => vec![0u8],
-            Some(th) => {
-                let mut p = vec![1u8];
-                p.extend_from_slice(&th);
-                p
-            }
-        };
-
-        let result = self
-            .rpc_call(
-                "state_call",
-                Value::Array(vec![
-                    Value::String("QuantumPowApi_mining_snapshot".into()),
-                    Value::String(hex_encode(&param)),
-                    Value::String(hex_encode(&block_hash)),
-                ]),
-            )
-            .await?;
-
-        let Some(hex) = result.as_str() else {
-            // Null result → no topology / empty response.
-            return Ok(None);
-        };
-        let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
-        let decoded: Option<MiningSnapshotScale> =
-            Decode::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))?;
-        let Some(scale) = decoded else {
-            return Ok(None);
-        };
-
-        // Block number from header (snapshot has no block_number field).
-        let header = self
-            .rpc_call(
+        // Every read is pinned at `block_hash`, so the five round trips that
+        // only depend on it run together. The topology itself is not among
+        // them: it is fetched once per hash and cached (see `topology_meta`).
+        // `LastProofBlock` at the head names the winning block one block
+        // before `LastProofBlockHash` catches up. Both are ValueQuery: 0 and
+        // the zero hash when unset.
+        let last_proof_block_key = last_proof_block_storage_key();
+        let stored_root_key = last_proof_block_hash_storage_key();
+        let (header, topology_hash, last_proof_block, stored_root, runtime_version) = futures::try_join!(
+            self.rpc_call(
                 "chain_getHeader",
-                Value::Array(vec![Value::String(hex_encode(&block_hash))]),
+                Value::Array(vec![Value::String(at_hex.clone())]),
+            ),
+            self.snapshot_topology_hash(topology_hash, &at_hex),
+            self.read_storage::<u32>(&last_proof_block_key, &at_hex),
+            self.read_storage::<[u8; 32]>(&stored_root_key, &at_hex),
+            self.rpc_call(
+                "state_getRuntimeVersion",
+                Value::Array(vec![Value::String(at_hex.clone())]),
+            ),
+        )?;
+        let Some(topology_hash) = topology_hash else {
+            return Ok(None);
+        };
+        let block_number = parse_block_number(&header)?;
+        let spec_version = parse_spec_version(&runtime_version)?;
+
+        // Decayed difficulty for this block. `None` means the hash is not
+        // registered, which is the same "nothing to mine" as no topology.
+        let difficulty = self
+            .quantum_pow_call_by_hash::<DifficultyConfig>(
+                "QuantumPowApi_difficulty_for",
+                &topology_hash,
+                &at_hex,
             )
             .await?;
-        let block_number = parse_block_number(&header)?;
+        let Some(difficulty) = difficulty else {
+            return Ok(None);
+        };
+        let Some(meta) = self.topology_meta(topology_hash, &at_hex).await? else {
+            return Ok(None);
+        };
 
         let snap = MiningSnapshot {
-            last_proof_block_hash: scale.last_proof_block_hash.0,
-            topology_hash: scale.topology_hash.0.to_vec(),
-            nodes: scale.nodes,
-            edges: scale.edges,
-            allowed_h_milli: require_set_values(&scale.allowed_h_values)
+            head_hash: block_hash,
+            last_proof_block_hash: super::snapshot::round_root(
+                block_hash,
+                block_number,
+                u64::from(last_proof_block.unwrap_or(0)),
+                stored_root.unwrap_or([0u8; 32]),
+            ),
+            topology_hash: topology_hash.to_vec(),
+            nodes: meta.nodes,
+            edges: meta.edges,
+            allowed_h_milli: require_set_values(&meta.allowed_h_values)
                 .map_err(ChainError::Decode)?,
-            allowed_j_milli: require_set_values(&scale.allowed_j_values)
+            allowed_j_milli: require_set_values(&meta.allowed_j_values)
                 .map_err(ChainError::Decode)?,
-            allowed_spin_milli: require_set_values(&scale.allowed_spin_values)
+            allowed_spin_milli: require_set_values(&meta.allowed_spin_values)
                 .map_err(ChainError::Decode)?,
-            min_solutions: scale.difficulty.min_solutions,
-            max_energy_milli: scale.difficulty.max_energy_milli,
-            min_diversity_milli: scale.difficulty.min_diversity_milli,
+            min_solutions: difficulty.min_solutions,
+            max_energy_milli: difficulty.max_energy_milli,
+            min_diversity_milli: difficulty.min_diversity_milli,
             block_number,
+            spec_version,
         };
 
         if let Ok(mut g) = self.last_snapshot.lock() {
             *g = Some(snap.clone());
         }
         if let Ok(mut g) = self.last_spin_spec.lock() {
-            *g = Some(scale.allowed_spin_values);
+            *g = Some(meta.allowed_spin_values);
         }
         Ok(Some(snap))
     }
@@ -373,6 +1114,24 @@ impl ChainClient for RealChainClient {
         };
         let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
         Decode::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))
+    }
+
+    async fn fetch_miner_info(&self, account: [u8; 32]) -> Result<Option<MinerInfo>, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+        let scale: Option<MinerInfoScale> =
+            self.read_storage(&miners_storage_key(&account), at).await?;
+        Ok(scale.map(|s| MinerInfo {
+            registered_at: u64::from(s.registered_at),
+            deposit: s.deposit,
+            proofs_submitted: u64::from(s.proofs_submitted),
+            proofs_won: u64::from(s.proofs_won),
+            rewards_earned: s.rewards_earned,
+        }))
     }
 
     async fn fetch_decay_params(
@@ -420,12 +1179,16 @@ impl ChainClient for RealChainClient {
         }))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one order walk: enumerate keys, read each order, drop closed and expired ones"
+    )]
     async fn fetch_mempool_orders(
         &self,
         _miner_account: [u8; 32],
     ) -> Result<Vec<JobOrder>, ChainError> {
-        // Discover recent order ids from system events at head, then storage-read
-        // each JobOrders(order_id). Without a live node this returns transport
+        // Discover order ids by walking the JobOrders map at head, then
+        // storage-read each order. Without a live node this returns transport
         // errors; with a node, empty open-order sets yield Ok(vec![]).
         let head = self
             .rpc_call("chain_getBlockHash", Value::Array(vec![]))
@@ -434,12 +1197,6 @@ impl ChainClient for RealChainClient {
             .as_str()
             .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
 
-        // Decode System.Events at head via subxt (metadata-aware) and collect
-        // the order_id of every QuantumComputeMempool::JobProposed. This finds
-        // orders proposed in the head block; still-open orders from earlier
-        // blocks are re-surfaced as they are re-proposed or by the storage-status
-        // filter below. Matches the Python reference (get_events_at → filter
-        // module_id/event_id → attributes.order_id).
         let head_bytes = hex_decode(head_hex).map_err(ChainError::Decode)?;
         if head_bytes.len() != 32 {
             return Err(ChainError::Decode(format!(
@@ -447,32 +1204,60 @@ impl ChainClient for RealChainClient {
                 head_bytes.len()
             )));
         }
-        let head_hash = H256::from_slice(&head_bytes);
 
-        let client = self.subxt_client().await?;
-        let at = client
-            .at_block(head_hash)
-            .await
-            .map_err(|e| ChainError::Unavailable(format!("subxt at_block: {e}")))?;
-        let events = at
-            .events()
-            .fetch()
-            .await
-            .map_err(|e| ChainError::Unavailable(format!("subxt events fetch: {e}")))?;
-
+        // Walk the JobOrders map rather than decoding JobProposed events. The
+        // map holds every open order, not only those proposed in the head
+        // block, and it needs no runtime metadata.
+        let prefix = hex_encode(&super::orders::job_orders_prefix());
         let mut order_ids: Vec<u64> = Vec::new();
-        for ev in events.iter() {
-            let ev = ev.map_err(|e| ChainError::Decode(format!("event decode: {e}")))?;
-            if ev.pallet_name() != "QuantumComputeMempool" || ev.event_name() != "JobProposed" {
-                continue;
+        let mut start_key: Option<String> = None;
+        loop {
+            let mut params = vec![
+                Value::String(prefix.clone()),
+                Value::Number(ORDER_PAGE_SIZE.into()),
+            ];
+            // state_getKeysPaged takes the previous page's last key as the
+            // resume point. The block hash is always the final argument, so a
+            // missing start key must still be sent as null.
+            params.push(match &start_key {
+                Some(k) => Value::String(k.clone()),
+                None => Value::Null,
+            });
+            params.push(Value::String(head_hex.to_string()));
+
+            let page = self
+                .rpc_call("state_getKeysPaged", Value::Array(params))
+                .await?;
+            let Some(keys) = page.as_array() else {
+                break;
+            };
+            if keys.is_empty() {
+                break;
             }
-            let fields = ev
-                .decode_fields_unchecked_as::<Composite<()>>()
-                .map_err(|e| ChainError::Decode(format!("JobProposed fields: {e}")))?;
-            if let Some(oid) = order_id_from_fields(&fields) {
-                order_ids.push(oid);
+            for k in keys {
+                let Some(hex) = k.as_str() else { continue };
+                let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+                if let Some(oid) = super::orders::order_id_from_key(&bytes) {
+                    order_ids.push(oid);
+                }
+            }
+            let full_page = keys.len() == ORDER_PAGE_SIZE as usize;
+            start_key = keys.last().and_then(|k| k.as_str()).map(String::from);
+            if !full_page {
+                break;
             }
         }
+
+        let header = self
+            .rpc_call(
+                "chain_getHeader",
+                Value::Array(vec![Value::String(head_hex.to_string())]),
+            )
+            .await?;
+        let head_number = parse_block_number(&header)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
         let mut orders = Vec::new();
         for oid in order_ids {
@@ -495,6 +1280,17 @@ impl ChainClient for RealChainClient {
             if scale.status != OrderStatus::Opened {
                 continue;
             }
+            // The pallet expires orders lazily, so an `Opened` status can
+            // outlive the order. Skip one already past its expiry.
+            let Some(deadline_ms) = order_deadline_ms(
+                scale.created_at,
+                scale.first_solution_at,
+                &scale.timing,
+                head_number,
+                now_ms,
+            ) else {
+                continue;
+            };
             orders.push(JobOrder {
                 order_id: oid.to_le_bytes().to_vec(),
                 nodes: scale.ising_params.nodes,
@@ -504,10 +1300,7 @@ impl ChainClient for RealChainClient {
                 min_energy_milli: scale.ising_params.min_energy_milli,
                 min_diversity_milli: scale.ising_params.min_diversity_milli,
                 min_solutions: scale.ising_params.min_solutions,
-                // Convert deadline_blocks → a soft ms deadline using a 6s
-                // block time estimate. Callers that need exact expiry should
-                // re-query chain head.
-                deadline_ms: u64::from(scale.timing.deadline_blocks).saturating_mul(6_000),
+                deadline_ms,
             });
         }
         Ok(orders)
@@ -555,11 +1348,27 @@ impl ChainClient for RealChainClient {
         Ok(out)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "hybrid sign + RPC submit path is one linear procedure"
-    )]
-    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError> {
+    async fn fetch_pending_proofs(&self) -> Result<Vec<PendingProof>, ChainError> {
+        let raw = self
+            .rpc_call("author_pendingExtrinsics", Value::Array(vec![]))
+            .await?;
+        let Some(entries) = raw.as_array() else {
+            return Err(ChainError::Decode(
+                "author_pendingExtrinsics did not return an array".into(),
+            ));
+        };
+        let mut proofs = Vec::new();
+        for entry in entries {
+            let Some(hex) = entry.as_str() else { continue };
+            let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+            if let Some(p) = decode_pending_proof(&bytes) {
+                proofs.push(p);
+            }
+        }
+        Ok(proofs)
+    }
+
+    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError> {
         let pair = self.pair()?;
         let snap = self
             .last_snapshot
@@ -600,137 +1409,252 @@ impl ChainClient for RealChainClient {
         let quantum = build_quantum_proof(proof, &ctx)
             .map_err(|e| ChainError::Submit(format!("encode proof: {e}")))?;
         let call = encode_submit_proof_call(&quantum);
+        let account = signer_account_bytes(&pair);
 
-        // Chain state for signed extensions. `system_accountNextIndex` expects
-        // an SS58-encoded address (the node rejects a hex account with a
-        // "Base 58 requirement is violated" param error), so encode the
-        // derived account with the default SS58 prefix.
-        let account_ss58 =
-            quip_transaction_crypto::account_id_from_public(&pair.public()).to_ss58check();
-        let nonce_val = self
-            .rpc_call(
-                "system_accountNextIndex",
-                Value::Array(vec![Value::String(account_ss58)]),
-            )
+        let (outcome, extrinsic_hash) = self
+            .submit_signed_call(&call, Confirmation::ProofWin { account })
             .await?;
-        let account_nonce = u32::try_from(
-            nonce_val
-                .as_u64()
-                .ok_or_else(|| ChainError::Decode("system_accountNextIndex not a u64".into()))?,
-        )
-        .map_err(|_| ChainError::Decode("account nonce exceeds u32".into()))?;
-
-        let genesis = self
-            .rpc_call(
-                "chain_getBlockHash",
-                Value::Array(vec![Value::Number(0.into())]),
-            )
-            .await?;
-        let genesis_hex = genesis
-            .as_str()
-            .ok_or_else(|| ChainError::Decode("genesis hash not a string".into()))?;
-        let genesis_bytes = hex_decode(genesis_hex).map_err(ChainError::Decode)?;
-        let mut genesis_hash = [0u8; 32];
-        if genesis_bytes.len() != 32 {
-            return Err(ChainError::Decode("genesis hash length".into()));
-        }
-        genesis_hash.copy_from_slice(&genesis_bytes);
-
-        let rv = self
-            .rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
-            .await?;
-        let spec_version = u32::try_from(
-            rv.get("specVersion")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    ChainError::Decode("runtime specVersion missing/not a u64".into())
-                })?,
-        )
-        .map_err(|_| ChainError::Decode("specVersion exceeds u32".into()))?;
-        let transaction_version = u32::try_from(
-            rv.get("transactionVersion")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    ChainError::Decode("runtime transactionVersion missing/not a u64".into())
-                })?,
-        )
-        .map_err(|_| ChainError::Decode("transactionVersion exceeds u32".into()))?;
-
-        let signed_ctx = SignedExtensionContext {
-            account_nonce,
-            genesis_hash,
-            spec_version,
-            transaction_version,
-            tip: 0,
-        };
-        let ext = build_hybrid_signed_extrinsic(&pair, &call, &signed_ctx);
-
-        // Submit via subxt's `author_submitAndWatchExtrinsic` and CONFIRM the
-        // on-chain outcome, rather than treating pool acceptance as success.
-        // We watch the status stream to in-best-block (not finality, to stay
-        // responsive — a re-org after this is rare on the local validator and
-        // the per-generation `current_best` reset bounds any wrong advance),
-        // then check the extrinsic's own events: `ExtrinsicSuccess` -> Success,
-        // `ExtrinsicFailed` -> classify the pallet error via `classify_receipt`.
-        let client = self.subxt_client().await?;
-        let tx_client = client
-            .tx()
-            .await
-            .map_err(|e| ChainError::Unavailable(format!("subxt tx client: {e}")))?;
-        let mut progress = tx_client
-            .from_bytes(ext)
-            .submit_and_watch()
-            .await
-            .map_err(|e| ChainError::Submit(format!("submit_and_watch: {e}")))?;
-        loop {
-            let status = progress
-                .next()
-                .await
-                .ok_or_else(|| ChainError::Unavailable("tx status stream ended".into()))?
-                .map_err(|e| ChainError::Unavailable(format!("tx progress: {e}")))?;
-            match status {
-                TransactionStatus::InBestBlock(in_block)
-                | TransactionStatus::InFinalizedBlock(in_block) => {
-                    return match in_block.wait_for_success().await {
-                        Ok(_events) => {
-                            tracing::info!(
-                                block = %in_block.block_hash(),
-                                "proof included and dispatched successfully"
-                            );
-                            Ok(SubmitAction::Success)
-                        }
-                        Err(e) => {
-                            // Included, but the pallet dispatch failed
-                            // (`ExtrinsicFailed`). Extract the `Pallet::Variant`
-                            // name for a precise classification (e.g. InvalidNonce
-                            // -> StopRoundStale/retry, not the default Fatal);
-                            // fall back to the Display string otherwise.
-                            let msg = match &e {
-                                subxt::error::TransactionEventsError::ExtrinsicFailed(
-                                    subxt::error::DispatchError::Module(m),
-                                ) => m.details_string(),
-                                other => other.to_string(),
-                            };
-                            tracing::warn!(error = %msg, "proof included but ExtrinsicFailed");
-                            Ok(classify_receipt(Some(&msg)))
-                        }
-                    };
-                }
-                TransactionStatus::Invalid { message } => {
-                    // Bad nonce / signature: stale for this round.
-                    tracing::warn!(%message, "proof rejected as invalid before inclusion");
-                    return Ok(classify_receipt(Some(&message)));
-                }
-                TransactionStatus::Dropped { message } | TransactionStatus::Error { message } => {
-                    // Pool drop / transient node error: retry the candidate.
-                    tracing::warn!(%message, "proof dropped by node before inclusion");
-                    return Ok(SubmitAction::Retry);
-                }
-                // Validated / Broadcasted / NoLongerInBestBlock: keep watching.
-                _ => {}
+        match outcome {
+            SignedCallOutcome::Success { block, number } => {
+                tracing::info!(block = %block, number, "proof included and dispatched successfully");
+                let block_hash = hex_decode(&block)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+                Ok(SubmitReceipt {
+                    action: SubmitAction::Success,
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash,
+                    block_number: Some(number),
+                })
+            }
+            SignedCallOutcome::DispatchFailed {
+                error,
+                lost_race: true,
+            } => {
+                tracing::info!(reason = %error, "proof included but another miner took the qblock");
+                Ok(SubmitReceipt {
+                    action: SubmitAction::StopRoundStale,
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash: None,
+                    block_number: None,
+                })
+            }
+            SignedCallOutcome::DispatchFailed { error, .. } => {
+                tracing::warn!(error = %error, "proof included but ExtrinsicFailed");
+                Ok(SubmitReceipt {
+                    action: classify_receipt(Some(&error)),
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash: None,
+                    block_number: None,
+                })
+            }
+            SignedCallOutcome::Invalid { message } => {
+                tracing::warn!(%message, "proof rejected as invalid before inclusion");
+                Ok(SubmitReceipt {
+                    action: classify_receipt(Some(&message)),
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash: None,
+                    block_number: None,
+                })
+            }
+            SignedCallOutcome::Dropped { message } => {
+                tracing::warn!(%message, "proof dropped by node before inclusion");
+                Ok(SubmitReceipt {
+                    action: SubmitAction::Retry,
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash: None,
+                    block_number: None,
+                })
             }
         }
     }
+
+    async fn ensure_miner_registered(&self) -> Result<RegistrationOutcome, ChainError> {
+        let account = signer_account_bytes(&self.pair()?);
+        if self.miner_is_registered(&account).await? {
+            return Ok(RegistrationOutcome::AlreadyRegistered);
+        }
+        let call = encode_register_miner_call();
+        let (outcome, _) = self
+            .submit_signed_call(&call, Confirmation::MinerRegistered { account })
+            .await?;
+        match outcome {
+            SignedCallOutcome::Success { .. } => Ok(RegistrationOutcome::Registered),
+            SignedCallOutcome::DispatchFailed { error, .. }
+            | SignedCallOutcome::Invalid { message: error } => {
+                classify_registration(Some(&error)).ok_or(ChainError::Submit(error))
+            }
+            SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
+        }
+    }
+
+    async fn ensure_solver_registered(&self) -> Result<RegistrationOutcome, ChainError> {
+        let account = signer_account_bytes(&self.pair()?);
+        let want = SolverType::from(self.participate_kind);
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+        match self
+            .read_storage::<SolverInfoScale>(&solvers_storage_key(&account), at)
+            .await?
+        {
+            Some(info) if info.solver_type == want => {
+                return Ok(RegistrationOutcome::AlreadyRegistered)
+            }
+            Some(info) => {
+                // `register_solver` refuses an existing entry, so a type change
+                // (a GPU added to a CPU node, say) needs a deregister first.
+                tracing::info!(
+                    registered = ?info.solver_type,
+                    configured = ?want,
+                    "mempool solver type changed; deregistering before re-registering"
+                );
+                let (outcome, _) = self
+                    .submit_signed_call(
+                        &encode_deregister_solver_call(),
+                        Confirmation::SolverDeregistered { account },
+                    )
+                    .await?;
+                match outcome {
+                    SignedCallOutcome::Success { .. } => {}
+                    SignedCallOutcome::DispatchFailed { error, .. }
+                    | SignedCallOutcome::Invalid { message: error }
+                    | SignedCallOutcome::Dropped { message: error } => {
+                        return Err(ChainError::Submit(format!("deregister_solver: {error}")))
+                    }
+                }
+            }
+            None => {}
+        }
+        let (outcome, _) = self
+            .submit_signed_call(
+                &encode_register_solver_call(want),
+                Confirmation::SolverRegistered { account },
+            )
+            .await?;
+        match outcome {
+            SignedCallOutcome::Success { .. } => Ok(RegistrationOutcome::Registered),
+            SignedCallOutcome::DispatchFailed { error, .. }
+            | SignedCallOutcome::Invalid { message: error } => {
+                classify_registration(Some(&error)).ok_or(ChainError::Submit(error))
+            }
+            SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
+        }
+    }
+
+    async fn submit_solution(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError> {
+        let order_id = <[u8; 8]>::try_from(proof.order_id.as_slice())
+            .map(u64::from_le_bytes)
+            .map_err(|_| {
+                ChainError::Submit(format!(
+                    "mempool order id is {} bytes, expected 8",
+                    proof.order_id.len()
+                ))
+            })?;
+        // Proof rows contain validated +1/-1 i8 spins.
+        let rows: Vec<Vec<i8>> = proof.solutions.iter().map(|r| r.spins.clone()).collect();
+        let account = signer_account_bytes(&self.pair()?);
+        let call = encode_submit_solution_call(order_id, &rows);
+        let (outcome, extrinsic_hash) = self
+            .submit_signed_call(&call, Confirmation::SolutionAccepted { order_id, account })
+            .await?;
+        let action = match &outcome {
+            SignedCallOutcome::Success { block, number } => {
+                tracing::info!(order_id, block = %block, number, rows = rows.len(), "mempool solution accepted");
+                let block_hash = hex_decode(block)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+                return Ok(SubmitReceipt {
+                    action: SubmitAction::Success,
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash,
+                    block_number: Some(*number),
+                });
+            }
+            // The failure text explains state; it carries no pallet error name
+            // to classify, and a rejected solution is not worth resending.
+            SignedCallOutcome::DispatchFailed { error: reason, .. }
+            | SignedCallOutcome::Invalid { message: reason } => {
+                tracing::warn!(order_id, reason = %reason, "mempool solution rejected");
+                SubmitAction::StopFatal
+            }
+            SignedCallOutcome::Dropped { message } => {
+                tracing::warn!(order_id, reason = %message, "mempool solution dropped before inclusion");
+                SubmitAction::Retry
+            }
+        };
+        Ok(SubmitReceipt {
+            action,
+            extrinsic_hash: Some(extrinsic_hash),
+            block_hash: None,
+            block_number: None,
+        })
+    }
+
+    async fn file_descriptor(
+        &self,
+        descriptor: &NodeDescriptorV2Input,
+    ) -> Result<DescriptorOutcome, ChainError> {
+        let call = encode_set_descriptor_call(descriptor);
+        let account = signer_account_bytes(&self.pair()?);
+        let (outcome, _) = self
+            .submit_signed_call(&call, Confirmation::Descriptor { account })
+            .await?;
+        match outcome {
+            SignedCallOutcome::Success { .. } => Ok(DescriptorOutcome::Filed),
+            SignedCallOutcome::DispatchFailed { error, .. }
+            | SignedCallOutcome::Invalid { message: error } => {
+                classify_descriptor(Some(&error)).ok_or(ChainError::Submit(error))
+            }
+            SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
+        }
+    }
+
+    async fn declare_participation(
+        &self,
+        qblock_id: u64,
+    ) -> Result<ParticipationOutcome, ChainError> {
+        let call = encode_participate_call(qblock_id, self.participate_kind, None);
+        let account = signer_account_bytes(&self.pair()?);
+        let (outcome, _) = self
+            .submit_signed_call(&call, Confirmation::Participation { qblock_id, account })
+            .await?;
+        match outcome {
+            SignedCallOutcome::Success { .. } => Ok(ParticipationOutcome::Declared),
+            SignedCallOutcome::DispatchFailed { error, .. }
+            | SignedCallOutcome::Invalid { message: error } => {
+                classify_participation(Some(&error)).ok_or(ChainError::Submit(error))
+            }
+            SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
+        }
+    }
+}
+
+/// Block time assumed when turning a block count into wall-clock time.
+const BLOCK_TIME_ESTIMATE_MS: u64 = 6_000;
+
+/// Absolute deadline, in Unix milliseconds, for a mempool order seen at `head`.
+///
+/// Miners compare `deadline_ms` with their own clock, so it must be absolute.
+/// Mirrors the pallet's `effective_expiry`: the hard deadline, cut short by
+/// `block_wait` once a first solution lands. `None` once `head` has reached
+/// that expiry, when `submit_solution` would find the order closed.
+fn order_deadline_ms(
+    created_at: u32,
+    first_solution_at: Option<u32>,
+    timing: &OrderTiming,
+    head: u64,
+    now_ms: u64,
+) -> Option<u64> {
+    let hard = created_at.saturating_add(timing.deadline_blocks);
+    let expiry = first_solution_at.map_or(hard, |first| {
+        hard.min(first.saturating_add(timing.block_wait))
+    });
+    let remaining = u64::from(expiry).checked_sub(head).filter(|&b| b > 0)?;
+    Some(now_ms.saturating_add(remaining.saturating_mul(BLOCK_TIME_ESTIMATE_MS)))
 }
 
 fn extract_salt(proof: &Proof) -> Option<[u8; 32]> {
@@ -740,6 +1664,34 @@ fn extract_salt(proof: &Proof) -> Option<[u8; 32]> {
     let mut s = [0u8; 32];
     s.copy_from_slice(&proof.salt);
     Some(s)
+}
+
+/// What chain state says about a submitted extrinsic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateOutcome {
+    /// Our extrinsic is in the block and the expected storage write is present.
+    Won,
+    /// Our extrinsic is in the block but the expected storage write is absent.
+    /// The dispatch failed, and state does not say why.
+    IncludedButNotWon,
+    /// Our extrinsic is not in the block.
+    NotIncluded,
+}
+
+/// Fold the two state reads into an outcome.
+///
+/// The second argument is true when the storage entry this call should have
+/// written is present. That is not the same as winning a quantum block. A
+/// descriptor or a participation write never touches `QBlocks`. Confirmation
+/// only counts when our own extrinsic is in the block. Another account's
+/// extrinsic can write the same entry, and claiming that would mark a failed
+/// call as successful.
+const fn classify_state_outcome(included: bool, won_here: bool) -> StateOutcome {
+    match (included, won_here) {
+        (true, true) => StateOutcome::Won,
+        (true, false) => StateOutcome::IncludedButNotWon,
+        (false, _) => StateOutcome::NotIncluded,
+    }
 }
 
 fn parse_block_number(header: &Value) -> Result<u64, ChainError> {
@@ -756,117 +1708,467 @@ fn parse_block_number(header: &Value) -> Result<u64, ChainError> {
     Err(ChainError::Decode("header.number unparseable".into()))
 }
 
-/// Extract the `order_id` (u64) from a decoded `QuantumComputeMempool::
-/// JobProposed` event's fields. Prefers the named `order_id` field (matching
-/// the pallet's named event attributes); falls back to the first field of an
-/// unnamed composite. `None` if absent or not an unsigned primitive. Extra
-/// fields (proposer, reward, …) are ignored, so it survives event-shape growth.
-fn order_id_from_fields(fields: &Composite<()>) -> Option<u64> {
-    let value = match fields {
-        Composite::Named(named) => named
-            .iter()
-            .find(|(name, _)| name == "order_id")
-            .map(|(_, v)| v),
-        Composite::Unnamed(vals) => vals.first(),
-    }?;
-    match &value.value {
-        ValueDef::Primitive(Primitive::U128(n)) => u64::try_from(*n).ok(),
-        _ => None,
-    }
-}
-
-async fn rpc_request(url: &str, method: &str, params: Value) -> Result<Value, ChainError> {
-    // Support both ws:// and http(s):// via jsonrpsee.
-    if url.starts_with("ws://") || url.starts_with("wss://") {
-        rpc_ws(url, method, params).await
-    } else {
-        rpc_http(url, method, params).await
-    }
-}
-
-async fn rpc_http(url: &str, method: &str, params: Value) -> Result<Value, ChainError> {
-    use jsonrpsee::core::client::ClientT;
-    use jsonrpsee::http_client::HttpClientBuilder;
-
-    let client = HttpClientBuilder::default()
-        .build(url)
-        .map_err(|e| ChainError::Unavailable(format!("http client: {e}")))?;
-    let result: Value = client
-        .request(method, rpc_params_from_value(params))
-        .await
-        .map_err(|e| ChainError::Unavailable(format!("rpc {method}: {e}")))?;
-    Ok(result)
-}
-
-async fn rpc_ws(url: &str, method: &str, params: Value) -> Result<Value, ChainError> {
-    use jsonrpsee::core::client::ClientT;
-    use jsonrpsee::ws_client::WsClientBuilder;
-
-    let client = WsClientBuilder::default()
-        .build(url)
-        .await
-        .map_err(|e| ChainError::Unavailable(format!("ws client: {e}")))?;
-    let result: Value = client
-        .request(method, rpc_params_from_value(params))
-        .await
-        .map_err(|e| ChainError::Unavailable(format!("rpc {method}: {e}")))?;
-    Ok(result)
-}
-
-fn rpc_params_from_value(params: Value) -> jsonrpsee::core::params::ArrayParams {
-    match params {
-        Value::Array(arr) => {
-            let mut p = jsonrpsee::core::params::ArrayParams::new();
-            for v in arr {
-                let _ = p.insert(v);
-            }
-            p
-        }
-        other => {
-            let mut p = jsonrpsee::core::params::ArrayParams::new();
-            let _ = p.insert(other);
-            p
-        }
-    }
+/// `specVersion` from a `state_getRuntimeVersion` response.
+pub(crate) fn parse_spec_version(rv: &Value) -> Result<u32, ChainError> {
+    u32::try_from(
+        rv.get("specVersion")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ChainError::Decode("runtime specVersion missing/not a u64".into()))?,
+    )
+    .map_err(|_| ChainError::Decode("specVersion exceeds u32".into()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::order_id_from_fields;
-    use subxt::ext::scale_value::{Composite, Value};
+    use super::super::transport_jsonrpsee::{
+        rpc_request, RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT,
+    };
 
+    /// Losing the qblock to another miner is the one included-but-failed case
+    /// that must not be reported as a rejection: the proof itself was sound.
     #[test]
-    fn order_id_from_named_ignores_other_fields() {
-        // Real JobProposed carries more than order_id (proposer, reward, …);
-        // the named lookup must pick order_id regardless of position.
-        let fields = Composite::Named(vec![
-            ("proposer".to_string(), Value::u128(999)),
-            ("order_id".to_string(), Value::u128(42)),
-            ("reward".to_string(), Value::u128(7)),
-        ]);
-        assert_eq!(order_id_from_fields(&fields), Some(42));
+    fn an_order_deadline_is_absolute_and_honours_block_wait() {
+        let timing = super::OrderTiming {
+            deadline_blocks: 50,
+            block_wait: 5,
+        };
+        assert_eq!(
+            super::order_deadline_ms(100, None, &timing, 120, 1_000),
+            Some(1_000 + 30 * 6_000)
+        );
+        assert_eq!(
+            super::order_deadline_ms(100, Some(110), &timing, 112, 0),
+            Some(3 * 6_000)
+        );
+        assert_eq!(
+            super::order_deadline_ms(100, Some(110), &timing, 115, 0),
+            None,
+            "block_wait has elapsed since the first solution"
+        );
+        assert_eq!(
+            super::order_deadline_ms(100, None, &timing, 150, 0),
+            None,
+            "the hard deadline has been reached"
+        );
     }
 
     #[test]
-    fn order_id_from_unnamed_takes_first() {
-        let fields = Composite::Unnamed(vec![Value::u128(7), Value::u128(99)]);
-        assert_eq!(order_id_from_fields(&fields), Some(7));
+    fn only_a_rival_winner_counts_as_a_lost_race() {
+        let ours = [1u8; 32];
+        let rival = [2u8; 32];
+
+        let (text, lost_race) = explain_proof_failure(&ours, Some(rival));
+        assert!(lost_race, "a rival winner is a lost race");
+        assert!(
+            text.contains(&hex_encode(&rival)),
+            "the reason must name the winner so the loss can be verified on chain, got: {text}"
+        );
+
+        // No qblock at all means the pallet threw the proof out. That is a real
+        // rejection and must stay distinguishable from a lost race.
+        let (_, lost_race) = explain_proof_failure(&ours, None);
+        assert!(!lost_race, "an empty qblock slot is a rejection");
+
+        // Seeing our own account means the read raced the write, not a loss.
+        let (_, lost_race) = explain_proof_failure(&ours, Some(ours));
+        assert!(!lost_race, "winning it ourselves is not a lost race");
     }
+    use super::{
+        classify_state_outcome, explain_proof_failure, hex_encode, parse_spec_version,
+        RealChainClient, StateOutcome,
+    };
 
     #[test]
-    fn order_id_absent_wrong_type_or_empty_is_none() {
-        // No order_id field.
-        assert_eq!(
-            order_id_from_fields(&Composite::Named(vec![("x".to_string(), Value::u128(1))])),
-            None
+    fn parse_spec_version_reads_the_number_and_rejects_absence() {
+        let rv = serde_json::json!({ "specName": "quip-runtime", "specVersion": 118 });
+        assert_eq!(parse_spec_version(&rv).map_err(|e| e.to_string()), Ok(118));
+        let missing = serde_json::json!({ "specName": "quip-runtime" });
+        assert!(parse_spec_version(&missing).is_err());
+    }
+    use crate::chain::scale_types::MinerKind;
+    use crate::chain::ChainError;
+    use serde_json::Value as JsonValue;
+    use std::time::{Duration, Instant};
+    use tokio::net::TcpListener;
+
+    /// Accept connections and never write a response byte. Models a wedged peer
+    /// that passes TCP but blocks the client forever without timeouts.
+    async fn spawn_blackhole_listener() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole listener");
+        let addr = listener.local_addr().expect("blackhole local addr");
+        drop(tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // Hold the accepted socket open and never write. The peer must
+                // time out on its own; that is the behaviour under test.
+                drop(tokio::spawn(async move {
+                    let _sock = sock;
+                    std::future::pending::<()>().await;
+                }));
+            }
+        }));
+        format!("{addr}")
+    }
+
+    /// Upper bound for a single-endpoint blackhole: connect budget plus slack
+    /// for scheduler jitter on a loaded CI host. Must stay well under the
+    /// test's outer timeout so a hang fails the test, not the harness.
+    fn single_endpoint_budget() -> Duration {
+        RPC_CONNECT_TIMEOUT
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(5))
+    }
+
+    /// Upper bound when the first endpoint blackholes and the second refuses:
+    /// one connect timeout plus a refused connect, with CI slack.
+    fn failover_budget() -> Duration {
+        RPC_CONNECT_TIMEOUT
+            .saturating_mul(3)
+            .saturating_add(RPC_REQUEST_TIMEOUT)
+            .saturating_add(Duration::from_secs(5))
+    }
+
+    #[tokio::test]
+    async fn ws_blackhole_endpoint_errors_within_connect_budget() {
+        let addr = spawn_blackhole_listener().await;
+        let url = format!("ws://{addr}");
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            single_endpoint_budget(),
+            rpc_request(&url, "system_health", JsonValue::Array(vec![])),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "ws blackhole call hung past {:?}",
+            single_endpoint_budget()
         );
-        // order_id present but not an unsigned primitive.
-        let nested = Value::named_composite(vec![("inner".to_string(), Value::u128(1))]);
-        assert_eq!(
-            order_id_from_fields(&Composite::Named(vec![("order_id".to_string(), nested)])),
-            None
+        let err = outcome
+            .expect("outer timeout")
+            .expect_err("blackhole must not succeed");
+        assert!(
+            matches!(err, ChainError::Unavailable(_)),
+            "timeout must classify as Unavailable for failover, got {err}"
         );
-        // Empty unnamed composite.
-        assert_eq!(order_id_from_fields(&Composite::Unnamed(vec![])), None);
+        assert!(
+            started.elapsed() < single_endpoint_budget(),
+            "elapsed {:?} exceeds budget",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_blackhole_endpoint_errors_within_request_budget() {
+        let addr = spawn_blackhole_listener().await;
+        let url = format!("http://{addr}");
+        // HTTP has no separate connect timeout; request_timeout covers the hang.
+        let budget = RPC_REQUEST_TIMEOUT.saturating_add(Duration::from_secs(10));
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            budget,
+            rpc_request(&url, "system_health", JsonValue::Array(vec![])),
+        )
+        .await;
+        assert!(outcome.is_ok(), "http blackhole call hung past {budget:?}");
+        let err = outcome
+            .expect("outer timeout")
+            .expect_err("blackhole must not succeed");
+        assert!(
+            matches!(err, ChainError::Unavailable(_)),
+            "timeout must classify as Unavailable for failover, got {err}"
+        );
+        assert!(
+            started.elapsed() < budget,
+            "elapsed {:?} exceeds budget",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_call_fails_over_past_blackhole_first_validator() {
+        let addr = spawn_blackhole_listener().await;
+        // Primary accepts and stays silent. Secondary refuses immediately so
+        // the call ends after one connect timeout plus a fast connection error.
+        let client = RealChainClient::new(
+            vec![format!("ws://{addr}"), "ws://127.0.0.1:1".to_string()],
+            "//Alice".to_string(),
+            MinerKind::Cpu,
+        );
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(failover_budget(), client.runtime_version_raw()).await;
+        assert!(
+            outcome.is_ok(),
+            "failover hung past {:?}",
+            failover_budget()
+        );
+        let err = outcome
+            .expect("outer timeout")
+            .expect_err("no working validator in the list");
+        assert!(
+            matches!(err, ChainError::Unavailable(_)),
+            "all-endpoint failure must be Unavailable, got {err}"
+        );
+        // Must have left the blackhole: elapsed is under one connect budget
+        // times a small factor, not an unbounded hang.
+        assert!(
+            started.elapsed() < failover_budget(),
+            "elapsed {:?} exceeds failover budget",
+            started.elapsed()
+        );
+        // And it must have waited long enough that the connect timeout fired
+        // (not instant success / skip). A refused-only pair would be near 0.
+        assert!(
+            started.elapsed() >= RPC_CONNECT_TIMEOUT,
+            "expected at least one connect timeout ({RPC_CONNECT_TIMEOUT:?}), got {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The submit path must not treat inclusion as success. A block that
+    /// includes the extrinsic but does not advance `LastProofBlock` is a failed
+    /// dispatch, and reporting it as success would mark a losing proof as won.
+    #[test]
+    fn inclusion_without_a_win_is_not_success() {
+        assert_eq!(
+            classify_state_outcome(true, false),
+            StateOutcome::IncludedButNotWon
+        );
+        assert_eq!(classify_state_outcome(true, true), StateOutcome::Won);
+        assert_eq!(
+            classify_state_outcome(false, false),
+            StateOutcome::NotIncluded
+        );
+    }
+
+    /// A win recorded while our extrinsic never made the block belongs to
+    /// another miner and must not be claimed.
+    #[test]
+    fn a_win_without_our_extrinsic_is_not_ours() {
+        assert_eq!(
+            classify_state_outcome(false, true),
+            StateOutcome::NotIncluded
+        );
+    }
+
+    /// A validator scripted for the snapshot path: a fixed head at block 16,
+    /// one registered topology per hash, a `DefaultTopology` the test can
+    /// move, and a `LastProofBlock` the test can set. `None` answers null for
+    /// both `LastProofBlock` and `LastProofBlockHash`, which is genesis.
+    struct SnapshotValidator {
+        default_topology: std::sync::Mutex<[u8; 32]>,
+        last_proof_block: std::sync::Mutex<Option<u32>>,
+        topology_meta_calls: std::sync::Mutex<Vec<[u8; 32]>>,
+    }
+
+    const HEAD: [u8; 32] = [0xAA; 32];
+    const STORED_ROOT: [u8; 32] = [0xBB; 32];
+
+    fn topology_for(hash: [u8; 32]) -> crate::chain::scale_types::TopologyMetaScale {
+        use quantum_validation::AllowedValueSpec;
+        let n = u32::from(hash[0]);
+        crate::chain::scale_types::TopologyMetaScale {
+            nodes: vec![0, 1, n],
+            edges: vec![(0, 1), (1, n)],
+            allowed_h_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            allowed_j_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            allowed_spin_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            registered_at: 3,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::chain::transport::RpcTransport for SnapshotValidator {
+        async fn request(
+            &self,
+            _url: &str,
+            method: &str,
+            params: JsonValue,
+        ) -> Result<JsonValue, ChainError> {
+            use crate::chain::extrinsic::{
+                default_topology_storage_key, hex_decode, last_proof_block_hash_storage_key,
+                last_proof_block_storage_key,
+            };
+            use parity_scale_codec::Encode as _;
+            let arg = |i: usize| {
+                params
+                    .get(i)
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let hex = |bytes: &[u8]| JsonValue::String(hex_encode(bytes));
+            Ok(match method {
+                "chain_getBlockHash" => hex(&HEAD),
+                "chain_getHeader" => {
+                    assert_eq!(arg(0), hex_encode(&HEAD), "header read pinned at the head");
+                    serde_json::json!({ "number": "0x10" })
+                }
+                "state_getRuntimeVersion" => {
+                    assert_eq!(
+                        arg(0),
+                        hex_encode(&HEAD),
+                        "runtime version read pinned at the head"
+                    );
+                    serde_json::json!({ "specName": "quip-runtime", "specVersion": 118 })
+                }
+                "state_getStorage" => {
+                    assert_eq!(arg(1), hex_encode(&HEAD), "storage read pinned at the head");
+                    let key = hex_decode(&arg(0)).expect("storage key hex");
+                    if key == default_topology_storage_key() {
+                        hex(&*self.default_topology.lock().unwrap())
+                    } else if key == last_proof_block_storage_key() {
+                        match *self.last_proof_block.lock().unwrap() {
+                            Some(n) => hex(&n.encode()),
+                            None => JsonValue::Null,
+                        }
+                    } else if key == last_proof_block_hash_storage_key() {
+                        match *self.last_proof_block.lock().unwrap() {
+                            Some(_) => hex(&STORED_ROOT),
+                            None => JsonValue::Null,
+                        }
+                    } else {
+                        panic!("unexpected storage key {}", arg(0))
+                    }
+                }
+                "state_call" => {
+                    assert_eq!(arg(2), hex_encode(&HEAD), "runtime call pinned at the head");
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&hex_decode(&arg(1)).expect("hash hex"));
+                    match arg(0).as_str() {
+                        "QuantumPowApi_difficulty_for" => {
+                            hex(&Some(crate::chain::scale_types::DifficultyConfig {
+                                min_solutions: 1,
+                                max_energy_milli: -5_000,
+                                min_diversity_milli: 0,
+                            })
+                            .encode())
+                        }
+                        "QuantumPowApi_topology_meta" => {
+                            self.topology_meta_calls.lock().unwrap().push(hash);
+                            hex(&Some(topology_for(hash)).encode())
+                        }
+                        other => panic!("unexpected runtime call {other}"),
+                    }
+                }
+                other => panic!("unexpected rpc method {other}"),
+            })
+        }
+
+        async fn subscribe(
+            &self,
+            _url: &str,
+            _sub: &str,
+            _params: JsonValue,
+            _unsub: &str,
+        ) -> Result<
+            crate::chain::transport::BoxStream<'static, Result<JsonValue, ChainError>>,
+            ChainError,
+        > {
+            Err(ChainError::Unavailable(
+                "no subscriptions in this test".into(),
+            ))
+        }
+    }
+
+    /// The topology is the one payload that never changes under its hash, so
+    /// polling the same hash must not download it again. A new default
+    /// topology is a new hash and is downloaded when it first appears. The
+    /// root and the difficulty are read on every poll.
+    #[tokio::test]
+    async fn the_topology_is_downloaded_only_when_the_hash_changes() {
+        use crate::chain::ChainClient as _;
+        let first = [0x11; 32];
+        let second = [0x22; 32];
+        let validator = std::sync::Arc::new(SnapshotValidator {
+            default_topology: std::sync::Mutex::new(first),
+            last_proof_block: std::sync::Mutex::new(Some(10)),
+            topology_meta_calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let client = RealChainClient::with_transport(
+            vec!["ws://scripted".to_string()],
+            "//Alice".to_string(),
+            MinerKind::Cpu,
+            validator.clone(),
+        );
+
+        let snap = client
+            .fetch_mining_snapshot(None, [0u8; 32], None)
+            .await
+            .expect("first snapshot")
+            .expect("a topology is registered");
+        assert_eq!(snap.head_hash, HEAD);
+        assert_eq!(
+            snap.last_proof_block_hash, STORED_ROOT,
+            "the win was at block 10, so the stored hash is the root"
+        );
+        assert_eq!(snap.block_number, 16);
+        assert_eq!(snap.spec_version, 118);
+        assert_eq!(snap.topology_hash, first.to_vec());
+        assert_eq!(snap.nodes, vec![0, 1, 0x11]);
+        assert_eq!(snap.edges, vec![(0, 1), (1, 0x11)]);
+        assert_eq!(snap.allowed_spin_milli, vec![-1000, 1000]);
+        assert_eq!(snap.min_solutions, 1);
+        assert_eq!(snap.max_energy_milli, -5_000);
+
+        *validator.last_proof_block.lock().unwrap() = Some(16);
+        let won = client
+            .fetch_mining_snapshot(None, [0u8; 32], None)
+            .await
+            .expect("snapshot at the winning block")
+            .expect("still registered");
+        assert_eq!(
+            won.last_proof_block_hash, HEAD,
+            "LastProofBlock equals the head number, so the head is the root"
+        );
+
+        *validator.last_proof_block.lock().unwrap() = None;
+        let genesis = client
+            .fetch_mining_snapshot(None, [0u8; 32], None)
+            .await
+            .expect("snapshot before any win")
+            .expect("still registered");
+        assert_eq!(
+            genesis.last_proof_block_hash, [0u8; 32],
+            "unset storage reads as the ValueQuery defaults: block 0, zero hash"
+        );
+
+        let again = client
+            .fetch_mining_snapshot(None, [0u8; 32], None)
+            .await
+            .expect("second snapshot")
+            .expect("still registered");
+        assert_eq!(again.nodes, snap.nodes);
+        assert_eq!(
+            validator.topology_meta_calls.lock().unwrap().as_slice(),
+            &[first],
+            "the second poll on the same hash reuses the cached topology"
+        );
+
+        *validator.default_topology.lock().unwrap() = second;
+        let moved = client
+            .fetch_mining_snapshot(None, [0u8; 32], None)
+            .await
+            .expect("third snapshot")
+            .expect("the new default is registered");
+        assert_eq!(moved.topology_hash, second.to_vec());
+        assert_eq!(moved.nodes, vec![0, 1, 0x22]);
+        assert_eq!(
+            validator.topology_meta_calls.lock().unwrap().as_slice(),
+            &[first, second],
+            "a new hash is downloaded when it first appears"
+        );
+
+        // The caller's own choice bypasses `DefaultTopology` and hits the cache.
+        let chosen = client
+            .fetch_mining_snapshot(None, [0u8; 32], Some(second))
+            .await
+            .expect("chosen snapshot")
+            .expect("registered");
+        assert_eq!(chosen.nodes, moved.nodes);
+        assert_eq!(validator.topology_meta_calls.lock().unwrap().len(), 2);
     }
 }

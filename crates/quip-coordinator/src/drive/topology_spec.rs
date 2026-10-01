@@ -121,6 +121,7 @@ impl TopologySpec {
     #[must_use]
     pub fn to_snapshot(&self) -> MiningSnapshot {
         MiningSnapshot {
+            head_hash: [0u8; 32],
             last_proof_block_hash: [0u8; 32],
             topology_hash: self.topology.hash.clone(),
             nodes: self.topology.nodes.clone(),
@@ -132,6 +133,7 @@ impl TopologySpec {
             max_energy_milli: self.max_energy_milli,
             min_diversity_milli: self.min_diversity_milli,
             block_number: 0,
+            spec_version: 0,
         }
     }
 }

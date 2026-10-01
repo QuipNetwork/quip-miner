@@ -49,20 +49,21 @@ use quantum_validation::{
 };
 use quip_coordinator::chain::extrinsic::{
     build_hybrid_signed_extrinsic, hex_decode, hex_encode, miner_identity_bytes,
-    SignedExtensionContext,
+    miners_storage_key, SignedExtensionContext,
 };
 use quip_coordinator::chain::scale_types::{
-    IsingParams, JobMode, MiningSnapshotScale, ResultDelivery, RewardResolution,
+    encode_register_miner_call, IsingParams, JobMode, MiningSnapshotScale, ResultDelivery,
+    RewardResolution,
 };
 use quip_coordinator::chain::submit::SubmitAction;
 use quip_coordinator::chain::{ChainClient, JobOrder, RealChainClient};
-use quip_proto::v1::Solution;
-use quip_protocol::wire::encode_spins;
+use quip_coordinator::drive::parse_topology_spec;
+use quip_coordinator::presets::preset_spec;
+use quip_coordinator::validate::MAX_PROOF_SOLUTIONS;
 use quip_transaction_crypto::{account_id_from_public, HybridPair};
 use sp_core::Pair;
 
 const QUANTUM_POW_PALLET: u8 = 10;
-const REGISTER_MINER_CALL: u8 = 0;
 
 /// `QuantumPow` `Error` variants in declaration order (module error index).
 const POW_ERRORS: &[&str] = &[
@@ -207,7 +208,8 @@ async fn account_nonce(url: &str, acct: &[u8; 32]) -> u32 {
 }
 
 async fn miner_proofs_submitted(url: &str, acct: &[u8; 32]) -> Option<u32> {
-    let key = map_key(b"QuantumPow", b"Miners", acct);
+    // The production key builder, so a live chain checks it too.
+    let key = miners_storage_key(acct);
     let bytes = get_storage(url, &key, None).await?;
     MinerInfoLite::decode(&mut &bytes[..])
         .map(|m| m.proofs_submitted)
@@ -413,6 +415,22 @@ fn build_adjacency(
 // Test
 // ----------------------------------------------------------------------------
 
+/// Install the coordinator's log subscriber so a failed submit reports the
+/// module error it hit. Without this, `submit_proof` logs the dispatch error at
+/// `warn` and the test sees only the classified action, which cannot say why.
+/// Ignores a second call, because both tests in this file may run together.
+fn init_test_logging() {
+    let level = std::env::var("QUIP_DEVNET_LOG")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "trace" => Some(quip_coordinator::logging::LogLevel::Trace),
+            "debug" => Some(quip_coordinator::logging::LogLevel::Debug),
+            _ => None,
+        })
+        .unwrap_or(quip_coordinator::logging::LogLevel::Info);
+    let _ = quip_coordinator::logging::init(Some(level));
+}
+
 #[tokio::test]
 #[ignore = "requires a live devnet; set QUIP_DEVNET=ws://host:port"]
 async fn devnet_submit_proof_end_to_end() {
@@ -420,12 +438,17 @@ async fn devnet_submit_proof_end_to_end() {
         eprintln!("QUIP_DEVNET unset; skipping live devnet test");
         return;
     };
+    init_test_logging();
 
     let alice = HybridPair::from_string("//Alice", None).expect("//Alice");
     let alice_acct = account_id_from_public(&alice.public());
     let alice_bytes: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(&alice_acct);
 
-    let client = RealChainClient::new(vec![url.clone()], "//Alice".to_string());
+    let client = RealChainClient::new(
+        vec![url.clone()],
+        "//Alice".to_string(),
+        quip_coordinator::chain::MinerKind::Cpu,
+    );
 
     // ---------------- Milestone 1: read path ----------------
     let snap = client
@@ -442,10 +465,21 @@ async fn devnet_submit_proof_end_to_end() {
         snap.min_diversity_milli,
         hex_encode(&snap.last_proof_block_hash),
     );
-    assert!(
-        (4000..5000).contains(&snap.nodes.len()),
-        "expected ~4578 nodes, got {}",
-        snap.nodes.len()
+    // The devnet is seeded from the `advantage2-system1` preset, so the
+    // snapshot must report that graph exactly. Deriving the counts from the
+    // preset rather than hard-coding them keeps this assertion correct if the
+    // fixture ever changes, and catches a devnet seeded with the wrong graph.
+    let seeded = parse_topology_spec(preset_spec("advantage2-system1").expect("preset resolves"))
+        .expect("preset parses");
+    assert_eq!(
+        snap.nodes.len(),
+        seeded.topology.nodes.len(),
+        "node count must match the advantage2-system1 preset"
+    );
+    assert_eq!(
+        snap.edges.len(),
+        seeded.topology.edges.0.len(),
+        "edge count must match the advantage2-system1 preset"
     );
     // Difficulty parameters are chain-state-dependent (they ratchet/decay and are
     // reconfigured), so assert decode sanity rather than pinning volatile values.
@@ -469,7 +503,7 @@ async fn devnet_submit_proof_end_to_end() {
     if miner_proofs_submitted(&url, &alice_bytes).await.is_none() {
         let nonce = account_nonce(&url, &alice_bytes).await;
         let ctx = fetch_ext_ctx(&url, nonce).await;
-        let call = vec![QUANTUM_POW_PALLET, REGISTER_MINER_CALL];
+        let call = encode_register_miner_call();
         let ext = build_hybrid_signed_extrinsic(&alice, &call, &ctx);
         let block = submit_and_confirm(&url, &hex_encode(&ext), "register_miner", |u| async move {
             miner_proofs_submitted(&u, &alice_bytes).await.is_some()
@@ -517,6 +551,10 @@ async fn devnet_submit_proof_end_to_end() {
             valid.push((s, e));
         }
     }
+    // The runtime bounds a proof at `QuantumPowMaxSolutions` rows. More than
+    // that fails to decode, so the node answers the submission with a codec
+    // error instead of a dispatch result and the test learns nothing.
+    valid.truncate(MAX_PROOF_SOLUTIONS);
 
     // (4) Best-effort diversity over whatever we found (0 if < 2 rows).
     let valid_slices: Vec<&[i8]> = valid.iter().map(|(s, _)| s.as_slice()).collect();
@@ -546,8 +584,8 @@ async fn devnet_submit_proof_end_to_end() {
         n_valid: valid.len() as u32,
         solutions: valid
             .iter()
-            .map(|(s, e)| Solution {
-                spins_bytes: encode_spins(s),
+            .map(|(s, e)| quip_coordinator::validate::SpinRow {
+                spins: s.clone(),
                 energy_milli: *e,
             })
             .collect(),
@@ -575,7 +613,7 @@ async fn devnet_submit_proof_end_to_end() {
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
-    let reported_success = matches!(action, Ok(SubmitAction::Success));
+    let reported_success = matches!(action.as_ref().map(|r| r.action), Ok(SubmitAction::Success));
     let event = scan_recent_events(&url, &alice_bytes, 8).await;
     println!(
         "  F9 check: reported_success={reported_success} on_chain_incremented={incremented} event={}",
@@ -683,11 +721,16 @@ async fn devnet_mempool_job_proposed_end_to_end() {
         eprintln!("QUIP_DEVNET unset; skipping live devnet mempool test");
         return;
     };
+    init_test_logging();
 
     let alice = HybridPair::from_string("//Alice", None).expect("//Alice");
     let alice_acct = account_id_from_public(&alice.public());
     let alice_bytes: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(&alice_acct);
-    let client = RealChainClient::new(vec![url.clone()], "//Alice".to_string());
+    let client = RealChainClient::new(
+        vec![url.clone()],
+        "//Alice".to_string(),
+        quip_coordinator::chain::MinerKind::Cpu,
+    );
 
     // The canonical default plain-Ising spec is seeded at genesis; propose
     // against it so no root-gated spec registration is needed.

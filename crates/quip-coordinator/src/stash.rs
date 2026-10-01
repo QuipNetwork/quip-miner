@@ -1,16 +1,20 @@
 //! Win-time candidate stash (agm.2.4).
 //!
 //! Holds the most-viable solutions per generation and projects, from the decay
-//! schedule, the block at which each becomes viable as difficulty eases — so the
+//! model, the block at which each becomes viable as difficulty eases — so the
 //! coordinator can submit at the right block without polling the chain every
 //! block. Already-viable solutions submit immediately on the session path; this
 //! stash captures solutions that don't clear the *current* (already-decayed)
 //! threshold yet but will after enough decay, so they aren't discarded.
 
-use crate::decay::step_for_energy;
-use quip_proto::v1::Solution;
+use crate::decay::{DecayAlgorithm, DecayModel};
+use crate::validate::SpinRow;
 use serde::Serialize;
 use std::fmt::Write as _;
+
+/// How far ahead of the last proof the stash projects: 256 epochs of 100
+/// blocks. A candidate that does not clear inside this window is not held.
+pub const DECAY_HORIZON_BLOCKS: u64 = 25_600;
 
 /// A stashed candidate: a validated solution set awaiting its viability block.
 #[derive(Clone, Debug)]
@@ -28,7 +32,7 @@ pub struct Candidate {
     /// Count of gate-passing solutions retained.
     pub n_valid: u32,
     /// Solutions to resubmit when the candidate becomes viable.
-    pub solutions: Vec<Solution>,
+    pub solutions: Vec<SpinRow>,
     /// Whether the job was a `PoW` job.
     pub is_pow: bool,
     /// Mempool order id (empty for `PoW`).
@@ -39,29 +43,28 @@ pub struct Candidate {
     pub submitted: bool,
 }
 
-/// Per-generation stash of the top-K most-viable candidates plus the projection
-/// inputs (decay schedule, last-proof block, epoch length).
+/// Per-generation stash of the top-K most-viable candidates plus the
+/// projection inputs (decay model and last-proof block).
 pub struct WinStash {
     generation: u64,
-    /// `max_energy_milli` threshold at each decay step (`build_decay_schedule`).
-    schedule: Vec<i64>,
+    /// Threshold model for the round. `None` until [`reset`](Self::reset)
+    /// arms one, and while the chain reads that build it fail.
+    model: Option<DecayModel>,
     last_proof_block: u64,
-    epoch_length: u64,
     k: usize,
     /// Kept sorted best-first (lowest energy), length ≤ `k`.
     candidates: Vec<Candidate>,
 }
 
 impl WinStash {
-    /// Empty stash retaining the top-`k` candidates (k ≥ 1). No schedule until
-    /// [`reset`](Self::reset).
+    /// Empty stash retaining the top-`k` candidates (k ≥ 1). No projection
+    /// until [`reset`](Self::reset).
     #[must_use]
     pub fn new(k: usize) -> Self {
         Self {
             generation: 0,
-            schedule: Vec::new(),
+            model: None,
             last_proof_block: 0,
-            epoch_length: 0,
             k: k.max(1),
             candidates: Vec::new(),
         }
@@ -69,18 +72,31 @@ impl WinStash {
 
     /// Re-arm for a new generation with fresh projection inputs, dropping all
     /// held candidates (the prior round's problem is stale after a reseed).
-    pub fn reset(
-        &mut self,
-        generation: u64,
-        schedule: Vec<i64>,
-        last_proof_block: u64,
-        epoch_length: u64,
-    ) {
+    pub fn reset(&mut self, generation: u64, model: Option<DecayModel>, last_proof_block: u64) {
         self.generation = generation;
-        self.schedule = schedule;
+        self.model = model;
         self.last_proof_block = last_proof_block;
-        self.epoch_length = epoch_length;
         self.candidates.clear();
+    }
+
+    /// Swap the decay rule in place, keeping every candidate. Returns whether
+    /// the rule changed. A runtime upgrade takes effect at one block, so the
+    /// feeder calls this on every poll with the rule the head's
+    /// `spec_version` implies.
+    pub fn set_algorithm(&mut self, algorithm: DecayAlgorithm) -> bool {
+        match self.model.as_mut() {
+            Some(m) if m.algorithm != algorithm => {
+                m.algorithm = algorithm;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The rule the projection runs under, or `None` without a model.
+    #[must_use]
+    pub fn algorithm(&self) -> Option<DecayAlgorithm> {
+        self.model.as_ref().map(|m| m.algorithm)
     }
 
     /// Current generation this stash is armed for.
@@ -95,25 +111,22 @@ impl WinStash {
         self.candidates.is_empty()
     }
 
-    /// Decay step at which `energy_milli` first clears, or `None` if it never
-    /// clears within the projected horizon.
-    #[must_use]
-    pub fn viability_step(&self, energy_milli: i64) -> Option<usize> {
-        step_for_energy(&self.schedule, energy_milli)
-    }
-
-    /// Block at which `energy_milli` becomes viable: `last_proof_block + step *
-    /// epoch_length`. `None` if it never clears within the horizon.
+    /// Block at which `energy_milli` becomes viable: the last proof block
+    /// plus the first elapsed count whose threshold strictly exceeds it.
+    /// `None` without a model, or if it never clears within
+    /// [`DECAY_HORIZON_BLOCKS`].
     #[must_use]
     pub fn viability_block(&self, energy_milli: i64) -> Option<u64> {
-        self.viability_step(energy_milli)
-            .map(|s| self.last_proof_block + (s as u64) * self.epoch_length)
+        let model = self.model.as_ref()?;
+        model
+            .first_clearing_elapsed(energy_milli, DECAY_HORIZON_BLOCKS)
+            .map(|elapsed| self.last_proof_block.saturating_add(elapsed))
     }
 
     /// Insert a candidate if it becomes viable within the horizon and ranks in
     /// the top-K by energy (lowest wins). Returns whether it was kept.
     pub fn insert(&mut self, cand: Candidate) -> bool {
-        if self.viability_step(cand.best_energy_milli).is_none() {
+        if self.viability_block(cand.best_energy_milli).is_none() {
             return false; // never clears within the horizon → not worth holding
         }
         let job_id = cand.job_id.clone();
@@ -163,7 +176,8 @@ impl WinStash {
         StashSummary {
             generation: self.generation,
             last_proof_block: self.last_proof_block,
-            epoch_length: self.epoch_length,
+            epoch_length: self.model.as_ref().map_or(0, |m| m.epoch_length),
+            decay_algorithm: self.model.as_ref().map_or("none", |m| m.algorithm.name()),
             candidates: self
                 .candidates
                 .iter()
@@ -189,8 +203,24 @@ pub struct StashSummary {
     pub last_proof_block: u64,
     /// Blocks per decay step.
     pub epoch_length: u64,
+    /// Decay rule the projection ran under: `stepwise`, `continuous`, or
+    /// `none` without a model.
+    pub decay_algorithm: &'static str,
     /// Top-K candidates currently held.
     pub candidates: Vec<CandidateSummary>,
+}
+
+impl StashSummary {
+    /// Worst and best retained energies, in milli-units.
+    ///
+    /// A new candidate must beat the worst to displace it once the stash is
+    /// full. `None` when the stash holds nothing.
+    #[must_use]
+    pub fn retained_band_milli(&self) -> Option<(i64, i64)> {
+        let best = self.candidates.first()?.best_energy_milli;
+        let worst = self.candidates.last()?.best_energy_milli;
+        Some((worst, best))
+    }
 }
 
 /// One candidate's annotation in the stash summary.
@@ -221,11 +251,26 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decay::{DecayAlgorithm, DecayModel, EnergyCurve};
 
-    // schedule[s] = threshold at step s (monotonic non-decreasing / easing).
-    fn stash_with(schedule: Vec<i64>, last_proof_block: u64, epoch: u64, k: usize) -> WinStash {
+    /// Stepwise thresholds -50000, -48775, -47581, -46416 at blocks 100, 110,
+    /// 120, 130 (last proof 100, epoch 10).
+    fn model() -> DecayModel {
+        DecayModel {
+            base_max_energy_milli: -50_000,
+            curve: Some(EnergyCurve {
+                min_milli: -100_000,
+                knee_milli: -50_000,
+                max_milli: -1_000,
+            }),
+            epoch_length: 10,
+            algorithm: DecayAlgorithm::Stepwise,
+        }
+    }
+
+    fn stash_with(model: Option<DecayModel>, last_proof_block: u64, k: usize) -> WinStash {
         let mut s = WinStash::new(k);
-        s.reset(1, schedule, last_proof_block, epoch);
+        s.reset(1, model, last_proof_block);
         s
     }
 
@@ -252,30 +297,30 @@ mod tests {
     }
 
     #[test]
-    fn viability_block_maps_step_to_block() {
-        // Threshold eases: -50000, -48000, -46000. last_proof 100, epoch 10.
-        let s = stash_with(vec![-50_000, -48_000, -46_000], 100, 10, 4);
-        // Energy -49000 clears at step 1 (first threshold > -49000) → block 110.
-        assert_eq!(s.viability_step(-49_000), Some(1));
+    fn viability_block_offsets_the_clearing_block_from_the_last_proof() {
+        let s = stash_with(Some(model()), 100, 4);
+        // -49000 clears at step 1 → block 110.
         assert_eq!(s.viability_block(-49_000), Some(110));
-        // Energy -47000 clears at step 2 → block 120.
-        assert_eq!(s.viability_block(-47_000), Some(120));
-        // Energy already below the base threshold clears at step 0 (viable now).
+        // -47000 clears at step 3 (-46416 is the first threshold above it) → 130.
+        assert_eq!(s.viability_block(-47_000), Some(130));
+        // Already below the base threshold → viable at the last proof block.
         assert_eq!(s.viability_block(-51_000), Some(100));
-        // Energy the schedule never exceeds → never viable in horizon.
-        assert_eq!(s.viability_block(-1_000), None);
+        // Above the easy cap → never.
+        assert_eq!(s.viability_block(-1), None);
+        // No projection → never.
+        assert_eq!(stash_with(None, 100, 4).viability_block(-51_000), None);
     }
 
     #[test]
     fn insert_keeps_top_k_and_rejects_never_viable() {
-        let mut s = stash_with(vec![-50_000, -48_000, -46_000], 100, 10, 2);
+        let mut s = stash_with(Some(model()), 100, 2);
         assert!(s.insert(cand(1, -49_000)));
         assert!(s.insert(cand(2, -47_500)));
         // A third, worse candidate is dropped (k=2, keeps the two best).
         assert!(!s.insert(cand(3, -46_500)));
         // A better one displaces the worst.
         assert!(s.insert(cand(4, -49_900)));
-        // Never-viable (above the whole schedule) is rejected outright.
+        // Never-viable (above the easy cap) is rejected outright.
         assert!(!s.insert(cand(5, -100)));
         let ids: Vec<u8> = s.candidates.iter().map(job_byte).collect();
         assert_eq!(ids, vec![4, 1]); // best-first: -49900, -49000
@@ -283,64 +328,61 @@ mod tests {
 
     #[test]
     fn due_at_returns_best_arrived_unsubmitted() {
-        let mut s = stash_with(vec![-50_000, -48_000, -46_000], 100, 10, 4);
+        let mut s = stash_with(Some(model()), 100, 4);
         let _ = s.insert(cand(1, -49_000)); // viable at block 110
-        let _ = s.insert(cand(2, -47_000)); // viable at block 120
-                                            // Before block 110: nothing due.
+        let _ = s.insert(cand(2, -47_000)); // viable at block 130
         assert!(s.due_at(109).is_none());
-        // At 110: candidate 1 due.
         assert_eq!(s.due_at(110).map(job_byte), Some(1));
-        // At 125 both due → best (lower energy = cand 2? no, -47000 > -49000).
-        // cand 1 (-49000) is lower energy = stronger, and both arrived → cand 1.
-        assert_eq!(s.due_at(125).map(job_byte), Some(1));
-        // Once cand 1 submitted, cand 2 becomes the best due one.
+        // At 135 both are due; cand 1 (-49000) is the stronger one.
+        assert_eq!(s.due_at(135).map(job_byte), Some(1));
         s.mark_submitted(&[1]);
-        assert_eq!(s.due_at(125).map(job_byte), Some(2));
+        assert_eq!(s.due_at(135).map(job_byte), Some(2));
     }
 
     #[test]
     fn due_improving_requires_arrival_and_improvement() {
-        let mut s = stash_with(vec![-50_000, -48_000, -46_000], 100, 10, 4);
+        let mut s = stash_with(Some(model()), 100, 4);
         let _ = s.insert(cand(1, -49_000)); // viable at block 110
-                                            // Not arrived yet → nothing.
         assert!(s.due_improving(109, None).is_none());
-        // Arrived + no current best → submit.
         assert_eq!(s.due_improving(110, None).map(job_byte), Some(1));
-        // Arrived but a better proof already stands → don't regress.
+        // Current best already stronger → nothing improves.
         assert!(s.due_improving(110, Some(-49_500)).is_none());
-        // Arrived + current best is worse → submit the improvement.
+        // Current best weaker → submit.
         assert_eq!(s.due_improving(110, Some(-48_000)).map(job_byte), Some(1));
     }
 
     #[test]
-    fn reset_clears_candidates_and_rearms() {
-        let mut s = stash_with(vec![-50_000, -48_000], 100, 10, 4);
-        let _ = s.insert(cand(1, -49_000));
-        assert!(!s.is_empty());
-        s.reset(2, vec![-40_000, -38_000], 200, 10);
-        assert!(s.is_empty());
-        assert_eq!(s.generation(), 2);
-        assert_eq!(s.viability_block(-39_000), Some(210));
+    fn set_algorithm_keeps_candidates_and_moves_viability_earlier() {
+        let mut s = stash_with(Some(model()), 100, 4);
+        assert!(s.insert(cand(1, -49_500)));
+        assert_eq!(s.viability_block(-49_500), Some(110));
+        assert_eq!(s.algorithm(), Some(DecayAlgorithm::Stepwise));
+
+        assert!(s.set_algorithm(DecayAlgorithm::Continuous));
+        assert_eq!(s.algorithm(), Some(DecayAlgorithm::Continuous));
+        let block = s.viability_block(-49_500).unwrap_or(u64::MAX);
+        assert!(
+            100 < block && block < 110,
+            "continuous viability at {block}"
+        );
+        assert_eq!(s.candidates.len(), 1);
+        assert_eq!(s.summary().decay_algorithm, "continuous");
+
+        // Same algorithm again is not a change.
+        assert!(!s.set_algorithm(DecayAlgorithm::Continuous));
+        // No projection → nothing to switch.
+        assert!(!stash_with(None, 100, 4).set_algorithm(DecayAlgorithm::Continuous));
     }
 
     #[test]
-    fn summary_serializes_annotations() {
-        let mut s = stash_with(vec![-50_000, -48_000, -46_000], 100, 10, 4);
-        let _ = s.insert(cand(0xab, -49_000));
-        let v: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&s.summary()).unwrap()).unwrap();
-        assert_eq!(v.get("generation"), Some(&serde_json::json!(1)));
-        assert_eq!(
-            v.pointer("/candidates/0/job_id"),
-            Some(&serde_json::json!("ab"))
-        );
-        assert_eq!(
-            v.pointer("/candidates/0/viability_block"),
-            Some(&serde_json::json!(110))
-        );
-        assert_eq!(
-            v.pointer("/candidates/0/submitted"),
-            Some(&serde_json::json!(false))
-        );
+    fn reset_drops_candidates_and_summary_names_the_model() {
+        let mut s = stash_with(Some(model()), 100, 4);
+        let _ = s.insert(cand(1, -49_000));
+        s.reset(2, None, 0);
+        assert!(s.is_empty());
+        assert_eq!(s.generation(), 2);
+        let summary = s.summary();
+        assert_eq!(summary.epoch_length, 0);
+        assert_eq!(summary.decay_algorithm, "none");
     }
 }

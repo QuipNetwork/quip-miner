@@ -1,9 +1,12 @@
 //! Scripted chain for tests: fixed snapshot, optional mempool order, captured submits.
 
+use super::sync::{SyncSource, SyncStatus};
 use super::{
-    ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, Proof, QBlockRecord,
-    RegisteredTopology, SubmitAction, TopologyInputs,
+    ChainClient, ChainError, DecayParams, DescriptorOutcome, JobOrder, MinerInfo, MiningSnapshot,
+    NodeDescriptorV2Input, ParticipationOutcome, PendingProof, Proof, QBlockRecord,
+    RegisteredTopology, RegistrationOutcome, SubmitAction, SubmitReceipt, TopologyInputs,
 };
+use crate::funding::BalanceSource;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -12,21 +15,58 @@ use std::sync::Mutex;
 pub struct FakeChain {
     snapshot: Mutex<Option<MiningSnapshot>>,
     orders: Mutex<Vec<JobOrder>>,
+    /// Scripted transaction-pool `submit_proof` entries (default empty).
+    pending_proofs: Mutex<Vec<PendingProof>>,
     /// Captured proofs from [`ChainClient::submit_proof`].
     pub submitted: Mutex<Vec<Proof>>,
-    /// Optional scripted submit result (default Success).
-    submit_result: Mutex<Result<SubmitAction, ChainError>>,
+    /// Optional scripted submit receipt (default `Success`, no chain detail).
+    submit_result: Mutex<Result<SubmitReceipt, ChainError>>,
     /// Scripted `latest_qblock_id` (default `None`).
     qblock_id: Mutex<Option<u64>>,
     /// Scripted `fetch_decay_params` (default `None`).
     decay_params: Mutex<Option<DecayParams>>,
+    /// Scripted free balance. Defaults to a funded account so existing feeder
+    /// tests keep mining without extra setup.
+    balance: Mutex<Result<u128, String>>,
+    /// Scripted sync status. Defaults to a caught-up validator.
+    sync: Mutex<Result<SyncStatus, String>>,
+    balance_calls: Mutex<usize>,
+    sync_calls: Mutex<usize>,
+    /// Captured `qblock_id` values from [`ChainClient::declare_participation`].
+    participations: Mutex<Vec<u64>>,
+    /// Scripted participate result (default `Declared`).
+    participation_result: Mutex<Result<ParticipationOutcome, ChainError>>,
+    /// Captured payloads from [`ChainClient::file_descriptor`].
+    descriptors: Mutex<Vec<NodeDescriptorV2Input>>,
+    /// Scripted descriptor result (default `Filed`).
+    descriptor_result: Mutex<Result<DescriptorOutcome, ChainError>>,
+    /// Scripted `QuantumPow.Miners` presence for the signing account.
+    registered: Mutex<bool>,
+    /// Scripted `register_miner` result (default `Registered`).
+    registration_result: Mutex<Result<RegistrationOutcome, ChainError>>,
+    /// Calls to [`ChainClient::ensure_miner_registered`], submitted or not.
+    registration_calls: Mutex<usize>,
+    /// Calls that reached the submit path (the account was not registered).
+    registration_submits: Mutex<usize>,
+    /// Accounts passed to [`BalanceSource::free_balance`], in call order.
+    balance_accounts: Mutex<Vec<[u8; 32]>>,
+    /// Scripted `QuantumPow.Miners[account]` value (default `None`).
+    miner_info: Mutex<Option<MinerInfo>>,
+    /// Captured proofs from [`ChainClient::submit_solution`].
+    pub solutions: Mutex<Vec<Proof>>,
+    /// Scripted `QuantumComputeMempool.Solvers` presence for the signing account.
+    solver_registered: Mutex<bool>,
+    /// Scripted `register_solver` result (default `Registered`).
+    solver_registration_result: Mutex<Result<RegistrationOutcome, ChainError>>,
+    /// Calls that reached the `register_solver` submit path.
+    solver_registration_submits: Mutex<usize>,
     /// Scripted `fetch_qblock_by_id` results, keyed by qblock id.
     qblocks: Mutex<HashMap<u64, QBlockRecord>>,
     /// Scripted `fetch_topology_meta` results, keyed by topology hash.
     topologies: Mutex<HashMap<[u8; 32], TopologyInputs>>,
     /// Scripted `fetch_registered_topologies` set, keyed by topology hash,
     /// carrying each topology's `registered_at` for era ordering.
-    registered: Mutex<HashMap<[u8; 32], (TopologyInputs, u32)>>,
+    registered_topologies: Mutex<HashMap<[u8; 32], (TopologyInputs, u32)>>,
 }
 
 impl FakeChain {
@@ -36,13 +76,38 @@ impl FakeChain {
         Self {
             snapshot: Mutex::new(Some(snapshot)),
             orders: Mutex::new(order.into_iter().collect()),
+            pending_proofs: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
-            submit_result: Mutex::new(Ok(SubmitAction::Success)),
+            submit_result: Mutex::new(Ok(SubmitReceipt::action_only(SubmitAction::Success))),
             qblock_id: Mutex::new(None),
             decay_params: Mutex::new(None),
+            balance: Mutex::new(Ok(u128::MAX)),
+            sync: Mutex::new(Ok(SyncStatus {
+                is_syncing: false,
+                peers: 0,
+                should_have_peers: false,
+                current_block: Some(1),
+                highest_block: Some(1),
+            })),
+            balance_calls: Mutex::new(0),
+            sync_calls: Mutex::new(0),
+            participations: Mutex::new(Vec::new()),
+            participation_result: Mutex::new(Ok(ParticipationOutcome::Declared)),
+            descriptors: Mutex::new(Vec::new()),
+            descriptor_result: Mutex::new(Ok(DescriptorOutcome::Filed)),
+            registered: Mutex::new(false),
+            registration_result: Mutex::new(Ok(RegistrationOutcome::Registered)),
+            registration_calls: Mutex::new(0),
+            registration_submits: Mutex::new(0),
+            balance_accounts: Mutex::new(Vec::new()),
+            miner_info: Mutex::new(None),
+            solutions: Mutex::new(Vec::new()),
+            solver_registered: Mutex::new(false),
+            solver_registration_result: Mutex::new(Ok(RegistrationOutcome::Registered)),
+            solver_registration_submits: Mutex::new(0),
             qblocks: Mutex::new(HashMap::new()),
             topologies: Mutex::new(HashMap::new()),
-            registered: Mutex::new(HashMap::new()),
+            registered_topologies: Mutex::new(HashMap::new()),
         }
     }
 
@@ -65,7 +130,7 @@ impl FakeChain {
         {
             let _ = self.topologies.lock().unwrap().insert(hash, inputs.clone());
             let _ = self
-                .registered
+                .registered_topologies
                 .lock()
                 .unwrap()
                 .insert(hash, (inputs, registered_at));
@@ -97,6 +162,50 @@ impl FakeChain {
         )]
         {
             let _ = self.topologies.lock().unwrap().insert(hash, inputs);
+        }
+    }
+
+    /// Script the next `ensure_solver_registered` submit result.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_solver_registration_result(&self, result: Result<RegistrationOutcome, ChainError>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.solver_registration_result.lock().unwrap() = result;
+        }
+    }
+
+    /// How many `register_solver` extrinsics the fake chain was asked to submit.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn solver_registration_submits(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.solver_registration_submits.lock().unwrap()
+        }
+    }
+
+    /// Drain and return captured `submit_solution` proofs.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn take_solutions(&self) -> Vec<Proof> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            std::mem::take(&mut *self.solutions.lock().unwrap())
         }
     }
 
@@ -156,6 +265,18 @@ impl FakeChain {
         }
     }
 
+    /// Replace the scripted pool contents.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test double; Mutex poison is a test failure"
+    )]
+    pub fn set_pending_proofs(&self, proofs: Vec<PendingProof>) {
+        *self.pending_proofs.lock().unwrap() = proofs;
+    }
+
     /// Number of proofs captured via `submit_proof`.
     ///
     /// # Panics
@@ -183,6 +304,264 @@ impl FakeChain {
         )]
         {
             std::mem::take(&mut *self.submitted.lock().unwrap())
+        }
+    }
+
+    /// Script the next `submit_proof` action. The receipt carries no chain
+    /// detail; use [`Self::set_submit_receipt`] when a test needs the hashes.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_submit_result(&self, action: Result<SubmitAction, ChainError>) {
+        let receipt = action.map(SubmitReceipt::action_only);
+        self.set_submit_receipt(receipt);
+    }
+
+    /// Script the next `submit_proof` receipt in full.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_submit_receipt(&self, receipt: Result<SubmitReceipt, ChainError>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.submit_result.lock().unwrap() = receipt;
+        }
+    }
+
+    /// Script the next `free_balance` return value.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_balance(&self, balance: Result<u128, String>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.balance.lock().unwrap() = balance;
+        }
+    }
+
+    /// Script the next `sync_status` return value.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_sync(&self, status: Result<SyncStatus, String>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.sync.lock().unwrap() = status;
+        }
+    }
+
+    /// How many times `free_balance` has been called.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn balance_calls(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.balance_calls.lock().unwrap()
+        }
+    }
+
+    /// How many times `sync_status` has been called.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn sync_calls(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.sync_calls.lock().unwrap()
+        }
+    }
+
+    /// Script the next `declare_participation` return value.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_participation_result(&self, result: Result<ParticipationOutcome, ChainError>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.participation_result.lock().unwrap() = result;
+        }
+    }
+
+    /// How many times `declare_participation` has been called.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn participation_calls(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.participations.lock().unwrap().len()
+        }
+    }
+
+    /// Drain and return captured participation qblock ids.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn take_participations(&self) -> Vec<u64> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            std::mem::take(&mut *self.participations.lock().unwrap())
+        }
+    }
+
+    /// Script the next `file_descriptor` return value.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_descriptor_result(&self, result: Result<DescriptorOutcome, ChainError>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.descriptor_result.lock().unwrap() = result;
+        }
+    }
+
+    /// How many times `file_descriptor` has been called.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn descriptor_calls(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.descriptors.lock().unwrap().len()
+        }
+    }
+
+    /// Script whether `QuantumPow.Miners` already holds the signing account.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_registered(&self, registered: bool) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.registered.lock().unwrap() = registered;
+        }
+    }
+
+    /// Script the next `ensure_miner_registered` submit result.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_registration_result(&self, result: Result<RegistrationOutcome, ChainError>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.registration_result.lock().unwrap() = result;
+        }
+    }
+
+    /// How many times `ensure_miner_registered` has been called.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn registration_calls(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.registration_calls.lock().unwrap()
+        }
+    }
+
+    /// How many `register_miner` extrinsics the fake chain was asked to submit.
+    /// An already-registered account submits none.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn registration_submits(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.registration_submits.lock().unwrap()
+        }
+    }
+
+    /// Drain and return the accounts passed to `free_balance`, in call order.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn take_balance_accounts(&self) -> Vec<[u8; 32]> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            std::mem::take(&mut *self.balance_accounts.lock().unwrap())
+        }
+    }
+
+    /// Drain and return captured descriptor payloads.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn take_descriptors(&self) -> Vec<NodeDescriptorV2Input> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            std::mem::take(&mut *self.descriptors.lock().unwrap())
+        }
+    }
+
+    /// Script the value `fetch_miner_info` returns.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_miner_info(&self, info: Option<MinerInfo>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.miner_info.lock().unwrap() = info;
         }
     }
 }
@@ -217,7 +596,17 @@ impl ChainClient for FakeChain {
         }
     }
 
-    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError> {
+    async fn fetch_pending_proofs(&self) -> Result<Vec<PendingProof>, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(self.pending_proofs.lock().unwrap().clone())
+        }
+    }
+
+    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError> {
         #[expect(
             clippy::unwrap_used,
             reason = "test double; Mutex poison is a test failure"
@@ -227,7 +616,103 @@ impl ChainClient for FakeChain {
             // Can't move out of Mutex guard for Result with ChainError (not Clone);
             // reconstruct Success/Retry/etc from a stored pattern.
             match &*self.submit_result.lock().unwrap() {
-                Ok(a) => Ok(*a),
+                Ok(r) => Ok(*r),
+                Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
+                Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
+                Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
+            }
+        }
+    }
+
+    async fn ensure_miner_registered(&self) -> Result<RegistrationOutcome, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.registration_calls.lock().unwrap() += 1;
+            // Mirrors the real client: read the map first, submit only when the
+            // account is absent.
+            if *self.registered.lock().unwrap() {
+                return Ok(RegistrationOutcome::AlreadyRegistered);
+            }
+            *self.registration_submits.lock().unwrap() += 1;
+            match &*self.registration_result.lock().unwrap() {
+                Ok(o) => {
+                    *self.registered.lock().unwrap() = true;
+                    Ok(*o)
+                }
+                Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
+                Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
+                Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
+            }
+        }
+    }
+
+    async fn ensure_solver_registered(&self) -> Result<RegistrationOutcome, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            if *self.solver_registered.lock().unwrap() {
+                return Ok(RegistrationOutcome::AlreadyRegistered);
+            }
+            *self.solver_registration_submits.lock().unwrap() += 1;
+            match &*self.solver_registration_result.lock().unwrap() {
+                Ok(o) => {
+                    *self.solver_registered.lock().unwrap() = true;
+                    Ok(*o)
+                }
+                Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
+                Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
+                Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
+            }
+        }
+    }
+
+    async fn submit_solution(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.solutions.lock().unwrap().push(proof.clone());
+            Ok(SubmitReceipt::action_only(SubmitAction::Success))
+        }
+    }
+
+    async fn file_descriptor(
+        &self,
+        descriptor: &NodeDescriptorV2Input,
+    ) -> Result<DescriptorOutcome, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.descriptors.lock().unwrap().push(descriptor.clone());
+            match &*self.descriptor_result.lock().unwrap() {
+                Ok(o) => Ok(*o),
+                Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
+                Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
+                Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
+            }
+        }
+    }
+
+    async fn declare_participation(
+        &self,
+        qblock_id: u64,
+    ) -> Result<ParticipationOutcome, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.participations.lock().unwrap().push(qblock_id);
+            match &*self.participation_result.lock().unwrap() {
+                Ok(o) => Ok(*o),
                 Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
                 Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
                 Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
@@ -255,6 +740,16 @@ impl ChainClient for FakeChain {
         )]
         {
             Ok(self.decay_params.lock().unwrap().clone())
+        }
+    }
+
+    async fn fetch_miner_info(&self, _account: [u8; 32]) -> Result<Option<MinerInfo>, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(*self.miner_info.lock().unwrap())
         }
     }
 
@@ -288,7 +783,7 @@ impl ChainClient for FakeChain {
         )]
         {
             Ok(self
-                .registered
+                .registered_topologies
                 .lock()
                 .unwrap()
                 .iter()
@@ -302,12 +797,46 @@ impl ChainClient for FakeChain {
     }
 }
 
+#[async_trait]
+impl BalanceSource for FakeChain {
+    async fn free_balance(&self, account: [u8; 32]) -> Result<u128, String> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.balance_calls.lock().unwrap() += 1;
+            self.balance_accounts.lock().unwrap().push(account);
+            self.balance.lock().unwrap().clone()
+        }
+    }
+}
+
+#[async_trait]
+impl SyncSource for FakeChain {
+    async fn sync_status(&self) -> Result<SyncStatus, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.sync_calls.lock().unwrap() += 1;
+            self.sync
+                .lock()
+                .unwrap()
+                .clone()
+                .map_err(ChainError::Unavailable)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn sample_snapshot() -> MiningSnapshot {
         MiningSnapshot {
+            head_hash: [0u8; 32],
             last_proof_block_hash: [0u8; 32],
             topology_hash: vec![9u8; 32],
             nodes: vec![0, 1],
@@ -319,6 +848,7 @@ mod tests {
             max_energy_milli: i64::MAX,
             min_diversity_milli: 0,
             block_number: 0,
+            spec_version: 117,
         }
     }
 

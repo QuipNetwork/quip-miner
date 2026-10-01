@@ -24,6 +24,8 @@ pub struct Topology {
     /// Allowed h-field values (milli), advertised so the miner can pick its
     /// adapt difficulty band.
     pub allowed_h: Vec<i32>,
+    /// Allowed J-coupling values (milli). A lease miner draws couplings from this set.
+    pub allowed_j: Vec<i32>,
 }
 
 impl Topology {
@@ -43,6 +45,7 @@ impl Topology {
             nodes,
             edges: (u, v),
             allowed_h: allowed_h.to_vec(),
+            allowed_j: allowed_j.to_vec(),
         }
     }
 
@@ -68,6 +71,7 @@ impl Topology {
                 v: self.edges.1.clone(),
             }),
             allowed_h_milli: self.allowed_h.clone(),
+            allowed_j_milli: self.allowed_j.clone(),
         }
     }
 }

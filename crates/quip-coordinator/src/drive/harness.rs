@@ -19,6 +19,7 @@ use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
     coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, Reject, Result as JobResult, Welcome,
 };
+use quip_protocol::session::PROTOCOL_VERSION;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -52,6 +53,11 @@ pub struct DriveManyParams<'a> {
     pub utilization: Option<u32>,
     /// Forwarded as `--yielding` to the spawned miner (GPU backends).
     pub yielding: bool,
+    /// Forwarded as `--log-level` so the miner's own subscriber matches the
+    /// verbosity the operator asked `drive` for. The miner inherits this
+    /// process's stderr, so without this its per-job lines stay at the miner
+    /// default no matter what `drive --log-level` says.
+    pub log_level: crate::logging::LogLevel,
 }
 
 /// Result of a drive-many run: per-job rows plus handshake/exit status.
@@ -81,6 +87,7 @@ fn failing_row(job_id: Vec<u8>, is_pow: bool, wall_ms: u64) -> JobRow {
         is_pow,
         n_solutions: 0,
         best_energy_milli: i64::MAX,
+        raw_best_energy_milli: i64::MAX,
         diversity_milli: 0,
         passed: false,
         device_access_time_us: 0,
@@ -88,6 +95,8 @@ fn failing_row(job_id: Vec<u8>, is_pow: bool, wall_ms: u64) -> JobRow {
         sweeps: 0,
         wall_ms,
         rejected: true,
+        salts_done: 0,
+        winners: 0,
     }
 }
 
@@ -99,6 +108,7 @@ fn job_is_pow(job: &Job) -> bool {
 struct RunState {
     rows: StdMutex<Vec<JobRow>>,
     dispatch_at: StdMutex<HashMap<Vec<u8>, Instant>>,
+    lease_winners: StdMutex<HashMap<Vec<u8>, u32>>,
     /// First job dispatch and last result — the real wall-clock span of the
     /// run. Throughput is `jobs / span`; summing per-job `wall_ms` would
     /// overcount the streaming backends' concurrent (overlapping) jobs.
@@ -111,6 +121,7 @@ impl RunState {
         Self {
             rows: StdMutex::new(Vec::new()),
             dispatch_at: StdMutex::new(HashMap::new()),
+            lease_winners: StdMutex::new(HashMap::new()),
             span: StdMutex::new((None, None)),
             total,
         }
@@ -224,6 +235,7 @@ async fn handshake(
     else {
         return None;
     };
+    let caps = hello.capabilities.clone().unwrap_or_default();
     {
         let st = state.lock().await;
         let expected = st
@@ -233,22 +245,18 @@ async fn handshake(
             .unwrap_or_default();
         // Mirror production `run_session`: an empty expected token must never
         // authenticate an empty-token miner.
-        if expected.is_empty() || hello.session_token != expected || hello.protocol_version != 1 {
+        if expected.is_empty()
+            || hello.session_token != expected
+            || hello.capabilities.is_none()
+            || caps.protocol_version != PROTOCOL_VERSION
+        {
             return None;
         }
     }
     let configure = {
         let mut st = state.lock().await;
-        st.router.register_miner(
-            miner_id.to_string(),
-            MinerCaps {
-                backend: hello.backend,
-                algorithm: hello.algorithm,
-                supported_kinds: hello.supported_kinds,
-                max_nodes: hello.max_nodes,
-                max_edges: hello.max_edges,
-            },
-        );
+        st.router
+            .register_miner(miner_id.to_string(), MinerCaps::from_capabilities(&caps));
         let staged = jobs.lock().await.drain(..).collect::<Vec<_>>();
         for j in staged {
             let _ = st.router.route(j);
@@ -269,7 +277,7 @@ async fn handshake(
     };
     let _ = tx
         .send(Ok(coord(coord_msg::Msg::Welcome(Welcome {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
         }))))
         .await;
     let _ = tx
@@ -370,6 +378,7 @@ async fn handle_result(
         is_pow,
         n_solutions,
         best_energy_milli: validated.best_energy_milli,
+        raw_best_energy_milli: validated.raw_best_energy_milli,
         diversity_milli: validated.diversity_milli,
         passed: validated.accepted,
         device_access_time_us: device_us,
@@ -377,6 +386,80 @@ async fn handle_result(
         sweeps,
         wall_ms,
         rejected: false,
+        salts_done: 1,
+        winners: u32::from(validated.accepted),
+    });
+}
+
+/// Verify a lease winner inline so its count is updated before the following
+/// `LeaseDone` on the same miner stream is handled.
+async fn handle_lease_result(
+    state: &Arc<Mutex<CoordinatorState>>,
+    result: &JobResult,
+    run: &RunState,
+) {
+    let (generator, view, target) = {
+        let st = state.lock().await;
+        let Some(job) = st.inflight.get(&result.job_id) else {
+            return;
+        };
+        let Some(generator) = job.generator.as_ref() else {
+            return;
+        };
+        let (Some(view), Some(target)) = (st.lease_topology.clone(), st.target) else {
+            return;
+        };
+        (generator.clone(), view, target)
+    };
+    let wire_target = quip_protocol::target::Target::from_proto(&target);
+    if quip_protocol::lease::verify_lease_result(&generator, &view, &wire_target, result).is_ok() {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "StdMutex poison only if a prior holder panicked"
+        )]
+        {
+            let mut winners = run.lease_winners.lock().unwrap();
+            let count = winners.entry(result.job_id.clone()).or_default();
+            *count += 1;
+        }
+    }
+}
+
+async fn handle_lease_done(
+    state: &Arc<Mutex<CoordinatorState>>,
+    done: quip_proto::v1::LeaseDone,
+    run: &RunState,
+) {
+    let is_lease = state.lock().await.inflight.remove(&done.job_id).is_some();
+    if !is_lease {
+        return;
+    }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "StdMutex poison only if a prior holder panicked"
+    )]
+    let winners = run
+        .lease_winners
+        .lock()
+        .unwrap()
+        .remove(&done.job_id)
+        .unwrap_or(0);
+    let wall_ms = run.wall_ms_since_dispatch(&done.job_id);
+    run.record(JobRow {
+        job_id: done.job_id,
+        is_pow: true,
+        n_solutions: 0,
+        best_energy_milli: done.best_energy_milli,
+        raw_best_energy_milli: done.best_energy_milli,
+        diversity_milli: 0,
+        passed: winners > 0,
+        device_access_time_us: 0,
+        wall_ms,
+        reads: 0,
+        sweeps: 0,
+        rejected: false,
+        salts_done: done.salts_done,
+        winners,
     });
 }
 
@@ -422,7 +505,7 @@ async fn handle_message(
         // miner sends JobRequest: quip-mock-miner only requests after
         // completing a job. This makes the pool exceed the miner's stated depth
         // by `queue_depth` — harmless now that neither side couples reads to
-        // writes, but see the note in MINER_PROTOCOL.md about making the miner
+        // writes, but see the note in quip-solver-core's SPEC.md about making the miner
         // the sole credit source once every backend sends an initial request.
         Some(miner_msg::Msg::Ready(_)) => grants.send(seed_credits).await.is_ok(),
         // Hand the grant to the dispatcher task rather than dispatching here:
@@ -431,6 +514,16 @@ async fn handle_message(
         // results that would free credits — the deadlock this split fixes.
         Some(miner_msg::Msg::JobRequest(req)) => grants.send(req.credits).await.is_ok(),
         Some(miner_msg::Msg::Result(result)) => {
+            let is_lease = {
+                let st = state.lock().await;
+                st.inflight
+                    .get(&result.job_id)
+                    .is_some_and(crate::lease::is_lease)
+            };
+            if is_lease {
+                handle_lease_result(state, &result, run).await;
+                return true;
+            }
             // Validate concurrently so the session task keeps draining the
             // stream and dispatching replacement jobs instead of blocking
             // ~300ms per result. The final row can land after the loop's own
@@ -445,6 +538,13 @@ async fn handle_message(
                     let _ = tx.send(Ok(shutdown_msg(500))).await;
                 }
             }));
+            true
+        }
+        Some(miner_msg::Msg::LeaseDone(done)) => {
+            handle_lease_done(state, done, run).await;
+            if run.is_complete() {
+                let _ = tx.send(Ok(shutdown_msg(500))).await;
+            }
             true
         }
         Some(miner_msg::Msg::Reject(rej)) => {
@@ -566,14 +666,19 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
 
     let socket_uri = format!("unix://{sock_path}");
     let mut cmd = Command::new(p.miner_bin);
+    // The session flags — including `--device` when the entry carries one —
+    // come from the supervised path's builder, so drive cannot drift from the
+    // argv a real run produces. Only the governor flags below are drive's own.
     let _ = cmd
-        .arg("--quip-coordinator")
-        .arg(&socket_uri)
-        .arg("--miner-id")
-        .arg(miner_id)
+        .args(crate::supervisor::child_args(
+            p.entry,
+            &socket_uri,
+            p.log_level,
+        ))
         .env("QUIP_SESSION_TOKEN", p.token);
     // Mechanism A: forward governor flags to the spawned miner's own CLI
-    // (cuda/metal). config.toml still overrides these via backend_toml.
+    // (cuda/metal). Drive has no `backend_toml` to carry them, which is why
+    // these are argv here and are not in the supervised path.
     if let Some(util) = p.utilization {
         let _ = cmd.arg("--utilization").arg(util.to_string());
     }

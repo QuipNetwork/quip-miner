@@ -1,12 +1,16 @@
 //! `quip-miner-exec`: a miner that shells out to a generic external solver.
 //!
 //! See [`quip_miner_exec`] for the solver contract. Handshake and session flow
-//! are handled by [`quip_miner_core::run`]; this binary only parses the
+//! are handled by [`quip_solver_core::run`]; this binary only parses the
 //! solver-specific flags and builds an [`ExecSampler`].
 
 use clap::Parser;
-use quip_miner_core::{adapt::AdaptBounds, run, BackendIdentity, CommonArgs, OpenError};
 use quip_miner_exec::ExecSampler;
+use quip_solver_core::{
+    adapt::AdaptBounds,
+    quip_proto::v1::{Algorithm, Backend},
+    run, BackendIdentity, CommonArgs, OpenError,
+};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -37,10 +41,11 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     run(
         BackendIdentity {
-            backend: "exec",
-            algorithm: "external",
+            backend: Backend::Exec,
+            algorithm: Algorithm::External,
             max_nodes: 100_000,
             max_edges: 1_000_000,
+            features: &[],
             // The external solver's real sampling envelope is unknown, so the
             // coordinator adapts against conservative CPU-SA-like bounds.
             adapt: AdaptBounds {

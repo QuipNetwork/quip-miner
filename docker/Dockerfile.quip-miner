@@ -2,41 +2,75 @@
 # Multi-arch (linux/amd64, linux/arm64) via buildx; TARGETARCH selects the
 # released CPU binaries. The coordinator is built from source; the CPU miner
 # binaries are downloaded from their release; the D-Wave miner is a Python
-# package (builds quip_proto from source until it is on PyPI).
+# package whose protocol dependency resolves as a prebuilt quip-solver-core
+# wheel from PyPI on both architectures (amd64 and aarch64 wheels since
+# quip-solver-core 0.0.1-rc1, pinned by quip-miner-dwave v0.3.2-rc1).
 
-# --- builder: quip-coordinator (Rust) + quip-dwave-qa venv (Python) ---
+# --- builder: D-Wave venv (Python) then quip-coordinator (Rust) ---
+# Python is independent of the Rust build. Keep it above cargo so a Rust
+# source or Cargo.toml change does not re-run the pip install.
 FROM python:3.12-bookworm AS builder
 
+# build-essential + rustup for the quip-coordinator cargo build below. The
+# D-Wave pip install needs neither (its protocol wheel comes from PyPI) and
+# protoc is gone with it. Unpinned; pin churn would change the image base.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        protobuf-compiler build-essential curl ca-certificates \
+        build-essential curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-WORKDIR /src
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY crates/ crates/
-COPY proto/ proto/
-RUN cargo build --release -p quip-coordinator
-
-# D-Wave miner into an isolated venv (pulls + builds quip_proto via maturin).
-ARG MINERS_TAG=v0.3.0
+# D-Wave miner into an isolated venv; its quip-solver-core dependency
+# resolves as a prebuilt wheel from PyPI on both architectures (no Rust, no
+# protoc). Only fetch-miners.sh is needed for the pin; the image and the
+# macOS bundle cannot drift to different dwave releases.
+COPY crates/quip-coordinator/tools/fetch-miners.sh /tmp/fetch-miners.sh
 RUN python -m venv /opt/venv \
+    && DWAVE_TAG="$(bash /tmp/fetch-miners.sh --print-tag dwave)" \
     && /opt/venv/bin/pip install --no-cache-dir \
-       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${MINERS_TAG}"
+       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${DWAVE_TAG}"
+
+WORKDIR /src
+
+# Cargo dependency cache: copy manifests, compile the dependency tree against
+# stub sources, then copy real sources and rebuild the binary. A source-only
+# change reuses the compiled external crates in target/.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/quip-miner-exec/Cargo.toml crates/quip-miner-exec/
+COPY crates/quip-coordinator/Cargo.toml crates/quip-coordinator/
+COPY crates/quip-mock-miner/Cargo.toml crates/quip-mock-miner/
+RUN set -eux; \
+    mkdir -p crates/quip-miner-exec/src; \
+    printf 'pub fn _docker_dep_stub() {}\n' > crates/quip-miner-exec/src/lib.rs; \
+    printf 'fn main() {}\n' > crates/quip-miner-exec/src/main.rs; \
+    mkdir -p crates/quip-coordinator/src; \
+    printf 'pub fn _docker_dep_stub() {}\n' > crates/quip-coordinator/src/lib.rs; \
+    printf 'fn main() {}\n' > crates/quip-coordinator/src/main.rs; \
+    mkdir -p crates/quip-mock-miner/src; \
+    printf 'fn main() {}\n' > crates/quip-mock-miner/src/main.rs; \
+    cargo build --release -p quip-coordinator
+
+# Real sources. Touch .rs files so cargo sees them as newer than the stub
+# build artifacts (host mtimes from git can be older than the stub RUN).
+# Only workspace crates recompile; external deps stay cached.
+COPY crates/ crates/
+RUN find crates -name '*.rs' -exec touch {} + \
+    && cargo build --release -p quip-coordinator
 
 # --- runtime ---
 FROM python:3.12-slim-bookworm
 
-LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
+LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-miner"
 LABEL description="quip-miner v0.3 — coordinator + CPU + D-Wave"
 
 ARG TARGETARCH
-ARG MINERS_TAG=v0.3.0
 ARG QUIP_DOCKER_IMAGE=""
 ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE} \
     PATH="/opt/venv/bin:/usr/local/bin:${PATH}"
 
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tini gosu curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -48,11 +82,24 @@ RUN groupadd --system --gid 1000 quip \
 COPY --from=builder /src/target/release/quip-coordinator /usr/local/bin/quip-coordinator
 COPY --from=builder /opt/venv /opt/venv
 
+# Rebuild the venv's bytecode, validated by source hash rather than mtime.
+# pip wrote .pyc files in the builder, but the COPY above crosses a stage
+# boundary and kaniko does not preserve the source mtimes those .pyc headers
+# recorded, so every cache arrives stale. The miner runs as `quip`, which
+# cannot rewrite root-owned site-packages, so each start recompiled the whole
+# dependency tree in memory and reprinted third-party SyntaxWarnings (homebase,
+# plucky, dwave.preprocessing) into the operator's log. `unchecked-hash` pins
+# validity to the hash taken here, which no later mtime rewrite disturbs.
+RUN python -m compileall -q -f --invalidation-mode unchecked-hash /opt/venv/lib >/dev/null
+
 # Released CPU miner binaries for this arch, via the shared fetch-miners.sh —
 # single source of truth (the native/host install runs the same script). The
 # script derives arch from `uname` (correct on the per-arch kaniko runners).
+# This pulls the production kernels (sa, gibbs, sb) plus every experimental
+# kernel the cpu release carries; experimental ones that are absent are skipped
+# rather than failing the build.
 COPY crates/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
-RUN TARGETARCH="${TARGETARCH}" MINERS_TAG="${MINERS_TAG}" MINER_SET=cpu \
+RUN TARGETARCH="${TARGETARCH}" MINER_SET=cpu \
     bash /usr/local/bin/fetch-miners.sh /usr/local/bin
 
 WORKDIR /app

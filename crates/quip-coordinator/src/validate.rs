@@ -3,14 +3,12 @@
 //! This is a *derivative* check, not the chain consensus path: the pallet does
 //! the authoritative byte-exact validation, so the coordinator is free to use
 //! an optimized representation as long as it reaches the same accept/reject
-//! decision. Energies are scored in place from wire spin bytes against a
-//! position-resolved graph ([`ResolvedTopo`]) — no per-solution decode and no
-//! node-id lookup. `quantum_validation::energy_of_solution` is retained only as
-//! a debug golden check.
+//! decision. Packed wire spins are decoded once, then scored against a
+//! position-resolved graph ([`ResolvedTopo`]) with no node-id lookup.
+//! `quantum_validation::energy_of_solution` is retained as a debug golden check.
 
 use quantum_validation::{calculate_diversity, select_diverse, MilliValue};
-use quip_proto::v1::{ising_problem, IsingProblem, QualityGates, Solution};
-use quip_protocol::wire::decode_i32_le;
+use quip_proto::v1::{ising_problem, IsingProblem, Solution};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
@@ -20,6 +18,35 @@ use std::collections::{HashMap, HashSet};
 /// extrinsic dispatches. The coordinator therefore submits only the
 /// diverse-selected subset, and the pallet re-selects within it.
 pub const MAX_PROOF_SOLUTIONS: usize = 32;
+
+/// One decoded solution: spins in node order and the energy this coordinator
+/// scored for them. The internal form of a proof row. Wire solutions are
+/// decoded once, when a result is validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpinRow {
+    /// `+1`/`-1` spins in topology node order.
+    pub spins: Vec<i8>,
+    /// Energy in milli-units.
+    pub energy_milli: i64,
+}
+
+/// [`MAX_PROOF_SOLUTIONS`] as the wire `SetTarget.max_proof_solutions` value.
+pub const MAX_PROOF_SOLUTIONS_WIRE: u32 = 32;
+const _: () = assert!(MAX_PROOF_SOLUTIONS == MAX_PROOF_SOLUTIONS_WIRE as usize);
+
+/// The difficulty gates a result set must clear, derived from the session's
+/// [`SetTarget`](quip_proto::v1::SetTarget) by [`gates_from_target`]. A local
+/// value type: the wire carries the gates only inside `SetTarget` (the old
+/// standalone `QualityGates` proto message is gone from the contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QualityGates {
+    /// Exclusive energy ceiling a row must beat (the chain's `max_energy_milli`).
+    pub min_energy_milli: i64,
+    /// Minimum diversity (milli) over the diverse-selected subset.
+    pub min_diversity_milli: u32,
+    /// Minimum count of unique energy-valid solutions.
+    pub min_solutions: u32,
+}
 
 /// Outcome of coordinator-side result revalidation for miner gating.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,16 +63,91 @@ pub struct Validated {
     /// (≤ [`MAX_PROOF_SOLUTIONS`]). Empty when no rows cleared the energy gate.
     /// Packed into the immediate-submit proof instead of the raw result rows so
     /// submissions stay within the pallet's bound.
-    pub selected_solutions: Vec<Solution>,
+    pub selected_solutions: Vec<SpinRow>,
     /// Minimum energy over *all* shape-valid rows, ignoring the current gate.
     /// Unlike `best_energy_milli` (which is `i64::MAX` when nothing clears the
     /// gate) this reflects the true best the miner found, so the decay-ratchet
     /// stash can project when the easing gate will admit it.
     pub raw_best_energy_milli: i64,
-    /// The lowest-energy deduped rows (≤ [`MAX_PROOF_SOLUTIONS`]) regardless of
-    /// the current gate — the candidates the stash retains for a future,
-    /// eased-threshold submission.
-    pub stash_solutions: Vec<Solution>,
+    /// The deduped rows (≤ [`MAX_PROOF_SOLUTIONS`]) the stash retains for a
+    /// future, eased-ceiling submission, chosen regardless of the current gate.
+    /// Ordered by ascending energy and pruned so that every prefix of them
+    /// still clears the chain's diversity gate.
+    pub stash_solutions: Vec<SpinRow>,
+}
+
+/// Outcome of replaying the chain's proof gates over an already-scored row set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofGates {
+    /// Lowest energy among the rows the ceiling admits, or `i64::MAX` if none.
+    pub best_energy_milli: i64,
+    /// Diversity (milli) of the diverse selection over the admitted rows.
+    pub diversity_milli: u32,
+    /// Count of rows the ceiling admits.
+    pub n_valid: u32,
+    /// Whether the admitted rows clear all three chain gates.
+    pub accepted: bool,
+}
+
+/// The chain's post-energy-filter procedure: select the most separated
+/// `min(rows.len(), min_solutions)` rows, then score that selection. Returns
+/// the selected indices into `rows` alongside the diversity in milli.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "indices come from select_diverse over the same slice"
+)]
+fn select_and_score(rows: &[&[i8]], min_solutions: u32) -> (Vec<usize>, u32) {
+    let target = rows.len().min(min_solutions.max(1) as usize);
+    let selected = select_diverse(rows, target).unwrap_or_else(|e| {
+        // Unreachable in principle (every byte was validated during scoring);
+        // log if the invariant ever breaks instead of silently accepting the
+        // full set.
+        tracing::warn!(error = ?e, "select_diverse failed on validated spins; selecting all");
+        (0..rows.len()).collect()
+    });
+    let picked: Vec<&[i8]> = selected.iter().map(|&i| rows[i]).collect();
+    let diversity = calculate_diversity(&picked).unwrap_or_else(|e| {
+        tracing::warn!(error = ?e, "calculate_diversity failed on validated spins; treating as 0");
+        0
+    });
+    (selected, diversity)
+}
+
+/// Replay the chain's proof gates over rows that already carry their scored
+/// energy, so a proof held in the stash can be re-checked against the
+/// difficulty live now rather than the one it was stashed under.
+///
+/// The energies are the ones this coordinator computed when the result was
+/// validated; the pallet recomputes them from the same problem and reaches the
+/// same values, so only the gate parameters have to be fresh. `gates`
+/// `min_energy_milli` carries the chain's `max_energy_milli` ceiling.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "n_valid is a solution count; the pallet bound is 32"
+)]
+pub fn check_proof_gates(solutions: &[SpinRow], gates: &QualityGates) -> ProofGates {
+    let admitted: Vec<&SpinRow> = solutions
+        .iter()
+        .filter(|s| s.energy_milli < gates.min_energy_milli)
+        .collect();
+    let Some(best_energy_milli) = admitted.iter().map(|s| s.energy_milli).min() else {
+        return ProofGates {
+            best_energy_milli: i64::MAX,
+            diversity_milli: 0,
+            n_valid: 0,
+            accepted: false,
+        };
+    };
+    let rows: Vec<&[i8]> = admitted.iter().map(|s| s.spins.as_slice()).collect();
+    let n_valid = rows.len() as u32;
+    let (_, diversity_milli) = select_and_score(&rows, gates.min_solutions);
+    ProofGates {
+        best_energy_milli,
+        diversity_milli,
+        n_valid,
+        accepted: n_valid >= gates.min_solutions && diversity_milli >= gates.min_diversity_milli,
+    }
 }
 
 /// Build validation gates from the session difficulty target (`SetTarget`), or
@@ -105,17 +207,6 @@ impl ResolvedTopo {
     }
 }
 
-/// Map one wire spin byte to its `±1` value. `0x01 -> +1`, `0xFF -> -1`; any
-/// other byte is invalid (mirrors `wire::decode_spins`).
-#[inline]
-fn byte_spin(b: u8) -> Option<i64> {
-    match b {
-        0x01 => Some(1),
-        0xFF => Some(-1),
-        _ => None,
-    }
-}
-
 /// Canonical form of a spin row for dedup: a solution `s` and its global flip
 /// `-s` map to one key by forcing the first spin to `+1`.
 ///
@@ -136,13 +227,11 @@ fn canonicalize_spins(spins: &[i8]) -> Vec<i8> {
     }
 }
 
-/// Energy of one solution read directly from its wire spin bytes against
-/// position-resolved edges. No per-solution allocation and no node lookup.
-/// Returns `None` on a wrong-length or invalid-byte solution (mirrors the
-/// consensus shape/spin checks). Golden-checked against
-/// `quantum_validation::energy_of_solution` in debug builds.
-fn energy_in_place(
-    spins: &[u8],
+/// Energy of one decoded row against position-resolved edges. `None` on a
+/// wrong-length row or an edge endpoint past the row, which mirrors the
+/// consensus shape check.
+fn energy_of_row(
+    spins: &[i8],
     h_milli: &[MilliValue],
     edges_pos: &[(u32, u32)],
     j_milli: &[MilliValue],
@@ -151,12 +240,12 @@ fn energy_in_place(
         return None;
     }
     let mut energy: i64 = 0;
-    for (&field, &sb) in h_milli.iter().zip(spins) {
-        energy += i64::from(field) * byte_spin(sb)?;
+    for (&field, &s) in h_milli.iter().zip(spins) {
+        energy += i64::from(field) * i64::from(s);
     }
     for (&(u, v), &coupling) in edges_pos.iter().zip(j_milli) {
-        let su = byte_spin(*spins.get(u as usize)?)?;
-        let sv = byte_spin(*spins.get(v as usize)?)?;
+        let su = i64::from(*spins.get(u as usize)?);
+        let sv = i64::from(*spins.get(v as usize)?);
         energy += i64::from(coupling) * su * sv;
     }
     Some(energy)
@@ -173,10 +262,6 @@ fn energy_in_place(
 /// jobs; inline `EdgeList` jobs carry their own (already position-indexed)
 /// edges.
 #[expect(
-    clippy::too_many_lines,
-    reason = "single validation pipeline: score, dedup, diversity, stash view"
-)]
-#[expect(
     clippy::indexing_slicing,
     reason = "indices drawn from enumerate/len of the same scored buffers"
 )]
@@ -190,22 +275,10 @@ pub fn validate_result(
     gates: &QualityGates,
     topo: &ResolvedTopo,
 ) -> Validated {
-    // The problem's h/j are coordinator-authored (encoded with `encode_i32_le`
-    // when the job was built). A decode failure here therefore means the
-    // coordinator's own encoding is corrupt — surface it and reject, rather
-    // than silently scoring against a truncated (empty) problem, which would
-    // drop coupling/field terms and yield a plausible-but-wrong accept/reject.
-    let (h_milli, j_milli) = match (
-        decode_i32_le(&problem.h_milli_le32),
-        decode_i32_le(&problem.j_milli_le32),
-    ) {
-        (Ok(h), Ok(j)) => (h, j),
-        (h, j) => {
-            tracing::error!(
-                h_err = ?h.err(),
-                j_err = ?j.err(),
-                "validate_result: malformed problem wire bytes (not i32-aligned); rejecting result"
-            );
+    let (h_milli, j_milli) = match crate::producer::problem::problem_milli(problem) {
+        Ok(coefficients) => coefficients,
+        Err(e) => {
+            tracing::error!(error = %e, "validate_result: malformed problem coefficients; rejecting result");
             return Validated {
                 best_energy_milli: i64::MAX,
                 diversity_milli: 0,
@@ -230,19 +303,19 @@ pub fn validate_result(
         None => &[],
     };
 
-    // Energy gate: score each solution straight from its wire bytes, in
-    // parallel. `filter_map` + `unzip` preserve order and drop invalid rows.
-    // Survivors keep a borrow of their spin bytes (no copy) for the diversity
-    // pass below.
-    let (byte_rows, energies): (Vec<&[u8]>, Vec<i64>) = solutions
+    // Decode and score each packed solution once. Invalid lengths and nonzero
+    // padding bits are rejected by the consensus decoder.
+    let n = h_milli.len();
+    let (rows, energies): (Vec<Vec<i8>>, Vec<i64>) = solutions
         .par_iter()
         .filter_map(|sol| {
-            let e = energy_in_place(&sol.spins_bytes, &h_milli, edges_pos, &j_milli)?;
-            Some((sol.spins_bytes.as_slice(), e))
+            let spins = quip_protocol::wire::decode_spins_packed(&sol.spins, n).ok()?;
+            let energy = energy_of_row(&spins, &h_milli, edges_pos, &j_milli)?;
+            Some((spins, energy))
         })
         .unzip();
 
-    debug_assert_energies_match(&byte_rows, &h_milli, edges_pos, &j_milli, &energies);
+    debug_assert_energies_match(&rows, &h_milli, edges_pos, &j_milli, &energies);
 
     let energy_valid_indices: Vec<usize> = energies
         .iter()
@@ -261,82 +334,50 @@ pub fn validate_result(
     let unique_valid_indices: Vec<usize> = energy_valid_indices
         .into_iter()
         .filter(|&i| {
-            let spins = bytemuck::cast_slice::<u8, i8>(byte_rows[i]);
+            let spins = rows[i].as_slice();
             seen_canonical.insert(canonicalize_spins(spins))
         })
         .collect();
     let n_valid = unique_valid_indices.len() as u32;
 
-    let (best_energy_milli, diversity_milli, selected_solutions) = if unique_valid_indices
-        .is_empty()
-    {
-        (i64::MAX, 0u32, Vec::new())
-    } else {
-        // Diversity reads the valid spin vectors as `&[i8]` reinterpreted from
-        // their wire bytes (0x01/0xFF -> +1/-1) — a zero-copy view, sound
-        // because every byte was validated during scoring.
-        let energy_valid: Vec<&[i8]> = unique_valid_indices
-            .iter()
-            .map(|&i| bytemuck::cast_slice::<u8, i8>(byte_rows[i]))
-            .collect();
-        let target = energy_valid.len().min(gates.min_solutions.max(1) as usize);
-        let selected = select_diverse(&energy_valid, target).unwrap_or_else(|e| {
-            // Unreachable in principle (every byte was validated during
-            // scoring); log if the invariant ever breaks instead of silently
-            // accepting the full set.
-            tracing::warn!(error = ?e, "select_diverse failed on validated spins; selecting all");
-            (0..energy_valid.len()).collect()
-        });
-        let selected_spins: Vec<&[i8]> = selected.iter().map(|&i| energy_valid[i]).collect();
-        let diversity = calculate_diversity(&selected_spins).unwrap_or_else(|e| {
-            tracing::warn!(error = ?e, "calculate_diversity failed on validated spins; treating as 0");
-            0
-        });
-        let best = selected
-            .iter()
-            .map(|&i| energies[unique_valid_indices[i]])
-            .min()
-            .unwrap_or(i64::MAX);
-        // Materialize the diverse subset (capped at the pallet bound) as the
-        // exact rows to submit, so proofs never exceed MAX_PROOF_SOLUTIONS.
-        let selected_solutions: Vec<Solution> = selected
-            .iter()
-            .take(MAX_PROOF_SOLUTIONS)
-            .map(|&i| {
-                let row = unique_valid_indices[i];
-                Solution {
-                    spins_bytes: byte_rows[row].to_vec(),
-                    energy_milli: energies[row],
-                }
-            })
-            .collect();
-        (best, diversity, selected_solutions)
-    };
+    let (best_energy_milli, diversity_milli, selected_solutions) =
+        if unique_valid_indices.is_empty() {
+            (i64::MAX, 0u32, Vec::new())
+        } else {
+            // Diversity reads decoded spin vectors in node order.
+            let energy_valid: Vec<&[i8]> = unique_valid_indices
+                .iter()
+                .map(|&i| rows[i].as_slice())
+                .collect();
+            let (selected, diversity) = select_and_score(&energy_valid, gates.min_solutions);
+            let best = selected
+                .iter()
+                .map(|&i| energies[unique_valid_indices[i]])
+                .min()
+                .unwrap_or(i64::MAX);
+            // Materialize the diverse subset (capped at the pallet bound) as the
+            // exact rows to submit, so proofs never exceed MAX_PROOF_SOLUTIONS.
+            let selected_solutions: Vec<SpinRow> = selected
+                .iter()
+                .take(MAX_PROOF_SOLUTIONS)
+                .map(|&i| {
+                    let row = unique_valid_indices[i];
+                    SpinRow {
+                        spins: rows[row].clone(),
+                        energy_milli: energies[row],
+                    }
+                })
+                .collect();
+            (best, diversity, selected_solutions)
+        };
 
     let accepted = n_valid >= gates.min_solutions && diversity_milli >= gates.min_diversity_milli;
 
     // Gate-agnostic view for the decay-ratchet stash: the true best energy the
-    // miner found and the lowest-energy deduped rows (capped at the pallet
-    // bound). These are what becomes viable as the difficulty eases, so they are
-    // chosen by energy rather than by the current (harder) gate.
+    // miner found, and the rows that stay submittable as the difficulty eases.
+    // Both ignore the current (harder) gate, which nothing here has to clear.
     let raw_best_energy_milli = energies.iter().copied().min().unwrap_or(i64::MAX);
-    let stash_solutions: Vec<Solution> = {
-        let mut idx: Vec<usize> = (0..byte_rows.len()).collect();
-        idx.sort_by_key(|&i| energies[i]);
-        let mut seen: HashSet<Vec<i8>> = HashSet::new();
-        idx.into_iter()
-            .filter(|&i| {
-                seen.insert(canonicalize_spins(bytemuck::cast_slice::<u8, i8>(
-                    byte_rows[i],
-                )))
-            })
-            .take(MAX_PROOF_SOLUTIONS)
-            .map(|i| Solution {
-                spins_bytes: byte_rows[i].to_vec(),
-                energy_milli: energies[i],
-            })
-            .collect()
-    };
+    let stash_solutions = stash_rows(&rows, &energies, gates);
 
     Validated {
         best_energy_milli,
@@ -347,6 +388,68 @@ pub fn validate_result(
         raw_best_energy_milli,
         stash_solutions,
     }
+}
+
+/// Unique candidate rows examined while filling the stash. Each candidate costs
+/// a diversity pass over the rows already held, so an unbounded scan of a large
+/// result would dominate validation; the chain accepts at most
+/// [`MAX_PROOF_SOLUTIONS`] rows in a proof regardless.
+const STASH_SCAN_LIMIT: usize = 4 * MAX_PROOF_SOLUTIONS;
+
+/// Pick the rows the decay-ratchet stash holds for a later, eased-ceiling
+/// submission.
+///
+/// The chain filters a submitted proof to `energy < max_energy_milli` at the
+/// inclusion block and scores diversity over only the survivors, so the subset
+/// it judges is always a lowest-energy prefix of what was submitted. Rows are
+/// therefore admitted in ascending energy order only while each resulting
+/// prefix still clears `min_diversity_milli` under the chain's own selection; a
+/// row sitting too close to one already held is skipped in favour of a more
+/// distant, higher-energy row. Taking the globally lowest energies instead
+/// packs the prefix with near-twins of the optimum and collapses its diversity.
+///
+/// The single best row is always kept, because the decay projection rides on
+/// it. Scoring it alone yields 0 diversity, but a one-row prefix can never
+/// reach the diversity gate anyway: the chain rejects a difficulty carrying
+/// `min_diversity_milli > 0` with `min_solutions < 2`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "indices drawn from enumerate/len of the same scored buffers"
+)]
+fn stash_rows(rows: &[Vec<i8>], energies: &[i64], gates: &QualityGates) -> Vec<SpinRow> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by_key(|&i| energies[i]);
+
+    let mut seen: HashSet<Vec<i8>> = HashSet::new();
+    let mut examined = 0usize;
+    let mut chosen: Vec<usize> = Vec::new();
+    for i in order {
+        if chosen.len() == MAX_PROOF_SOLUTIONS || examined == STASH_SCAN_LIMIT {
+            break;
+        }
+        let spins = rows[i].as_slice();
+        if !seen.insert(canonicalize_spins(spins)) {
+            continue;
+        }
+        examined += 1;
+        chosen.push(i);
+        if chosen.len() < 2 {
+            continue;
+        }
+        let prefix: Vec<&[i8]> = chosen.iter().map(|&k| rows[k].as_slice()).collect();
+        let (_, diversity) = select_and_score(&prefix, gates.min_solutions);
+        if diversity < gates.min_diversity_milli {
+            let _ = chosen.pop();
+        }
+    }
+
+    chosen
+        .into_iter()
+        .map(|i| SpinRow {
+            spins: rows[i].clone(),
+            energy_milli: energies[i],
+        })
+        .collect()
 }
 
 /// Strict less-than tie-break: first accepted holds on equal energy.
@@ -364,14 +467,13 @@ pub fn beats_current(candidate_milli: i64, current_best_milli: Option<i64>) -> b
 /// agree for both inline and topology-hash graphs.
 #[cfg(debug_assertions)]
 fn debug_assert_energies_match(
-    byte_rows: &[&[u8]],
+    rows: &[Vec<i8>],
     h_milli: &[MilliValue],
     edges_pos: &[(u32, u32)],
     j_milli: &[MilliValue],
     energies: &[i64],
 ) {
     use quantum_validation::energy_of_solution;
-    use quip_protocol::wire::decode_spins;
 
     // `energy_of_solution` resolves every edge endpoint by a linear scan of
     // `nodes` (`position_of_node`), so this golden re-check costs
@@ -380,7 +482,7 @@ fn debug_assert_energies_match(
     // graph is ~20 billion unoptimized ops per result, which stalls a debug
     // `drive` run indefinitely (quip-w5p.14). Skip it past a modest size; the
     // release path never runs it at all, and small-problem coverage still
-    // catches an `energy_in_place` divergence (the formula is size-invariant).
+    // catches an `energy_of_row` divergence (the formula is size-invariant).
     const MAX_GOLDEN_EDGE_NODE_PRODUCT: usize = 1_000_000;
     if edges_pos.len().saturating_mul(h_milli.len()) > MAX_GOLDEN_EDGE_NODE_PRODUCT {
         return;
@@ -389,19 +491,16 @@ fn debug_assert_energies_match(
     let nodes: Vec<u32> = (0..h_milli.len())
         .map(|i| u32::try_from(i).unwrap_or(u32::MAX))
         .collect();
-    for (bytes, &e) in byte_rows.iter().zip(energies) {
-        let Ok(spins) = decode_spins(bytes) else {
-            continue;
-        };
-        if let Ok(g) = energy_of_solution(&spins, h_milli, edges_pos, j_milli, &nodes) {
-            debug_assert_eq!(g, e, "energy_in_place {e} diverged from consensus {g}");
+    for (spins, &e) in rows.iter().zip(energies) {
+        if let Ok(g) = energy_of_solution(spins, h_milli, edges_pos, j_milli, &nodes) {
+            debug_assert_eq!(g, e, "energy_of_row {e} diverged from consensus {g}");
         }
     }
 }
 
 #[cfg(not(debug_assertions))]
 fn debug_assert_energies_match(
-    _byte_rows: &[&[u8]],
+    _rows: &[Vec<i8>],
     _h_milli: &[MilliValue],
     _edges_pos: &[(u32, u32)],
     _j_milli: &[MilliValue],
@@ -412,25 +511,80 @@ fn debug_assert_energies_match(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_protocol::wire::encode_i32_le;
-    use quip_protocol::wire::encode_spins;
+    use quip_protocol::wire::encode_spins_packed;
+
+    #[test]
+    fn packed_row_with_padding_bit_is_dropped() {
+        // Three nodes, one byte. Bit 3 is padding and is set.
+        let problem = crate::producer::problem::milli_problem(
+            Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                u: vec![0],
+                v: vec![1],
+            })),
+            &[0, 0, 0],
+            &[1000],
+        );
+        let bad = Solution {
+            spins: vec![0b0000_1111],
+            energy_milli: 0,
+        };
+        let gates = QualityGates {
+            min_energy_milli: i64::MAX,
+            min_diversity_milli: 0,
+            min_solutions: 1,
+        };
+        let v = validate_result(&problem, &[bad], &gates, &ResolvedTopo::default());
+        assert_eq!(v.n_valid, 0);
+        assert!(!v.accepted);
+    }
+
+    #[test]
+    fn packed_rows_score_like_the_consensus_energy() {
+        let problem = crate::producer::problem::milli_problem(
+            Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                u: vec![0],
+                v: vec![1],
+            })),
+            &[1000, -1000],
+            &[1500],
+        );
+        let spins = [1i8, -1];
+        let sol = Solution {
+            spins: encode_spins_packed(&spins),
+            energy_milli: 0,
+        };
+        let gates = QualityGates {
+            min_energy_milli: i64::MAX,
+            min_diversity_milli: 0,
+            min_solutions: 1,
+        };
+        let v = validate_result(&problem, &[sol], &gates, &ResolvedTopo::default());
+        let expected =
+            quip_protocol::scoring::energy_from_milli(&spins, &[1000, -1000], &[1500], &[(0, 1)]);
+        assert_eq!(v.best_energy_milli, expected);
+        assert_eq!(
+            v.selected_solutions.first().map(|row| row.spins.as_slice()),
+            Some(spins.as_slice())
+        );
+    }
 
     #[test]
     fn golden_energy_and_strict_tiebreak() {
         // E = 1*1 + (-0.5)*(-1) + 2.0*1*(-1) = 1 + 0.5 - 2 = -0.5 → -500 milli
-        let problem = IsingProblem {
-            graph: Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
-                u: vec![0],
-                v: vec![1],
-            })),
-            h_milli_le32: encode_i32_le(&[1000, -500]),
-            j_milli_le32: encode_i32_le(&[2000]),
-            num_reads: 1,
-            num_sweeps: 0,
-            anneal_time_us: 0,
+        let problem = {
+            let mut problem = crate::producer::problem::milli_problem(
+                Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                    u: vec![0],
+                    v: vec![1],
+                })),
+                &[1000, -500],
+                &[2000],
+            );
+            problem.num_reads = 1;
+            problem
         };
         let sol = Solution {
-            spins_bytes: encode_spins(&[1, -1]),
+            spins: encode_spins_packed(&[1, -1]),
             energy_milli: -500,
         };
         let gates = QualityGates {
@@ -456,19 +610,20 @@ mod tests {
         // raw best (-500) and the candidate rows survive so the decay-ratchet
         // stash can retain what will win once the gate eases. F1: the submit
         // subset is capped at MAX_PROOF_SOLUTIONS.
-        let problem = IsingProblem {
-            graph: Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
-                u: vec![0],
-                v: vec![1],
-            })),
-            h_milli_le32: encode_i32_le(&[1000, -500]),
-            j_milli_le32: encode_i32_le(&[2000]),
-            num_reads: 1,
-            num_sweeps: 0,
-            anneal_time_us: 0,
+        let problem = {
+            let mut problem = crate::producer::problem::milli_problem(
+                Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                    u: vec![0],
+                    v: vec![1],
+                })),
+                &[1000, -500],
+                &[2000],
+            );
+            problem.num_reads = 1;
+            problem
         };
         let sol = Solution {
-            spins_bytes: encode_spins(&[1, -1]),
+            spins: encode_spins_packed(&[1, -1]),
             energy_milli: -500,
         };
         let gates = QualityGates {
@@ -517,23 +672,24 @@ mod tests {
             }
             couplings.push(if edge_idx % 2 == 0 { 1000 } else { -1000 });
         }
-        let problem = IsingProblem {
-            graph: Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
-                u: edge_u,
-                v: edge_v,
-            })),
-            h_milli_le32: encode_i32_le(&fields),
-            j_milli_le32: encode_i32_le(&couplings),
-            num_reads: 0,
-            num_sweeps: 0,
-            anneal_time_us: 0,
+        let problem = {
+            let mut problem = crate::producer::problem::milli_problem(
+                Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                    u: edge_u,
+                    v: edge_v,
+                })),
+                &fields,
+                &couplings,
+            );
+            problem.num_reads = 0;
+            problem
         };
         let spins: Vec<i8> = (0..num_nodes)
             .map(|idx| if idx % 2 == 0 { 1 } else { -1 })
             .collect();
         let sols: Vec<Solution> = (0..4)
             .map(|_| Solution {
-                spins_bytes: encode_spins(&spins),
+                spins: encode_spins_packed(&spins),
                 energy_milli: 0,
             })
             .collect();
@@ -550,16 +706,13 @@ mod tests {
 
     #[test]
     fn rejects_when_below_min_solutions() {
-        let problem = IsingProblem {
-            graph: None,
-            h_milli_le32: encode_i32_le(&[1000]),
-            j_milli_le32: vec![],
-            num_reads: 1,
-            num_sweeps: 0,
-            anneal_time_us: 0,
+        let problem = {
+            let mut problem = crate::producer::problem::milli_problem(None, &[1000], &[]);
+            problem.num_reads = 1;
+            problem
         };
         let sol = Solution {
-            spins_bytes: encode_spins(&[1]),
+            spins: encode_spins_packed(&[1]),
             energy_milli: 1000,
         };
         let gates = QualityGates {
@@ -576,16 +729,17 @@ mod tests {
     fn topology_edges_use_node_ids_not_spin_indices() {
         // nodes [10, 20]; edge (10, 20); h/j aligned to node positions.
         // spins [1, -1] → E = 1000*1 + (-500)*(-1) + 2000*1*(-1) = -500
-        let problem = IsingProblem {
-            graph: Some(ising_problem::Graph::TopologyHash(vec![0u8; 32])),
-            h_milli_le32: encode_i32_le(&[1000, -500]),
-            j_milli_le32: encode_i32_le(&[2000]),
-            num_reads: 1,
-            num_sweeps: 0,
-            anneal_time_us: 0,
+        let problem = {
+            let mut problem = crate::producer::problem::milli_problem(
+                Some(ising_problem::Graph::TopologyHash(vec![0u8; 32])),
+                &[1000, -500],
+                &[2000],
+            );
+            problem.num_reads = 1;
+            problem
         };
         let sol = Solution {
-            spins_bytes: encode_spins(&[1, -1]),
+            spins: encode_spins_packed(&[1, -1]),
             energy_milli: -500,
         };
         let gates = QualityGates {
@@ -604,21 +758,18 @@ mod tests {
         // Two fully opposite solutions on 3 spins: hamming=3, symmetric=0
         // under flip → diversity 0. Two solutions that differ in 1 of 2:
         // dist=1, pairs=1, n=2 → round(1000*1/(1*2)) = 500.
-        let problem = IsingProblem {
-            graph: None,
-            h_milli_le32: encode_i32_le(&[0, 0]),
-            j_milli_le32: vec![],
-            num_reads: 2,
-            num_sweeps: 0,
-            anneal_time_us: 0,
+        let problem = {
+            let mut problem = crate::producer::problem::milli_problem(None, &[0, 0], &[]);
+            problem.num_reads = 2;
+            problem
         };
         let sols = [
             Solution {
-                spins_bytes: encode_spins(&[1, 1]),
+                spins: encode_spins_packed(&[1, 1]),
                 energy_milli: 0,
             },
             Solution {
-                spins_bytes: encode_spins(&[1, -1]),
+                spins: encode_spins_packed(&[1, -1]),
                 energy_milli: 0,
             },
         ];
@@ -635,21 +786,18 @@ mod tests {
 
     #[test]
     fn dedup_collapses_exact_duplicate_solutions() {
-        let problem = IsingProblem {
-            graph: None,
-            h_milli_le32: encode_i32_le(&[0, 0]),
-            j_milli_le32: vec![],
-            num_reads: 2,
-            num_sweeps: 0,
-            anneal_time_us: 0,
+        let problem = {
+            let mut problem = crate::producer::problem::milli_problem(None, &[0, 0], &[]);
+            problem.num_reads = 2;
+            problem
         };
         let sols = [
             Solution {
-                spins_bytes: encode_spins(&[1, -1]),
+                spins: encode_spins_packed(&[1, -1]),
                 energy_milli: 0,
             },
             Solution {
-                spins_bytes: encode_spins(&[1, -1]),
+                spins: encode_spins_packed(&[1, -1]),
                 energy_milli: 0,
             },
         ];
@@ -666,21 +814,18 @@ mod tests {
     fn dedup_collapses_z2_flip_twin_at_h_zero() {
         // h = 0: a solution and its global flip are energy-equal and are the
         // same physical state, so they must collapse to one.
-        let problem = IsingProblem {
-            graph: None,
-            h_milli_le32: encode_i32_le(&[0, 0, 0]),
-            j_milli_le32: vec![],
-            num_reads: 2,
-            num_sweeps: 0,
-            anneal_time_us: 0,
+        let problem = {
+            let mut problem = crate::producer::problem::milli_problem(None, &[0, 0, 0], &[]);
+            problem.num_reads = 2;
+            problem
         };
         let sols = [
             Solution {
-                spins_bytes: encode_spins(&[1, -1, 1]),
+                spins: encode_spins_packed(&[1, -1, 1]),
                 energy_milli: 0,
             },
             Solution {
-                spins_bytes: encode_spins(&[-1, 1, -1]),
+                spins: encode_spins_packed(&[-1, 1, -1]),
                 energy_milli: 0,
             },
         ];
@@ -693,23 +838,317 @@ mod tests {
         assert_eq!(v.n_valid, 1);
     }
 
+    fn wire_rows(rows: &[SpinRow]) -> Vec<Solution> {
+        rows.iter()
+            .map(|row| Solution {
+                spins: encode_spins_packed(&row.spins),
+                energy_milli: row.energy_milli,
+            })
+            .collect()
+    }
+
+    /// Spins that carry no field, so they set distance without moving energy.
+    const SHAPE_SPINS: usize = 32;
+    /// Spins carrying powers-of-two fields, which set a row's energy level.
+    const LEVEL_SPINS: u32 = 4;
+    /// Chain-static gates used by the clustered-optimum fixture below.
+    const FIXTURE_MIN_SOLUTIONS: u32 = 3;
+    const FIXTURE_MIN_DIVERSITY: u32 = 300;
+
+    fn level_fixture_problem() -> IsingProblem {
+        let mut h = vec![0i32; SHAPE_SPINS];
+        h.extend_from_slice(&[1000, 2000, 4000, 8000]);
+        {
+            let mut problem = crate::producer::problem::milli_problem(None, &h, &[]);
+            problem.num_reads = 0;
+            problem
+        }
+    }
+
+    /// Row `shape` of the order-32 Sylvester-Hadamard matrix, whose distinct
+    /// rows sit at symmetric Hamming distance 16 — the maximum for 32 spins.
+    /// `flips` negates that many leading spins, which parks a row next to its
+    /// base instead. The trailing level spins give the row energy
+    /// `15000 - 2000 * level`.
+    fn level_row(shape: usize, flips: usize, level: u32) -> SpinRow {
+        let mut spins: Vec<i8> = (0..SHAPE_SPINS)
+            .map(|col| {
+                if (shape & col).count_ones().is_multiple_of(2) {
+                    1
+                } else {
+                    -1
+                }
+            })
+            .collect();
+        for s in spins.iter_mut().take(flips) {
+            *s = -*s;
+        }
+        for bit in 0..LEVEL_SPINS {
+            spins.push(if (level >> bit) & 1 == 1 { -1 } else { 1 });
+        }
+        SpinRow {
+            spins,
+            energy_milli: 15_000 - 2_000 * i64::from(level),
+        }
+    }
+
+    /// Four near-identical rows holding the four lowest energies, with five
+    /// mutually distant rows above them. This is the shape that made the chain
+    /// reject a proof the coordinator had cleared locally: the whole set is
+    /// diverse, every low-energy prefix of it is not.
+    fn clustered_optimum_rows() -> Vec<SpinRow> {
+        vec![
+            level_row(0, 0, 15),
+            level_row(0, 1, 14),
+            level_row(0, 2, 13),
+            level_row(0, 3, 12),
+            level_row(1, 0, 5),
+            level_row(2, 0, 4),
+            level_row(4, 0, 3),
+            level_row(8, 0, 2),
+            level_row(16, 0, 1),
+        ]
+    }
+
+    /// The chain's own procedure written out against the consensus primitives:
+    /// keep the rows under `ceiling`, select `min(count, min_solutions)` of them
+    /// by maximum separation, then score that selection. Returns
+    /// `(valid_solution_count, diversity_milli)` — the two values the pallet
+    /// gates on. This is the oracle the coordinator's row choice must satisfy.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "indices come from select_diverse over the same slice"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "fixture row counts are single digits"
+    )]
+    fn pallet_gates(rows: &[SpinRow], ceiling: i64, min_solutions: u32) -> (u32, u32) {
+        let valid: Vec<&[i8]> = rows
+            .iter()
+            .filter(|s| s.energy_milli < ceiling)
+            .map(|s| s.spins.as_slice())
+            .collect();
+        if valid.is_empty() {
+            return (0, 0);
+        }
+        let target = valid.len().min(min_solutions.max(1) as usize);
+        let selected = select_diverse(&valid, target).expect("fixture spins are valid");
+        let picked: Vec<&[i8]> = selected.iter().map(|&i| valid[i]).collect();
+        let diversity = calculate_diversity(&picked).expect("fixture spins are valid");
+        (valid.len() as u32, diversity)
+    }
+
+    /// Every ceiling that admits a different subset of `rows`: one just below
+    /// and one just above each row energy.
+    fn ceiling_sweep(rows: &[SpinRow]) -> Vec<i64> {
+        let mut ceilings: Vec<i64> = rows
+            .iter()
+            .flat_map(|s| [s.energy_milli, s.energy_milli + 1])
+            .collect();
+        ceilings.sort_unstable();
+        ceilings.dedup();
+        ceilings
+    }
+
+    /// The gates the fixture rows are stashed under: a ceiling far below every
+    /// row, so nothing is submittable yet and the whole result goes to the
+    /// decay-ratchet stash.
+    fn fixture_gates() -> QualityGates {
+        QualityGates {
+            min_energy_milli: -100_000,
+            min_diversity_milli: FIXTURE_MIN_DIVERSITY,
+            min_solutions: FIXTURE_MIN_SOLUTIONS,
+        }
+    }
+
+    #[test]
+    fn stashed_rows_keep_every_low_energy_prefix_diverse() {
+        let problem = level_fixture_problem();
+        let rows = clustered_optimum_rows();
+        let gates = fixture_gates();
+
+        // The failure shape: sorting purely by energy puts the four clustered
+        // rows first, so a ceiling admitting only those collapses diversity
+        // even though the full set scores well above the gate.
+        let mut energy_sorted = rows.clone();
+        energy_sorted.sort_by_key(|s| s.energy_milli);
+        let (all_valid, all_diversity) =
+            pallet_gates(&energy_sorted, i64::MAX, gates.min_solutions);
+        assert_eq!(all_valid, 9);
+        assert!(
+            all_diversity >= gates.min_diversity_milli,
+            "fixture must clear the gate over the whole set, scored {all_diversity}"
+        );
+        let energy_sorted_failures: Vec<(i64, u32)> = ceiling_sweep(&energy_sorted)
+            .into_iter()
+            .filter_map(|ceiling| {
+                let (n_valid, diversity) =
+                    pallet_gates(&energy_sorted, ceiling, gates.min_solutions);
+                (n_valid >= gates.min_solutions && diversity < gates.min_diversity_milli)
+                    .then_some((ceiling, diversity))
+            })
+            .collect();
+        assert!(
+            !energy_sorted_failures.is_empty(),
+            "fixture must reproduce the rejection: pure energy order should fail some ceiling"
+        );
+
+        // The stash rows must clear the same sweep at every ceiling that admits
+        // enough rows to reach the diversity gate at all.
+        let v = validate_result(
+            &problem,
+            &wire_rows(&rows),
+            &gates,
+            &ResolvedTopo::default(),
+        );
+        assert!(!v.accepted, "fixture stashes rather than submits");
+        for ceiling in ceiling_sweep(&v.stash_solutions) {
+            let (n_valid, diversity) =
+                pallet_gates(&v.stash_solutions, ceiling, gates.min_solutions);
+            if n_valid >= gates.min_solutions {
+                assert!(
+                    diversity >= gates.min_diversity_milli,
+                    "ceiling {ceiling} admits {n_valid} stashed rows scoring {diversity}, \
+                     below the {} gate",
+                    gates.min_diversity_milli
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stash_keeps_the_best_row_and_drops_only_its_near_twins() {
+        let problem = level_fixture_problem();
+        let rows = clustered_optimum_rows();
+        let v = validate_result(
+            &problem,
+            &wire_rows(&rows),
+            &fixture_gates(),
+            &ResolvedTopo::default(),
+        );
+
+        assert_eq!(v.raw_best_energy_milli, -15_000);
+        assert_eq!(
+            v.stash_solutions.first().map(|s| s.energy_milli),
+            Some(-15_000),
+            "the decay projection rides on the best row, which must always be stashed"
+        );
+        // The three near-twins of the best row are the only rows dropped.
+        let kept: Vec<i64> = v.stash_solutions.iter().map(|s| s.energy_milli).collect();
+        assert_eq!(kept, vec![-15_000, 5_000, 7_000, 9_000, 11_000, 13_000]);
+    }
+
+    #[test]
+    fn stash_falls_back_to_energy_order_when_no_diversity_is_demanded() {
+        let problem = level_fixture_problem();
+        let rows = clustered_optimum_rows();
+        let gates = QualityGates {
+            min_energy_milli: -100_000,
+            min_diversity_milli: 0,
+            min_solutions: FIXTURE_MIN_SOLUTIONS,
+        };
+        let v = validate_result(
+            &problem,
+            &wire_rows(&rows),
+            &gates,
+            &ResolvedTopo::default(),
+        );
+        let kept: Vec<i64> = v.stash_solutions.iter().map(|s| s.energy_milli).collect();
+        assert_eq!(
+            kept,
+            vec![-15_000, -13_000, -11_000, -9_000, 5_000, 7_000, 9_000, 11_000, 13_000],
+            "with no diversity gate every deduped row is worth holding"
+        );
+    }
+
+    #[test]
+    fn proof_gate_check_tracks_the_live_ceiling() {
+        let problem = level_fixture_problem();
+        let rows = clustered_optimum_rows();
+        let stashed = validate_result(
+            &problem,
+            &wire_rows(&rows),
+            &fixture_gates(),
+            &ResolvedTopo::default(),
+        )
+        .stash_solutions;
+
+        // Too early: the ceiling admits only the best row, short of the
+        // solution count the chain demands.
+        let early = check_proof_gates(
+            &stashed,
+            &QualityGates {
+                min_energy_milli: 0,
+                min_diversity_milli: FIXTURE_MIN_DIVERSITY,
+                min_solutions: FIXTURE_MIN_SOLUTIONS,
+            },
+        );
+        assert_eq!(early.n_valid, 1);
+        assert!(!early.accepted);
+
+        // Eased far enough to admit the whole stash: every gate clears.
+        let ready = check_proof_gates(
+            &stashed,
+            &QualityGates {
+                min_energy_milli: 20_000,
+                min_diversity_milli: FIXTURE_MIN_DIVERSITY,
+                min_solutions: FIXTURE_MIN_SOLUTIONS,
+            },
+        );
+        assert_eq!(ready.n_valid, 6);
+        assert_eq!(ready.best_energy_milli, -15_000);
+        assert!(ready.accepted);
+
+        // The check must agree with the chain's own procedure at every ceiling.
+        for ceiling in ceiling_sweep(&stashed) {
+            let gates = QualityGates {
+                min_energy_milli: ceiling,
+                min_diversity_milli: FIXTURE_MIN_DIVERSITY,
+                min_solutions: FIXTURE_MIN_SOLUTIONS,
+            };
+            let (n_valid, diversity) = pallet_gates(&stashed, ceiling, gates.min_solutions);
+            let got = check_proof_gates(&stashed, &gates);
+            assert_eq!(got.n_valid, n_valid, "ceiling {ceiling}");
+            assert_eq!(got.diversity_milli, diversity, "ceiling {ceiling}");
+        }
+    }
+
+    #[test]
+    fn proof_gate_check_rejects_a_diversity_collapse() {
+        // The rows a pure energy sort would have stashed, re-checked at the
+        // ceiling that admits exactly the clustered prefix: the count gate
+        // clears and the diversity gate does not — the chain's
+        // `InsufficientDiversity` rejection.
+        let mut energy_sorted = clustered_optimum_rows();
+        energy_sorted.sort_by_key(|s| s.energy_milli);
+        let got = check_proof_gates(
+            &energy_sorted,
+            &QualityGates {
+                min_energy_milli: -8_000,
+                min_diversity_milli: FIXTURE_MIN_DIVERSITY,
+                min_solutions: FIXTURE_MIN_SOLUTIONS,
+            },
+        );
+        assert_eq!(got.n_valid, 4);
+        assert!(got.diversity_milli < FIXTURE_MIN_DIVERSITY);
+        assert!(!got.accepted);
+    }
+
     #[test]
     fn dedup_does_not_collapse_genuinely_distinct_solutions() {
-        let problem = IsingProblem {
-            graph: None,
-            h_milli_le32: encode_i32_le(&[0, 0]),
-            j_milli_le32: vec![],
-            num_reads: 2,
-            num_sweeps: 0,
-            anneal_time_us: 0,
+        let problem = {
+            let mut problem = crate::producer::problem::milli_problem(None, &[0, 0], &[]);
+            problem.num_reads = 2;
+            problem
         };
         let sols = [
             Solution {
-                spins_bytes: encode_spins(&[1, 1]),
+                spins: encode_spins_packed(&[1, 1]),
                 energy_milli: 0,
             },
             Solution {
-                spins_bytes: encode_spins(&[1, -1]),
+                spins: encode_spins_packed(&[1, -1]),
                 energy_milli: 0,
             },
         ];

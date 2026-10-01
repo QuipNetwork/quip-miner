@@ -1,11 +1,11 @@
 //! Capability index, per-miner staged queue, credit accounting, cancel, reject.
 
-use quip_proto::v1::ising_problem;
-use quip_proto::v1::{Job, RejectReason};
+use quip_proto::v1::{ising_problem, Capabilities, Job, JobKind, RejectReason};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 /// Capability envelope advertised in `Hello`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MinerCaps {
     /// Backend name (e.g. `"cpu"`, `"cuda"`).
     pub backend: String,
@@ -17,6 +17,39 @@ pub struct MinerCaps {
     pub max_nodes: u32,
     /// Maximum edges; `0` means unlimited.
     pub max_edges: u32,
+    /// Problem generators this miner runs for `ISING_GENERATE` leases.
+    pub generators: Vec<i32>,
+    /// Problems the miner keeps in flight. `0` means unknown until the device opens.
+    pub stream_width: u32,
+}
+
+impl MinerCaps {
+    /// Whether this miner takes `ISING_GENERATE` leases with the generator
+    /// this coordinator issues. The upgrade guide sends leases only to a peer
+    /// that advertises both.
+    #[must_use]
+    pub fn accepts_leases(&self) -> bool {
+        self.supported_kinds
+            .contains(&(JobKind::IsingGenerate as i32))
+            && self
+                .generators
+                .contains(&(quip_proto::v1::GeneratorAlgorithm::Blake3Chacha8V1 as i32))
+    }
+
+    /// Index a v2 `Capabilities` message.
+    #[must_use]
+    pub fn from_capabilities(c: &Capabilities) -> Self {
+        use quip_protocol::session::{algorithm_name, backend_name};
+        Self {
+            backend: backend_name(c.backend()).to_owned(),
+            algorithm: algorithm_name(c.algorithm()).to_owned(),
+            supported_kinds: c.supported_kinds.clone(),
+            max_nodes: c.max_nodes,
+            max_edges: c.max_edges,
+            generators: c.generators.clone(),
+            stream_width: c.stream_width,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -35,7 +68,29 @@ struct MinerQueue {
     /// The feeder reads-and-resets this each poll to size the adaptive staging
     /// window from the miner's observed drain rate (see `feeder_loop`).
     consumed_since_poll: u32,
+    /// Lease salts the miner finished since the last `take_lease_salts`. The feeder turns this into a salts-per-second rate for lease sizing.
+    salts_since_poll: u64,
+    /// Jobs this miner finished (Result or Reject) since it registered.
+    /// The heartbeat reads this total. Polls do not reset it.
+    completed: u64,
     unsupported_kinds: HashSet<i32>,
+}
+
+/// How often one miner's dropped-job total may reach the log at `warn`.
+///
+/// A miner that rejects everything it is offered (a QPU with an exhausted
+/// budget, say) drops one job per dispatch, and at credit speed that is
+/// thousands of lines a second. The count is what an operator needs, not the
+/// individual jobs.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Dropped-job accounting for one miner, for the rate-limited warn.
+#[derive(Debug)]
+struct DropLog {
+    /// Jobs dropped since the last line reached the log.
+    since_warn: u64,
+    /// When that line was emitted.
+    last_warn: Instant,
 }
 
 /// Routes jobs to miners by capability, stages them, and gates dispatch on credits.
@@ -44,6 +99,8 @@ pub struct Router {
     miners: HashMap<String, MinerQueue>,
     /// Jobs that could not be routed (no capable miner).
     pub unroutable: Vec<Job>,
+    /// Per-miner drop counters behind [`DROP_WARN_INTERVAL`].
+    drops: HashMap<String, DropLog>,
 }
 
 impl Router {
@@ -65,6 +122,7 @@ impl Router {
                 q.caps = caps;
                 q.granted_credits = 0;
                 q.consumed_since_poll = 0;
+                q.salts_since_poll = 0;
                 q.unsupported_kinds.clear();
             }
             None => {
@@ -75,6 +133,8 @@ impl Router {
                         staged: VecDeque::new(),
                         granted_credits: 0,
                         consumed_since_poll: 0,
+                        salts_since_poll: 0,
+                        completed: 0,
                         unsupported_kinds: HashSet::new(),
                     },
                 );
@@ -122,6 +182,20 @@ impl Router {
         }
     }
 
+    /// Add salts a miner reported finished in a `LeaseDone`.
+    pub fn record_lease_salts(&mut self, miner_id: &str, salts: u64) {
+        if let Some(q) = self.miners.get_mut(miner_id) {
+            q.salts_since_poll = q.salts_since_poll.saturating_add(salts);
+        }
+    }
+
+    /// Read and reset the finished-salt count since the last call.
+    pub fn take_lease_salts(&mut self, miner_id: &str) -> u64 {
+        self.miners
+            .get_mut(miner_id)
+            .map_or(0, |q| std::mem::take(&mut q.salts_since_poll))
+    }
+
     /// Pop the next staged job, spending one credit. Returns `None` when the
     /// miner has no credits left or nothing is staged.
     pub fn next_job(&mut self, miner_id: &str) -> Option<Job> {
@@ -143,6 +217,22 @@ impl Router {
             .map_or(0, |q| std::mem::take(&mut q.consumed_since_poll))
     }
 
+    /// Record that `miner_id` finished a job (Result or Reject).
+    pub fn record_completion(&mut self, miner_id: &str) {
+        if let Some(q) = self.miners.get_mut(miner_id) {
+            q.completed = q.completed.saturating_add(1);
+        }
+    }
+
+    /// Jobs `miner_id` has finished since it registered. 0 if unknown.
+    ///
+    /// The heartbeat prints this total and the delta since the last
+    /// heartbeat. Feeder polls do not reset it.
+    #[must_use]
+    pub fn jobs_completed(&self, miner_id: &str) -> u64 {
+        self.miners.get(miner_id).map_or(0, |q| q.completed)
+    }
+
     /// Handle a miner reject: mark unsupported kinds, re-route to a *different*
     /// capable miner.
     ///
@@ -158,21 +248,67 @@ impl Router {
             }
         }
         if self.route_excluding(job, Some(miner_id)).is_none() {
-            tracing::warn!(
+            tracing::debug!(
                 miner = %miner_id,
                 reason,
                 "rejected job has no alternative capable miner; dropping"
             );
+            self.note_drop(miner_id, reason);
+        }
+    }
+
+    /// Count one dropped job, and let the total through at `warn` no more than
+    /// once per [`DROP_WARN_INTERVAL`] per miner.
+    ///
+    /// The first drop after a quiet period reports immediately, so a one-off
+    /// still surfaces; a flood collapses into one line carrying the count.
+    fn note_drop(&mut self, miner_id: &str, reason: i32) {
+        let now = Instant::now();
+        match self.drops.get_mut(miner_id) {
+            Some(log) if now.duration_since(log.last_warn) < DROP_WARN_INTERVAL => {
+                log.since_warn += 1;
+            }
+            Some(log) => {
+                tracing::warn!(
+                    miner = %miner_id,
+                    reason,
+                    dropped = log.since_warn + 1,
+                    window_s = DROP_WARN_INTERVAL.as_secs(),
+                    "rejected jobs have no alternative capable miner; dropping"
+                );
+                log.since_warn = 0;
+                log.last_warn = now;
+            }
+            None => {
+                tracing::warn!(
+                    miner = %miner_id,
+                    reason,
+                    dropped = 1,
+                    "rejected job has no alternative capable miner; dropping"
+                );
+                let _ = self.drops.insert(
+                    miner_id.to_string(),
+                    DropLog {
+                        since_warn: 0,
+                        last_warn: now,
+                    },
+                );
+            }
         }
     }
 
     /// Drop staged `PoW` jobs where `0 < generation <= max_generation`.
-    /// Mempool jobs (`generation == 0`) are preserved.
-    pub fn cancel(&mut self, max_generation: u64) {
+    /// Mempool jobs (`generation == 0`) are preserved. Returns how many jobs
+    /// were dropped.
+    pub fn cancel(&mut self, max_generation: u64) -> usize {
+        let mut dropped = 0;
         for q in self.miners.values_mut() {
+            let before = q.staged.len();
             q.staged
                 .retain(|j| j.generation == 0 || j.generation > max_generation);
+            dropped += before.saturating_sub(q.staged.len());
         }
+        dropped
     }
 
     /// Return all outstanding + staged jobs for a miner (e.g. on crash re-queue).
@@ -229,6 +365,9 @@ fn capable(q: &MinerQueue, kind: i32, n_nodes: u32, n_edges: u32) -> bool {
     if !q.caps.supported_kinds.is_empty() && !q.caps.supported_kinds.contains(&kind) {
         return false;
     }
+    if kind == JobKind::IsingGenerate as i32 && !q.caps.accepts_leases() {
+        return false;
+    }
     // max_nodes/max_edges of 0 means unlimited (Hello default when unset).
     if q.caps.max_nodes > 0 && n_nodes > q.caps.max_nodes {
         return false;
@@ -248,7 +387,8 @@ fn job_node_count(job: &Job) -> u32 {
         return 0;
     };
     // h field length / 4 = node count
-    (ising.h_milli_le32.len() / 4) as u32
+    // Coordinator-authored problems are always `I32`, four bytes per element.
+    (ising.h.len() / 4) as u32
 }
 
 #[expect(
@@ -261,14 +401,14 @@ fn job_edge_count(job: &Job) -> u32 {
     };
     match &ising.graph {
         Some(ising_problem::Graph::Edges(e)) => e.u.len() as u32,
-        _ => (ising.j_milli_le32.len() / 4) as u32,
+        _ => (ising.j.len() / 4) as u32,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_proto::v1::{IsingProblem, JobKind, Provenance};
+    use quip_proto::v1::{JobKind, Provenance};
 
     fn caps_ising() -> MinerCaps {
         MinerCaps {
@@ -277,23 +417,78 @@ mod tests {
             supported_kinds: vec![JobKind::IsingSample as i32],
             max_nodes: 1000,
             max_edges: 10000,
+            ..MinerCaps::default()
         }
+    }
+
+    fn caps_lease() -> MinerCaps {
+        MinerCaps {
+            supported_kinds: vec![JobKind::IsingSample as i32, JobKind::IsingGenerate as i32],
+            generators: vec![quip_proto::v1::GeneratorAlgorithm::Blake3Chacha8V1 as i32],
+            stream_width: 4,
+            ..caps_ising()
+        }
+    }
+
+    fn lease_job(start: u64) -> Job {
+        let snap = crate::chain::snapshot::MiningSnapshot {
+            head_hash: [0; 32],
+            last_proof_block_hash: [7; 32],
+            topology_hash: vec![9; 32],
+            nodes: vec![0, 1],
+            edges: vec![(0, 1)],
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![1000],
+            allowed_spin_milli: vec![-1000, 1000],
+            min_solutions: 1,
+            max_energy_milli: 0,
+            min_diversity_milli: 0,
+            block_number: 1,
+            spec_version: 117,
+        };
+        crate::lease::build_lease_job(&snap, [0; 32], start, 4, 1)
+    }
+
+    #[test]
+    fn lease_routes_only_to_a_miner_with_the_generator() {
+        let mut r = Router::new();
+        r.register_miner("plain", caps_ising());
+        assert_eq!(r.route(lease_job(1)), None);
+        r.register_miner("lease", caps_lease());
+        assert_eq!(r.route(lease_job(1)).as_deref(), Some("lease"));
+    }
+
+    #[test]
+    fn kind_without_generator_does_not_accept_leases() {
+        let caps = MinerCaps {
+            generators: vec![],
+            ..caps_lease()
+        };
+        assert!(!caps.accepts_leases());
+        assert!(caps_lease().accepts_leases());
+    }
+
+    #[test]
+    fn lease_salts_read_and_reset() {
+        let mut r = Router::new();
+        r.register_miner("lease", caps_lease());
+        r.record_lease_salts("lease", 7);
+        r.record_lease_salts("lease", 3);
+        assert_eq!(r.take_lease_salts("lease"), 10);
+        assert_eq!(r.take_lease_salts("lease"), 0);
+        assert_eq!(r.take_lease_salts("unknown"), 0);
     }
 
     fn make_job(generation: u64, kind: JobKind) -> Job {
         Job {
             job_id: format!("g{generation}").into_bytes(),
+            generator: None,
             kind: kind as i32,
             generation,
             deadline_ms: 9_999_999,
-            ising: Some(IsingProblem {
-                graph: None,
-                h_milli_le32: vec![0; 8], // 2 nodes
-                j_milli_le32: vec![0; 4], // 1 edge
-                num_reads: 0,
-                num_sweeps: 0,
-                anneal_time_us: 0,
-            }),
+            ising: Some(crate::producer::problem::milli_problem(
+                None, &[0; 2], &[0; 1],
+            )),
             provenance: Some(Provenance {
                 is_pow: generation != 0,
                 order_id: vec![],
@@ -350,6 +545,31 @@ mod tests {
         assert_eq!(r.take_consumed("unknown"), 0); // unknown miner
     }
 
+    /// The heartbeat must report completions, not the per-poll dispatch
+    /// counter. Stage 8, dispatch 8, complete 3, then drain the poll
+    /// counter twice. The reported number is 3, not 8 and not 0.
+    #[test]
+    fn heartbeat_reports_completions_not_poll_dispatches() {
+        let mut r = Router::new();
+        r.register_miner("cpu-0", caps_ising());
+        for generation in 1..=8 {
+            let _ = r.route(make_job(generation, JobKind::IsingSample));
+        }
+        r.grant_credits("cpu-0", 8);
+        for _ in 0..8 {
+            assert!(r.next_job("cpu-0").is_some());
+        }
+        for _ in 0..3 {
+            r.record_completion("cpu-0");
+        }
+        // A feeder poll reads and resets the dispatch counter. The
+        // heartbeat used to print whatever that single poll held.
+        assert_eq!(r.take_consumed("cpu-0"), 8);
+        assert_eq!(r.take_consumed("cpu-0"), 0);
+        assert_eq!(r.jobs_completed("cpu-0"), 3);
+        assert_eq!(r.jobs_completed("unknown"), 0);
+    }
+
     #[test]
     fn cancel_drops_pow_keeps_mempool_and_newer() {
         let mut r = Router::new();
@@ -358,7 +578,7 @@ mod tests {
         let _ = r.route(make_job(3, JobKind::IsingSample));
         let _ = r.route(make_job(5, JobKind::IsingSample));
         let _ = r.route(make_job(6, JobKind::IsingSample));
-        r.cancel(5);
+        assert_eq!(r.cancel(5), 2);
         // keep gen 0 and gen 6
         assert_eq!(r.staged_len("cpu-0"), 2);
         let mut gens: Vec<u64> = Vec::new();
@@ -405,6 +625,7 @@ mod tests {
                 supported_kinds: vec![JobKind::IsingSample as i32],
                 max_nodes: 1000,
                 max_edges: 10000,
+                ..MinerCaps::default()
             },
         );
         let job = make_job(1, JobKind::IsingSample);
@@ -419,6 +640,40 @@ mod tests {
         let _ = r.route(make_job(2, JobKind::IsingSample));
         assert_eq!(r.staged_len("cpu-0"), 0);
         assert_eq!(r.staged_len("cpu-1"), 2);
+    }
+
+    /// A miner that rejects everything (an exhausted QPU budget) drops one job
+    /// per dispatch. Those drops must collapse into one line per window, or the
+    /// session log is unreadable for as long as the condition lasts.
+    #[test]
+    fn repeated_drops_collapse_into_one_warn_window() {
+        let mut r = Router::new();
+        r.register_miner("qpu-0", caps_ising());
+        for g in 1..=50 {
+            let job = make_job(g, JobKind::IsingSample);
+            let _ = r.route(job);
+            r.grant_credits("qpu-0", 1);
+            let dispatched = r.next_job("qpu-0").expect("dispatched");
+            r.on_reject("qpu-0", dispatched, RejectReason::Overloaded as i32);
+        }
+        let log = r.drops.get("qpu-0").expect("drop log");
+        // The first drop reports at once and resets the counter; the other 49
+        // are counted for the next line instead of being logged one by one.
+        assert_eq!(log.since_warn, 49);
+    }
+
+    /// A one-off drop still reaches the log immediately: rate limiting must not
+    /// swallow the first occurrence.
+    #[test]
+    fn first_drop_opens_a_window_immediately() {
+        let mut r = Router::new();
+        r.register_miner("qpu-0", caps_ising());
+        let job = make_job(1, JobKind::IsingSample);
+        let _ = r.route(job);
+        r.grant_credits("qpu-0", 1);
+        let dispatched = r.next_job("qpu-0").expect("dispatched");
+        r.on_reject("qpu-0", dispatched, RejectReason::Overloaded as i32);
+        assert_eq!(r.drops.get("qpu-0").expect("drop log").since_warn, 0);
     }
 
     #[test]

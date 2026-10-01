@@ -1,22 +1,53 @@
 //! Chain access behind `ChainClient`. Real impl talks Substrate JSON-RPC;
 //! tests use `FakeChain`.
 
+pub mod account;
+pub mod dryrun;
 pub mod extrinsic;
 pub mod fake;
 pub mod mempool;
+pub mod orders;
+pub mod outcome;
+pub mod pool;
+pub mod preflight;
 pub mod proof_encode;
 pub mod qblock;
 pub mod real;
 pub mod scale_types;
+pub mod seed;
 pub mod snapshot;
 pub mod submit;
+pub mod sync;
+pub mod transport;
+pub mod transport_jsonrpsee;
+pub mod watch;
 
+pub use account::{free_from_account_bytes, system_account_storage_key};
+pub use dryrun::{decode_dispatch_error, describe_module_error, ModuleError};
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
+pub use orders::{job_orders_prefix, order_id_from_key};
+pub use outcome::{SubmitLedger, QBLOCK_RETENTION};
+pub use pool::{decode_pending_proof, PendingProof};
 pub use qblock::{QBlockRecord, RegisteredTopology, TopologyInputs};
 pub use real::RealChainClient;
-pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
-pub use submit::{classify_receipt, Proof, SubmitAction};
+pub use scale_types::{
+    MinerInfoScale, MinerKind, MinerSpecScale, NodeDescriptorV2Input, NodeLogLevel, SolverType,
+    MAX_ORDER_SOLUTIONS,
+};
+pub use seed::{
+    encode_register_topology, encode_set_difficulty, seed_chain, SeedParams, SeedReport,
+    SeedTopology, DEFAULT_SEED_DIFFICULTY,
+};
+pub use snapshot::{head_state_key, round_root, DecayParams, MiningSnapshot};
+pub use submit::{
+    classify_descriptor, classify_participation, classify_receipt, classify_registration,
+    DescriptorOutcome, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
+    SubmitReceipt,
+};
+pub use transport::{BoxStream, RpcTransport};
+pub use transport_jsonrpsee::JsonrpseeTransport;
+pub use watch::{parse_tx_status, TxStatus};
 
 use async_trait::async_trait;
 
@@ -43,6 +74,24 @@ impl std::fmt::Display for ChainError {
 
 impl std::error::Error for ChainError {}
 
+/// `QuantumPow.Miners[account]`, widened for the dashboard wire shape.
+///
+/// The pallet stores `registered_at` and both proof counts as `u32`. They widen
+/// to `u64` here so the dashboard serializer has one integer type to guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinerInfo {
+    /// Block the account registered at.
+    pub registered_at: u64,
+    /// Reserved miner deposit, in plancks.
+    pub deposit: u128,
+    /// Lifetime accepted proofs. Also the `pow_sequence` a submission reports.
+    pub proofs_submitted: u64,
+    /// Lifetime winning proofs.
+    pub proofs_won: u64,
+    /// Lifetime rewards, in plancks.
+    pub rewards_earned: u128,
+}
+
 /// Async chain seam: snapshot fetch, mempool orders, extrinsic submit.
 #[async_trait]
 pub trait ChainClient: Send + Sync {
@@ -60,13 +109,58 @@ pub trait ChainClient: Send + Sync {
         miner_account: [u8; 32],
     ) -> Result<Vec<JobOrder>, ChainError>;
 
+    /// Every `QuantumPow.submit_proof` waiting in the connected node's
+    /// transaction pool. Other pool entries are skipped.
+    async fn fetch_pending_proofs(&self) -> Result<Vec<PendingProof>, ChainError>;
+
     /// Hybrid-sign and submit a proof extrinsic; classify the receipt.
-    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError>;
+    async fn submit_proof(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError>;
+
+    /// Register the signing account with `QuantumPow.register_miner`, unless
+    /// `QuantumPow.Miners` already holds it.
+    ///
+    /// The signing account pays the call and has the miner deposit reserved
+    /// from it. Until this succeeds, every `submit_proof` fails with
+    /// `MinerNotRegistered`.
+    async fn ensure_miner_registered(&self) -> Result<RegistrationOutcome, ChainError>;
+
+    /// Register the signing account with `QuantumComputeMempool.register_solver`,
+    /// unless `Solvers` already holds it with the configured type.
+    ///
+    /// A registration under a different type is deregistered first, because
+    /// `register_solver` cannot overwrite one. Until this succeeds, every
+    /// `submit_solution` fails with `SolverNotRegistered`.
+    async fn ensure_solver_registered(&self) -> Result<RegistrationOutcome, ChainError>;
+
+    /// Hybrid-sign and submit `QuantumComputeMempool.submit_solution` for the
+    /// order named by `proof.order_id` (8 bytes, little-endian).
+    ///
+    /// `proof.solutions` must already respect the pallet bound
+    /// ([`MAX_ORDER_SOLUTIONS`] rows).
+    async fn submit_solution(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError>;
+
+    /// Hybrid-sign and submit `MinerRegistry.set_descriptor`.
+    async fn file_descriptor(
+        &self,
+        descriptor: &NodeDescriptorV2Input,
+    ) -> Result<DescriptorOutcome, ChainError>;
+
+    /// Hybrid-sign and submit `MinerRegistry.participate` for `qblock_id`.
+    async fn declare_participation(
+        &self,
+        qblock_id: u64,
+    ) -> Result<ParticipationOutcome, ChainError>;
 
     /// Current quantum-block id (`QuantumPowApi_latest_qblock_id`). `None` when
     /// the chain hasn't started a round or doesn't expose one; used to key the
     /// per-qblock mining-attempt logs.
     async fn fetch_latest_qblock_id(&self) -> Result<Option<u64>, ChainError>;
+
+    /// Read `QuantumPow.Miners[account]` at the current head.
+    ///
+    /// `None` means the account is not registered, which is a normal state and
+    /// not an error. The dashboard serves `miner_info: null` for it.
+    async fn fetch_miner_info(&self, account: [u8; 32]) -> Result<Option<MinerInfo>, ChainError>;
 
     /// Fetch decay-projection inputs for `topology_hash`: base (un-decayed)
     /// difficulty, last-proof block, epoch length, and the curve c-triple — so

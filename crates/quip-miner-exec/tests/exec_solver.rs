@@ -2,9 +2,8 @@
 //! fake solvers are `sh` one-liners.
 #![cfg(unix)]
 
-use quip_miner_core::{IsingGraph, SampleParams, Sampler};
 use quip_miner_exec::ExecSampler;
-use quip_proto::v1::RejectReason;
+use quip_solver_core::{IsingGraph, SampleError, SampleParams, Sampler};
 
 /// A 2-node problem, so valid solutions have `spins.len() == 2`.
 fn graph() -> IsingGraph {
@@ -48,29 +47,41 @@ fn stdin_mode_delivers_model_on_stdin() {
 }
 
 #[test]
-fn nonzero_exit_rejects_malformed() {
+fn nonzero_exit_is_a_device_fault() {
     let sampler = ExecSampler::new("sh -c 'exit 1' _ {model}", 5_000, false).expect("valid cmd");
-    assert_eq!(
-        sampler.sample(&graph(), &SampleParams::default()),
-        Err(RejectReason::Malformed)
-    );
+    match sampler.sample(&graph(), &SampleParams::default()) {
+        Err(SampleError::DeviceFault(detail)) => assert!(detail.contains("exited")),
+        other => panic!("expected DeviceFault, got {other:?}"),
+    }
 }
 
 #[test]
-fn timeout_rejects_overloaded() {
+fn timeout_is_device_busy() {
     let sampler = ExecSampler::new("sh -c 'sleep 10' _ {model}", 150, false).expect("valid cmd");
     assert_eq!(
         sampler.sample(&graph(), &SampleParams::default()),
-        Err(RejectReason::Overloaded)
+        Err(SampleError::DeviceBusy)
     );
 }
 
 #[test]
-fn missing_solver_binary_rejects_overloaded() {
+fn signal_killed_solver_is_device_busy() {
+    // The shell kills itself with SIGKILL — indistinguishable from an external
+    // OOM kill. A transient host condition must not end the session.
     let sampler =
-        ExecSampler::new("quip-no-such-solver-xyz {model}", 5_000, false).expect("valid cmd");
+        ExecSampler::new("sh -c 'kill -9 $$' _ {model}", 5_000, false).expect("valid cmd");
     assert_eq!(
         sampler.sample(&graph(), &SampleParams::default()),
-        Err(RejectReason::Overloaded)
+        Err(SampleError::DeviceBusy)
     );
+}
+
+#[test]
+fn missing_solver_binary_is_a_device_fault() {
+    let sampler =
+        ExecSampler::new("quip-no-such-solver-xyz {model}", 5_000, false).expect("valid cmd");
+    match sampler.sample(&graph(), &SampleParams::default()) {
+        Err(SampleError::DeviceFault(detail)) => assert!(detail.contains("spawn")),
+        other => panic!("expected DeviceFault, got {other:?}"),
+    }
 }

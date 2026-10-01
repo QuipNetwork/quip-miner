@@ -22,8 +22,7 @@
 
 use quip_coordinator::config::LaunchEntry;
 use quip_coordinator::drive::{DriveManyParams, JobRow};
-use quip_proto::v1::{ising_problem, Configure, EdgeList, IsingProblem, Job, JobKind};
-use quip_protocol::wire::encode_i32_le;
+use quip_proto::v1::{ising_problem, Configure, EdgeList, Job, JobKind};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Sibling `quip-mock-miner` binary (not same package → no `CARGO_BIN_EXE_*`).
@@ -53,26 +52,30 @@ fn now_ms() -> u64 {
 /// buffers absorb the burst and the deadlock does not appear.
 fn ring_jobs(count: usize, nodes: usize) -> Vec<Job> {
     let deadline = now_ms() + 3_600_000;
-    let h: Vec<i32> = (0..nodes).map(|i| if i % 2 == 0 { 1000 } else { -1000 }).collect();
+    let h: Vec<i32> = (0..nodes)
+        .map(|i| if i % 2 == 0 { 1000 } else { -1000 })
+        .collect();
     let u: Vec<u32> = (0..nodes as u32).collect();
     let v: Vec<u32> = (0..nodes as u32).map(|i| (i + 1) % nodes as u32).collect();
     let j: Vec<i32> = vec![500; nodes];
     (0..count)
         .map(|n| Job {
             job_id: format!("job-{n}").into_bytes(),
+            generator: None,
             kind: JobKind::IsingSample as i32,
             generation: 0,
             deadline_ms: deadline,
-            ising: Some(IsingProblem {
-                graph: Some(ising_problem::Graph::Edges(EdgeList {
-                    u: u.clone(),
-                    v: v.clone(),
-                })),
-                h_milli_le32: encode_i32_le(&h),
-                j_milli_le32: encode_i32_le(&j),
-                num_reads: 1,
-                num_sweeps: 1,
-                anneal_time_us: 0,
+            ising: Some({
+                let mut problem = quip_coordinator::producer::problem::milli_problem(
+                    Some(ising_problem::Graph::Edges(EdgeList {
+                        u: u.clone(),
+                        v: v.clone(),
+                    })),
+                    &h,
+                    &j,
+                );
+                problem.num_reads = 1;
+                problem
             }),
             provenance: None,
         })
@@ -88,6 +91,8 @@ async fn deep_credit_pool_does_not_deadlock_the_session() {
     let entry = LaunchEntry {
         miner_id: "cpu-0".into(),
         binary: miner.clone(),
+        backend: "cpu".into(),
+        device: None,
         configure: Configure {
             // The lever: `seed_credits` is `queue_depth`, so this grants the
             // whole pool up front and the coordinator dispatches every staged
@@ -113,6 +118,7 @@ async fn deep_credit_pool_does_not_deadlock_the_session() {
         jobs,
         utilization: None,
         yielding: false,
+        log_level: quip_coordinator::logging::LogLevel::Info,
     });
 
     // A generous bound: the mock miner answers instantly, so this only fires if

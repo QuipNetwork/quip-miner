@@ -293,6 +293,7 @@ mod tests {
 
         // A bucket whose topology matches the snapshot the drive harness will pass.
         let snap = MiningSnapshot {
+            head_hash: [0u8; 32],
             last_proof_block_hash: [0u8; 32],
             topology_hash: vec![9u8; 32],
             nodes: vec![0, 1, 2, 3],
@@ -304,6 +305,7 @@ mod tests {
             max_energy_milli: i64::MAX,
             min_diversity_milli: 0,
             block_number: 0,
+            spec_version: 117,
         };
         let hash_hex = hex_plain(&[9u8; 32]);
         // Two instances with real 64-char nonces.

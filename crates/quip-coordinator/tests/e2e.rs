@@ -61,6 +61,7 @@ fn loose_snapshot() -> MiningSnapshot {
     let hash =
         quip_coordinator::topology::topology_hash_sets(&nodes, &edges, &h, &j, &spin).to_vec();
     MiningSnapshot {
+        head_hash: [0u8; 32],
         last_proof_block_hash: [7u8; 32],
         topology_hash: hash,
         nodes,
@@ -72,6 +73,7 @@ fn loose_snapshot() -> MiningSnapshot {
         max_energy_milli: i64::MAX / 2, // energy ceiling (strict <)
         min_diversity_milli: 0,
         block_number: 42,
+        spec_version: 117,
     }
 }
 
@@ -102,6 +104,8 @@ async fn e2e_mock_miner_pow_submit_via_fake_chain() {
     let entry = LaunchEntry {
         miner_id: "cpu-0".into(),
         binary: miner.clone(),
+        backend: "cpu".into(),
+        device: None,
         configure: Configure {
             queue_depth: 3,
             idle_timeout_s: 30,
@@ -147,6 +151,8 @@ fn config_maps_mock_miner_launch() {
 [miner]
 validators = ["ws://127.0.0.1:9944"]
 signer_key = "//Alice"
+public_host = "203.0.113.10"
+public_port = 20050
 
 [cpu]
 binary = "quip-mock-miner"
