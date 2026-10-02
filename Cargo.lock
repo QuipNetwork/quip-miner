@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "quip-coordinator"
-version = "0.3.5-rc10"
+version = "0.3.5-rc11"
 dependencies = [
  "async-trait",
  "axum 0.8.9",

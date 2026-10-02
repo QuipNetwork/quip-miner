@@ -499,17 +499,23 @@ The feeder stages `ISING_GENERATE` jobs only for miners that advertise the
 BLAKE3/ChaCha8 generator. D-Wave does not advertise that generator and keeps
 receiving plain jobs.
 
-The coordinator sizes each lease from a smoothed salts-per-second rate.
-`LEASE_TARGET_SECS` sets the four-second target. The floor is one pipeline fill
-based on `stream_width`. `LEASE_MAX_SALTS` caps a lease at 2²⁰ salts. Before the
-feeder has a usable rate, it stages four pipeline fills. `LEASE_STAGE_DEPTH`
-sets the two-lease staging limit per miner.
+The coordinator sizes each lease from each miner's salts-per-second rate.
+`LEASE_TARGET_SECS` sets the 60-second target. A lease completes only when its
+slowest salt does, so a long lease keeps the miner busy through that tail.
+`SaltRate` averages completed salts over elapsed time. `LEASE_RATE_WINDOW_SECS`
+sets its window to 300 seconds. A miner's clock starts at its first lease. The
+floor is one pipeline fill based on `stream_width`. `LEASE_MAX_SALTS` caps a
+lease at 2²⁰ salts. Before a miner's first lease completes, the feeder assumes
+75 salts per second for each pipeline slot. `LEASE_STAGE_DEPTH` sets the
+two-lease staging limit per miner.
 
 A lease miner on quip-solver-core 0.0.2 sends a `Result` for each salt it
 reports, with every read and no target filter. The coordinator first checks
 that the `Result` is authentic: `verify_lease_result` with a permissive target
 redraws the problem and rescores every read. The coordinator drops a forged or
-corrupt `Result`. An authentic one counts as round participation. The coordinator then
+corrupt `Result`. It also drops a `Result` with no solutions, and that
+`Result` does not count as participation. An authentic one counts as round
+participation. The coordinator then
 selects the proof set against the live target with the same gates as a plain
 result. It submits a `Result` that clears the target and offers one that misses
 to the win-time stash. `LeaseDone` completes the lease. If `salts_done` is greater
