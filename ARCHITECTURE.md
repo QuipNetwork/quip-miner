@@ -26,7 +26,7 @@ import higher ones.
 | `quip-coordinator` | The `quip-coordinator` binary: chain access, feeder, router, supervisor | `quip-proto`, `quip-protocol` |
 | `quip-mock-miner` | Miner test double | `quip-proto`, `quip-protocol` |
 
-Three dependencies come from crates.io at v0.0.2-rc3, published from the
+Three dependencies come from crates.io at v0.0.2, published from the
 quip-solver-core repository: `quip-proto` (generated protocol types and gRPC
 service), `quip-protocol` (consensus primitives: `wire`, `session`, `scoring`,
 `derive`, `chacha8`), and `quip-solver-core` (the `Sampler` trait, session
@@ -151,12 +151,16 @@ A proof-of-work job flows through the system in one pass:
 
 For a miner that advertises the BLAKE3/ChaCha8 generator, the feeder stages
 `ISING_GENERATE` leases instead of plain proof-of-work jobs. Each lease names a
-range of salts. The miner draws, samples, and scores one problem per salt, then
-returns only winners. The coordinator checks every winner with
-`quip_protocol::lease::verify_lease_result`. Each winner that passes verification
-uses the same proof submission path as a plain result. `LeaseDone` completes
-the lease after its result messages arrive. A completed lease with positive
-`salts_done` counts as round participation.
+range of salts. The miner draws, samples, and scores one problem per salt. It
+sends a `Result` for each salt it reports, carrying every read, unfiltered by
+target. `lease::verify_and_select` checks each `Result` in two steps. First,
+`quip_protocol::lease::verify_lease_result` with a permissive target redraws the
+problem and rescores every read. Second, the gates and selection that plain
+results use pick the proof set against the live target. An authentic `Result`
+counts as round participation. It then uses the same submit and stash path as a
+plain result. `LeaseDone` completes the lease after its result messages arrive.
+A completed lease with positive `salts_done` also counts as round
+participation.
 
 Jobs carry a `job_id`, a `generation`, an optional `deadline_ms`, an optional
 `generator`, an optional Ising problem, and a `provenance` field. A plain Ising

@@ -12,7 +12,7 @@ Both shapes are specified and documented in the
 [quip-solver-core](https://gitlab.com/quip.network/quip-solver-core)
 repository: `SPEC.md` is the contract, the crate README covers the Rust
 `Sampler` path, and `examples/` holds a conformant mock solver in Rust, C++,
-Python, and TypeScript. Depend on `quip-solver-core = "0.0.2-rc3"` from crates.io
+Python, and TypeScript. Depend on `quip-solver-core = "0.0.2"` from crates.io
 for the Rust path, or on the `quip-solver-core` PyPI wheel for Python. A
 solver is conformant when the repo's `quip-solver-drive` binary reports a
 conformant session against it.
@@ -22,10 +22,11 @@ the coordinator, publishing releases, and testing against this coordinator.
 
 ## Salt leases
 
-A Rust miner built on quip-solver-core 0.0.2-rc3 receives leases through the
+A Rust miner built on quip-solver-core 0.0.2 receives leases through the
 default session loop when it advertises the BLAKE3/ChaCha8 generator. The
-session loop draws each problem and passes it to the sampler. It scores the
-returned samples and sends winners to the coordinator. A miner that does not
+session loop draws each problem and passes it to the sampler. It sends every
+returned read for each salt to the coordinator, which verifies the reads and
+selects the proof set. A miner that does not
 advertise `ISING_GENERATE` continues to receive plain jobs.
 
 A miner that generates problems on its device, such as an msa miner, must add
