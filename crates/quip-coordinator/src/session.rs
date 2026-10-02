@@ -681,7 +681,8 @@ pub(crate) async fn settle_pow_result<C: ChainClient>(
     }
 }
 
-/// Verify one lease winner and settle it like a plain proof-of-work result.
+/// Verify one reported lease salt and settle it like a plain proof-of-work
+/// result: submit it if it clears the target, else offer it to the stash.
 ///
 /// The lease stays in flight: only `LeaseDone` completes it. A result for an
 /// unknown or cancelled lease, a result that fails verification, and a result
@@ -712,12 +713,8 @@ pub(crate) async fn handle_lease_result<C: ChainClient>(
         tracing::warn!(miner = %miner_id, "lease result before topology or target; dropping");
         return;
     };
-    let wire_target = quip_protocol::target::Target::from_proto(&target);
-    let verified = match quip_protocol::lease::verify_lease_result(
-        generator,
-        &view,
-        &wire_target,
-        &result,
+    let (verified, validated) = match crate::lease::verify_and_select(
+        generator, &view, &target, &result,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -726,30 +723,6 @@ pub(crate) async fn handle_lease_result<C: ChainClient>(
         }
     };
     state.lock().await.note_result(job.generation);
-    // Verification decoded these rows already, so a decode failure here is
-    // unreachable. `filter_map` keeps the order of the proof.
-    let rows: Vec<crate::validate::SpinRow> = result
-        .solutions
-        .iter()
-        .filter_map(|s| {
-            quip_protocol::wire::decode_spins_packed(&s.spins, view.num_nodes)
-                .ok()
-                .map(|spins| crate::validate::SpinRow {
-                    spins,
-                    energy_milli: s.energy_milli,
-                })
-        })
-        .collect();
-    let stats = verified.stats;
-    let validated = crate::validate::Validated {
-        best_energy_milli: stats.best_energy_milli,
-        diversity_milli: stats.diversity_milli,
-        n_valid: stats.valid_solution_count,
-        accepted: true,
-        selected_solutions: rows.clone(),
-        raw_best_energy_milli: stats.best_energy_milli,
-        stash_solutions: rows,
-    };
     settle_pow_result(
         chain,
         state,
@@ -1889,6 +1862,42 @@ mod tests {
             .for_each(|solution| solution.energy_milli -= 1);
         handle_lease_result(&chain, &state, &notify(), "m", r).await;
         assert!(chain.take_submitted().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_result_with_more_reads_than_a_proof_holds_submits_a_capped_set() {
+        let (st, job) = lease_state();
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        let mut r = winner(&job, 1);
+        let read = r.solutions.first().cloned().unwrap();
+        r.solutions = vec![read; 40];
+        handle_lease_result(&chain, &state, &notify(), "m", r).await;
+        let submitted = chain.take_submitted();
+        assert_eq!(submitted.len(), 1, "an unfiltered read set still wins");
+        assert!(submitted
+            .first()
+            .is_some_and(|proof| proof.solutions.len() <= crate::validate::MAX_PROOF_SOLUTIONS));
+    }
+
+    #[tokio::test]
+    async fn lease_result_that_misses_the_target_counts_but_is_not_submitted() {
+        let (mut st, job) = lease_state();
+        let r = winner(&job, 3);
+        let energy = r.solutions.first().map(|s| s.energy_milli).unwrap();
+        // The ceiling is strict, so a read at exactly the ceiling misses it.
+        st.target = st.target.map(|t| SetTarget {
+            max_energy_milli: energy,
+            ..t
+        });
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        handle_lease_result(&chain, &state, &notify(), "m", r).await;
+        assert!(chain.take_submitted().is_empty());
+        assert!(
+            state.lock().await.round_mined(),
+            "an authentic result counts as participation"
+        );
     }
 
     #[tokio::test]

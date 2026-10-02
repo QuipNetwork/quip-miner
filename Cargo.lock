@@ -3024,7 +3024,7 @@ dependencies = [
  "prost",
  "quantum-validation",
  "quip-proto 0.0.1",
- "quip-proto 0.0.2-rc3",
+ "quip-proto 0.0.2",
  "quip-protocol",
  "quip-transaction-crypto",
  "quip-transaction-crypto-core",
@@ -3096,7 +3096,7 @@ dependencies = [
  "clap",
  "hyper-util",
  "prost",
- "quip-proto 0.0.2-rc3",
+ "quip-proto 0.0.2",
  "quip-protocol",
  "tokio",
  "tokio-stream",
@@ -3116,9 +3116,9 @@ dependencies = [
 
 [[package]]
 name = "quip-proto"
-version = "0.0.2-rc3"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9d89e305792adc6cadabe5ccee47a61919bd2812be29d2c48359962722c05c0"
+checksum = "b23623cac848ac57fb00ae389f4ada328f09ff89631f30c955b7285a4d88879c"
 dependencies = [
  "prost",
  "tonic",
@@ -3126,19 +3126,19 @@ dependencies = [
 
 [[package]]
 name = "quip-protocol"
-version = "0.0.2-rc3"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed93b261c81e2eeb036f0bb4e166e38091ae450ee0fabb4b05a514d67c891d23"
+checksum = "2685030cd72ce49aeb91a3ece54b91733cd30d64922277f907459b231441b46f"
 dependencies = [
  "blake3",
- "quip-proto 0.0.2-rc3",
+ "quip-proto 0.0.2",
 ]
 
 [[package]]
 name = "quip-solver-core"
-version = "0.0.2-rc3"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8d3805f56d9842019b830e0492dcf67a4692ff2d448969097a0e16fbf3c7e66"
+checksum = "97610f7de2d194bb3a1c43802bffd223ecfc8ec93d3f49e08fdbeeaae5fd2850"
 dependencies = [
  "base64",
  "clap",
@@ -3146,7 +3146,7 @@ dependencies = [
  "half",
  "hyper-util",
  "prost",
- "quip-proto 0.0.2-rc3",
+ "quip-proto 0.0.2",
  "quip-protocol",
  "serde",
  "serde_json",
