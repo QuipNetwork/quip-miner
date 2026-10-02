@@ -391,8 +391,9 @@ async fn handle_result(
     });
 }
 
-/// Verify a lease winner inline so its count is updated before the following
-/// `LeaseDone` on the same miner stream is handled.
+/// Verify a reported lease salt inline and count it as a winner when it clears
+/// the target, so the count is updated before the following `LeaseDone` on the
+/// same miner stream is handled.
 async fn handle_lease_result(
     state: &Arc<Mutex<CoordinatorState>>,
     result: &JobResult,
@@ -411,8 +412,9 @@ async fn handle_lease_result(
         };
         (generator.clone(), view, target)
     };
-    let wire_target = quip_protocol::target::Target::from_proto(&target);
-    if quip_protocol::lease::verify_lease_result(&generator, &view, &wire_target, result).is_ok() {
+    let winner = crate::lease::verify_and_select(&generator, &view, &target, result)
+        .is_ok_and(|(_, validated)| validated.accepted);
+    if winner {
         #[expect(
             clippy::unwrap_used,
             reason = "StdMutex poison only if a prior holder panicked"

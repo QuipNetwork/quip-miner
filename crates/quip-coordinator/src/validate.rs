@@ -261,14 +261,6 @@ fn energy_of_row(
 /// `topo` is the run-resolved position-indexed graph, used for topology-hash
 /// jobs; inline `EdgeList` jobs carry their own (already position-indexed)
 /// edges.
-#[expect(
-    clippy::indexing_slicing,
-    reason = "indices drawn from enumerate/len of the same scored buffers"
-)]
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "n_valid is solution count; pallet bound is 32, well below u32::MAX"
-)]
 pub fn validate_result(
     problem: &IsingProblem,
     solutions: &[Solution],
@@ -317,6 +309,21 @@ pub fn validate_result(
 
     debug_assert_energies_match(&rows, &h_milli, edges_pos, &j_milli, &energies);
 
+    validate_scored(&rows, &energies, gates)
+}
+
+/// Apply the quality gates to rows whose energies are already known: dedup,
+/// diverse selection, and the stash view. `rows[i]` scores `energies[i]`.
+#[must_use]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "indices drawn from enumerate/len of the same scored buffers"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "n_valid is solution count; pallet bound is 32, well below u32::MAX"
+)]
+pub fn validate_scored(rows: &[Vec<i8>], energies: &[i64], gates: &QualityGates) -> Validated {
     let energy_valid_indices: Vec<usize> = energies
         .iter()
         .enumerate()
@@ -377,7 +384,7 @@ pub fn validate_result(
     // miner found, and the rows that stay submittable as the difficulty eases.
     // Both ignore the current (harder) gate, which nothing here has to clear.
     let raw_best_energy_milli = energies.iter().copied().min().unwrap_or(i64::MAX);
-    let stash_solutions = stash_rows(&rows, &energies, gates);
+    let stash_solutions = stash_rows(rows, energies, gates);
 
     Validated {
         best_energy_milli,

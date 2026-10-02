@@ -505,10 +505,15 @@ based on `stream_width`. `LEASE_MAX_SALTS` caps a lease at 2²⁰ salts. Before 
 feeder has a usable rate, it stages four pipeline fills. `LEASE_STAGE_DEPTH`
 sets the two-lease staging limit per miner.
 
-The lease miner sends winners only. Near misses never reach the coordinator's
-win-time stash. A winner reaches that stash only when proof submission fails
-transiently. `LeaseDone` completes the lease. If `salts_done` is greater than
-zero, the miner counts as a round participant.
+A lease miner on quip-solver-core 0.0.2 sends a `Result` for each salt it
+reports, with every read and no target filter. The coordinator first checks
+that the `Result` is authentic: `verify_lease_result` with a permissive target
+redraws the problem and rescores every read. The coordinator drops a forged or
+corrupt `Result`. An authentic one counts as round participation. The coordinator then
+selects the proof set against the live target with the same gates as a plain
+result. It submits a `Result` that clears the target and offers one that misses
+to the win-time stash. `LeaseDone` completes the lease. If `salts_done` is greater
+than zero, the miner counts as a round participant.
 
 ## Supervision and shutdown
 

@@ -100,6 +100,50 @@ pub fn lease_salt_count(salts_per_sec: f64, stream_width: u32) -> u64 {
     want.clamp(fill.min(LEASE_MAX_SALTS), LEASE_MAX_SALTS)
 }
 
+/// Accepts every authentic result: each energy clears it and any solution
+/// count passes, so only the redraw and rescore in `verify_lease_result` fail.
+const AUTHENTICITY_ONLY: quip_protocol::target::Target = quip_protocol::target::Target {
+    max_energy_milli: i64::MAX,
+    min_solutions: 0,
+    min_diversity_milli: 0,
+    max_proof_solutions: u32::MAX,
+};
+
+/// Verify one lease `Result` in two steps, then select against `target`.
+///
+/// A solver-core 0.0.2 miner sends every read for a reported salt, unfiltered
+/// and uncapped. The first step redraws the problem and rescores every read
+/// with a permissive target, so it rejects only a forged or corrupt result. An
+/// authentic result counts as participation even if it misses the target. The
+/// second step applies the live gates through the same selection as a plain
+/// job, so a miss reaches the decay stash instead of being dropped.
+///
+/// # Errors
+/// Returns the verification error when the result is not authentic.
+pub fn verify_and_select(
+    generator: &IsingProblemGenerator,
+    topology: &quip_protocol::lease::TopologyView,
+    target: &quip_proto::v1::SetTarget,
+    result: &quip_proto::v1::Result,
+) -> Result<(quip_protocol::lease::Verified, crate::validate::Validated), String> {
+    let verified =
+        quip_protocol::lease::verify_lease_result(generator, topology, &AUTHENTICITY_ONLY, result)
+            .map_err(|e| e.to_string())?;
+    // Verification decoded and rescored every read, so neither step fails here.
+    let (rows, energies): (Vec<Vec<i8>>, Vec<i64>) = result
+        .solutions
+        .iter()
+        .filter_map(|s| {
+            quip_protocol::wire::decode_spins_packed(&s.spins, topology.num_nodes)
+                .ok()
+                .map(|spins| (spins, s.energy_milli))
+        })
+        .unzip();
+    let gates = crate::validate::gates_from_target(Some(target));
+    let validated = crate::validate::validate_scored(&rows, &energies, &gates);
+    Ok((verified, validated))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
