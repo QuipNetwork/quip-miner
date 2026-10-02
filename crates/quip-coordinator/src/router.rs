@@ -70,6 +70,9 @@ struct MinerQueue {
     consumed_since_poll: u32,
     /// Lease salts the miner finished since the last `take_lease_salts`. The feeder turns this into a salts-per-second rate for lease sizing.
     salts_since_poll: u64,
+    /// Lease salts the miner finished for the current round. Reset when a new
+    /// round starts, not when the miner re-registers.
+    round_salts: u64,
     /// Jobs this miner finished (Result or Reject) since it registered.
     /// The heartbeat reads this total. Polls do not reset it.
     completed: u64,
@@ -134,6 +137,7 @@ impl Router {
                         granted_credits: 0,
                         consumed_since_poll: 0,
                         salts_since_poll: 0,
+                        round_salts: 0,
                         completed: 0,
                         unsupported_kinds: HashSet::new(),
                     },
@@ -186,6 +190,26 @@ impl Router {
     pub fn record_lease_salts(&mut self, miner_id: &str, salts: u64) {
         if let Some(q) = self.miners.get_mut(miner_id) {
             q.salts_since_poll = q.salts_since_poll.saturating_add(salts);
+        }
+    }
+
+    /// Add salts a miner finished for the current round.
+    pub fn record_round_salts(&mut self, miner_id: &str, salts: u64) {
+        if let Some(q) = self.miners.get_mut(miner_id) {
+            q.round_salts = q.round_salts.saturating_add(salts);
+        }
+    }
+
+    /// Salts `miner_id` finished for the current round. 0 if unknown.
+    #[must_use]
+    pub fn round_salts(&self, miner_id: &str) -> u64 {
+        self.miners.get(miner_id).map_or(0, |q| q.round_salts)
+    }
+
+    /// Start every miner's round salt count from zero.
+    pub fn reset_round_salts(&mut self) {
+        for q in self.miners.values_mut() {
+            q.round_salts = 0;
         }
     }
 
@@ -477,6 +501,19 @@ mod tests {
         assert_eq!(r.take_lease_salts("lease"), 10);
         assert_eq!(r.take_lease_salts("lease"), 0);
         assert_eq!(r.take_lease_salts("unknown"), 0);
+    }
+
+    #[test]
+    fn round_salts_survive_reregistration_and_reset_per_round() {
+        let mut r = Router::new();
+        r.register_miner("lease", caps_lease());
+        r.record_round_salts("lease", 7);
+        r.register_miner("lease", caps_lease());
+        r.record_round_salts("lease", 3);
+        assert_eq!(r.round_salts("lease"), 10);
+        r.reset_round_salts();
+        assert_eq!(r.round_salts("lease"), 0);
+        assert_eq!(r.round_salts("unknown"), 0);
     }
 
     fn make_job(generation: u64, kind: JobKind) -> Job {

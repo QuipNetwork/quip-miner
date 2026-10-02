@@ -265,6 +265,7 @@ async fn stop_mining(coord: &Arc<Mutex<CoordinatorState>>, generation: u64) -> u
     let dropped = st.router.cancel(generation.saturating_sub(1));
     let _ = st.cancel_inflight(generation.saturating_sub(1));
     st.clear_salts();
+    st.router.reset_round_salts();
     dropped
 }
 
@@ -599,10 +600,6 @@ async fn stage_mempool_orders<C: ChainClient>(
     clippy::too_many_lines,
     reason = "single feeder loop: reseed, top-up, win-time submit"
 )]
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "salt counts per poll are far below 2^52"
-)]
 pub async fn feeder_loop<C>(
     chain: Arc<C>,
     state: Arc<Mutex<CoordinatorState>>,
@@ -619,8 +616,11 @@ pub async fn feeder_loop<C>(
     let start = std::time::Instant::now();
     // Per-miner smoothed jobs-consumed-per-poll, driving the adaptive window.
     let mut consumption_ema: HashMap<String, f64> = HashMap::new();
-    // Per-miner smoothed lease salts finished per poll, for lease sizing.
-    let mut salt_ema: HashMap<String, f64> = HashMap::new();
+    // Per-miner lease throughput, for lease sizing.
+    let mut salt_rates: HashMap<String, crate::lease::SaltRate> = HashMap::new();
+    // When lease rates were last updated, so each update covers the real
+    // time since the previous one rather than the nominal poll interval.
+    let mut last_rate_update = std::time::Instant::now();
     // Last difficulty triple broadcast to miners, so we only re-push on change
     // within a round. A reseed always pushes Topology and SetTarget again.
     let mut last_broadcast: Option<(i64, u32, u32)> = None;
@@ -1001,7 +1001,9 @@ pub async fn feeder_loop<C>(
             // Per-miner drain/staging stats for the heartbeat, collected here
             // and emitted off-lock below. The completion pair is (window,
             // total): window is completions since the last heartbeat.
-            let mut stats: Vec<(String, u64, u64, usize, usize)> = Vec::new();
+            let mut stats: Vec<(String, u64, u64, usize, usize, u64, f64)> = Vec::new();
+            let rate_secs = last_rate_update.elapsed().as_secs_f64();
+            last_rate_update = std::time::Instant::now();
             for id in st.router.miner_ids() {
                 let consumed_raw = st.router.take_consumed(&id);
                 let consumed = f64::from(consumed_raw);
@@ -1019,16 +1021,20 @@ pub async fn feeder_loop<C>(
                     .caps(&id)
                     .filter(|c| c.accepts_leases())
                     .map(|c| c.stream_width);
+                // Lease salts per second, for the heartbeat. Zero for a miner
+                // that takes plain jobs.
+                let mut salts_per_s = 0.0;
                 let depth = if let Some(stream_width) = lease_width {
-                    let finished = st.router.take_lease_salts(&id) as f64;
-                    let ema = match salt_ema.get(&id) {
-                        Some(&prev) => {
-                            CONSUMPTION_EMA_ALPHA * finished + (1.0 - CONSUMPTION_EMA_ALPHA) * prev
-                        }
-                        None => finished,
+                    let finished = st.router.take_lease_salts(&id);
+                    // A miner's window opens at its first lease. Time before
+                    // that, such as the wait for registration, is not its rate.
+                    let rate = if let Some(r) = salt_rates.get_mut(&id) {
+                        r.observe(finished, rate_secs)
+                    } else {
+                        let _ = salt_rates.insert(id.clone(), crate::lease::SaltRate::default());
+                        0.0
                     };
-                    let _ = salt_ema.insert(id.clone(), ema);
-                    let rate = ema / params.poll_interval.as_secs_f64().max(f64::EPSILON);
+                    salts_per_s = rate;
                     let count = crate::lease::lease_salt_count(rate, stream_width);
                     while st.router.staged_len(&id) < crate::lease::LEASE_STAGE_DEPTH {
                         let start = salt_ctr.saturating_add(1);
@@ -1042,6 +1048,14 @@ pub async fn feeder_loop<C>(
                         if !st.router.stage_on(&id, job) {
                             break;
                         }
+                        tracing::info!(
+                            miner = %id,
+                            generation,
+                            salt_start = start,
+                            salt_count = count,
+                            salts_per_sec = rate,
+                            "lease issued"
+                        );
                         salt_ctr = start.saturating_add(count - 1);
                     }
                     crate::lease::LEASE_STAGE_DEPTH
@@ -1095,6 +1109,8 @@ pub async fn feeder_loop<C>(
                     completed_total,
                     depth,
                     st.router.staged_len(&id),
+                    st.router.round_salts(&id),
+                    salts_per_s,
                 ));
             }
             if stats.is_empty() {
@@ -1151,13 +1167,17 @@ pub async fn feeder_loop<C>(
                 "feeder: poll"
             );
             if last_heartbeat.elapsed() >= FEEDER_HEARTBEAT {
-                for (id, completed, completed_total, depth, staged) in &stats {
+                for (id, completed, completed_total, depth, staged, round_salts, salts_per_s) in
+                    &stats
+                {
                     tracing::info!(
                         miner = %id,
                         jobs_completed = completed,
                         jobs_completed_total = completed_total,
                         staged = staged,
                         window = depth,
+                        round_salts = round_salts,
+                        salts_per_s = %format!("{salts_per_s:.0}"),
                         "miner throughput"
                     );
                     let _ = last_completed.insert(id.clone(), *completed_total);

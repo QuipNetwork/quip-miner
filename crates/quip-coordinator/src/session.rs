@@ -167,6 +167,11 @@ pub struct CoordinatorState {
     /// [`CoordinatorState::dispatch_inflight`]/[`CoordinatorState::complete_inflight`];
     /// the drive harness leaves it empty (it never crash-requeues).
     pub inflight_owner: HashMap<Vec<u8>, String>,
+    /// `job_id` → the instant a lease job was dispatched, so
+    /// [`handle_lease_done`] can report how long the lease was outstanding.
+    /// Populated in [`CoordinatorState::dispatch_inflight`] for lease jobs
+    /// only; cleared in [`CoordinatorState::complete_inflight`].
+    pub lease_issued_at: HashMap<Vec<u8>, std::time::Instant>,
     /// Live per-miner outbound channels, so the supervisor can push an in-band
     /// `Shutdown`/cancel to a running session. Registered on handshake success,
     /// removed when the session ends.
@@ -238,6 +243,7 @@ impl CoordinatorState {
             router: Router::new(),
             inflight: HashMap::new(),
             inflight_owner: HashMap::new(),
+            lease_issued_at: HashMap::new(),
             outbound: HashMap::new(),
             wakeups: HashMap::new(),
             salts: HashMap::new(),
@@ -312,17 +318,26 @@ impl CoordinatorState {
     }
 
     /// Record a dispatched job as in-flight, attributing it to `miner_id`.
+    /// A lease job also starts its issue-instant clock, read back in
+    /// [`handle_lease_done`].
     pub fn dispatch_inflight(&mut self, miner_id: &str, job: quip_proto::v1::Job) {
         let _ = self
             .inflight_owner
             .insert(job.job_id.clone(), miner_id.to_string());
+        if crate::lease::is_lease(&job) {
+            let _ = self
+                .lease_issued_at
+                .insert(job.job_id.clone(), std::time::Instant::now());
+        }
         let _ = self.inflight.insert(job.job_id.clone(), job);
     }
 
-    /// Clear an in-flight job on a terminal event (Result/Reject); returns the
-    /// job for validation context.
+    /// Clear an in-flight job on a terminal event (Result/Reject/LeaseDone);
+    /// returns the job for validation context. Also drops any lease
+    /// issue-instant, so a cancelled or reclaimed lease never leaks an entry.
     pub fn complete_inflight(&mut self, job_id: &[u8]) -> Option<quip_proto::v1::Job> {
         let _ = self.inflight_owner.remove(job_id);
+        let _ = self.lease_issued_at.remove(job_id);
         self.inflight.remove(job_id)
     }
 
@@ -357,6 +372,7 @@ impl CoordinatorState {
         let mut jobs = Vec::with_capacity(owned.len());
         for id in owned {
             let _ = self.inflight_owner.remove(&id);
+            let _ = self.lease_issued_at.remove(&id);
             if let Some(job) = self.inflight.remove(&id) {
                 jobs.push(job);
             }
@@ -628,10 +644,22 @@ pub(crate) async fn settle_pow_result<C: ChainClient>(
             };
             let target_txt =
                 crate::logging::display_energy(st.target.as_ref().map(|t| t.max_energy_milli));
-            tracing::info!(
+            let msg = format!(
                 "[quip-miner-{miner_id}] attempt {}: {decision} (stash: {stash_txt}, target <= {target_txt})",
                 short_job_id(job_id),
             );
+            // A plain PoW job produces at most one Result per dispatched job,
+            // so this stays at info. A lease Result now reports every salt a
+            // miner chooses to, not only winners, so this fires once per
+            // non-winning Result of a lease — at lease volume (one Result
+            // per salt) an info line there would dominate the log, so lease
+            // stays at debug. The stash/metrics counters below still record
+            // every decision either way.
+            if crate::lease::is_lease(job) {
+                tracing::debug!("{msg}");
+            } else {
+                tracing::info!("{msg}");
+            }
         }
 
         let pow_sequence = submitted
@@ -685,8 +713,10 @@ pub(crate) async fn settle_pow_result<C: ChainClient>(
 /// result: submit it if it clears the target, else offer it to the stash.
 ///
 /// The lease stays in flight: only `LeaseDone` completes it. A result for an
-/// unknown or cancelled lease, a result that fails verification, and a result
-/// that arrives before a target exists are dropped with a log line.
+/// unknown or cancelled lease, a result that arrives before a target exists,
+/// and a result that fails authenticity verification (a bad miner, not a
+/// near miss) are dropped. A dropped result never marks the round mined;
+/// `note_result` fires only after verification succeeds.
 pub(crate) async fn handle_lease_result<C: ChainClient>(
     chain: &C,
     state: &Arc<Mutex<CoordinatorState>>,
@@ -713,6 +743,14 @@ pub(crate) async fn handle_lease_result<C: ChainClient>(
         tracing::warn!(miner = %miner_id, "lease result before topology or target; dropping");
         return;
     };
+    if result.solutions.is_empty() {
+        // Not a protocol violation (a miner may report zero rows for a salt
+        // it drew but chose not to send), so this is debug, not warn. It is
+        // not participation either: the authenticity-only target accepts an
+        // empty set, so without this check `note_result` would fire for it.
+        tracing::debug!(miner = %miner_id, "lease result reports no solutions; dropping");
+        return;
+    }
     let (verified, validated) = match crate::lease::verify_and_select(
         generator, &view, &target, &result,
     ) {
@@ -750,21 +788,38 @@ pub(crate) fn handle_lease_done(
     done: &quip_proto::v1::LeaseDone,
 ) {
     st.router.record_lease_salts(miner_id, done.salts_done);
-    match st.complete_inflight(&done.job_id) {
-        Some(job) => {
-            st.router.record_completion(miner_id);
-            if done.salts_done > 0 {
-                st.note_result(job.generation);
-            }
+    let issued_at = st.lease_issued_at.get(&done.job_id).copied();
+    if let Some(job) = st.complete_inflight(&done.job_id) {
+        st.router.record_completion(miner_id);
+        let counted_toward_round = job.generation == st.generation;
+        if counted_toward_round {
+            st.router.record_round_salts(miner_id, done.salts_done);
         }
-        None => st.metrics.record_duplicate_result_drop(miner_id),
+        if done.salts_done > 0 {
+            st.note_result(job.generation);
+        }
+        // `display_energy` handles the `i64::MAX` "no solution" sentinel that
+        // a bare `energy_units` call would render as a nonsense whole-unit
+        // figure, so it is used here instead.
+        tracing::info!(
+            miner = %miner_id,
+            job_generation = job.generation,
+            current_generation = st.generation,
+            salts_done = done.salts_done,
+            salt_count = job.generator.as_ref().map_or(0, |g| g.salt_count),
+            best_energy = %crate::logging::display_energy((done.best_energy_milli != i64::MAX).then_some(done.best_energy_milli)),
+            elapsed_secs = issued_at.map(|t| t.elapsed().as_secs_f64()),
+            counted_toward_round,
+            "lease done"
+        );
+    } else {
+        st.metrics.record_duplicate_result_drop(miner_id);
+        tracing::debug!(
+            miner = %miner_id,
+            salts_done = done.salts_done,
+            "lease done for unknown or already-completed job"
+        );
     }
-    tracing::debug!(
-        miner = %miner_id,
-        salts_done = done.salts_done,
-        best_energy = %crate::logging::display_energy((done.best_energy_milli != i64::MAX).then_some(done.best_energy_milli)),
-        "lease done"
-    );
 }
 
 #[expect(
@@ -1862,6 +1917,73 @@ mod tests {
             .for_each(|solution| solution.energy_milli -= 1);
         handle_lease_result(&chain, &state, &notify(), "m", r).await;
         assert!(chain.take_submitted().is_empty());
+        assert!(
+            !state.lock().await.round_mined(),
+            "a report that fails authenticity verification is a bad miner, not participation"
+        );
+    }
+
+    /// A verified lease Result whose energy does not clear the live target is
+    /// held in the decay-ratchet stash, not submitted, and still counts as
+    /// participation for the round — the same as a plain `PoW` Result that
+    /// misses the gate.
+    #[tokio::test]
+    async fn lease_result_above_target_is_stashed_and_marks_round_mined() {
+        let (mut st, job) = lease_state();
+        let r = winner(&job, 3);
+        let energy = r.solutions.first().unwrap().energy_milli;
+        // Ceiling set to exactly the reported energy: the gate is strict
+        // less-than, so this candidate does not clear it.
+        st.target = Some(SetTarget {
+            max_energy_milli: energy,
+            min_solutions: 1,
+            min_diversity_milli: 0,
+            max_proof_solutions: 32,
+            ..Default::default()
+        });
+        // A model that eases past `energy` within the horizon, so the stash
+        // holds the candidate instead of rejecting it as never viable.
+        st.stash.reset(
+            job.generation,
+            Some(crate::decay::DecayModel {
+                base_max_energy_milli: energy,
+                curve: Some(crate::decay::EnergyCurve {
+                    min_milli: energy - 100_000,
+                    knee_milli: energy,
+                    max_milli: energy + 50_000,
+                }),
+                epoch_length: 10,
+                algorithm: crate::decay::DecayAlgorithm::Stepwise,
+            }),
+            0,
+        );
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        let (expected_nonce, expected_salt) = (r.nonce.clone(), r.salt.clone());
+        handle_lease_result(&chain, &state, &notify(), "m", r).await;
+        assert!(
+            chain.take_submitted().is_empty(),
+            "energy equal to the ceiling does not clear it"
+        );
+        let st = state.lock().await;
+        assert!(!st.stash.is_empty(), "held in the decay-ratchet stash");
+        assert!(
+            st.round_mined(),
+            "a verified lease Result counts as participation whether or not it clears the target"
+        );
+        let candidate = st
+            .stash
+            .due_at(u64::MAX)
+            .expect("the single stashed candidate becomes due within the horizon");
+        assert_eq!(
+            candidate.job_id, expected_nonce,
+            "stashed candidate keeps the result's nonce as its attempt id"
+        );
+        assert_eq!(
+            candidate.salt.map(|s| s.to_vec()),
+            Some(expected_salt),
+            "stashed candidate keeps the result's salt for the later live submit"
+        );
     }
 
     #[tokio::test]
@@ -1878,26 +2000,6 @@ mod tests {
         assert!(submitted
             .first()
             .is_some_and(|proof| proof.solutions.len() <= crate::validate::MAX_PROOF_SOLUTIONS));
-    }
-
-    #[tokio::test]
-    async fn lease_result_that_misses_the_target_counts_but_is_not_submitted() {
-        let (mut st, job) = lease_state();
-        let r = winner(&job, 3);
-        let energy = r.solutions.first().map(|s| s.energy_milli).unwrap();
-        // The ceiling is strict, so a read at exactly the ceiling misses it.
-        st.target = st.target.map(|t| SetTarget {
-            max_energy_milli: energy,
-            ..t
-        });
-        let state = Arc::new(Mutex::new(st));
-        let chain = FakeChain::new(lease_snapshot(), None);
-        handle_lease_result(&chain, &state, &notify(), "m", r).await;
-        assert!(chain.take_submitted().is_empty());
-        assert!(
-            state.lock().await.round_mined(),
-            "an authentic result counts as participation"
-        );
     }
 
     #[tokio::test]
@@ -1924,6 +2026,11 @@ mod tests {
             3,
             "cancelled salts still count toward the rate"
         );
+        assert_eq!(
+            st.router.round_salts("m"),
+            0,
+            "a cancelled round's salts do not count toward this round"
+        );
         assert!(!st.round_mined());
     }
 
@@ -1937,9 +2044,25 @@ mod tests {
         assert!(chain.take_submitted().is_empty());
     }
 
+    #[tokio::test]
+    async fn lease_result_with_no_solutions_is_dropped_without_marking_the_round() {
+        let (st, job) = lease_state();
+        let state = Arc::new(Mutex::new(st));
+        let chain = FakeChain::new(lease_snapshot(), None);
+        let mut r = winner(&job, 0);
+        r.solutions.clear();
+        handle_lease_result(&chain, &state, &notify(), "m", r).await;
+        assert!(chain.take_submitted().is_empty());
+        assert!(
+            !state.lock().await.round_mined(),
+            "reporting zero solutions is not participation"
+        );
+    }
+
     #[test]
     fn lease_done_with_salts_marks_the_round_mined() {
         let (mut st, job) = lease_state();
+        assert!(st.lease_issued_at.contains_key(&job.job_id));
         handle_lease_done(
             &mut st,
             "m",
@@ -1951,7 +2074,11 @@ mod tests {
         );
         assert!(st.round_mined());
         assert!(!st.inflight.contains_key(&job.job_id));
+        // The issue-instant clock is consumed (and its entry cleared) as part
+        // of reporting elapsed time, not left dangling.
+        assert!(!st.lease_issued_at.contains_key(&job.job_id));
         assert_eq!(st.router.take_lease_salts("m"), 4);
+        assert_eq!(st.router.round_salts("m"), 4);
     }
 
     #[test]
