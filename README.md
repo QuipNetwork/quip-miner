@@ -23,7 +23,7 @@ consumed from crates.io. The miner binaries ship from their own repositories.
   `quip-mock-miner` (the miner test double).
 - `docker/` — image builds and the example coordinator config.
 
-The miner binaries live in `quip.network/quip-miner-{cpu,cuda,metal,dwave}`.
+The miner binaries live in `quip.network/quip-solver-{cpu,cuda,metal,dwave}`.
 The `quip-proto`, `quip-protocol`, and `quip-solver-core` dependencies come
 from crates.io at v0.0.0; their source of truth is
 `quip.network/quip-solver-core`.

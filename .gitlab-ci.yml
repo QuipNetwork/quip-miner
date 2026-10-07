@@ -95,7 +95,7 @@ verify-fetch-miners:
       if echo "$out" | grep -q 'quip-cuda'; then echo "ERROR: cpu set pulled cuda"; exit 1; fi
       # The three production kernels must be required; a release that drops one
       # has to fail the image build, not ship an image missing its default
-      # miner. Everything experimental must be optional, because quip-miner-cpu
+      # miner. Everything experimental must be optional, because quip-solver-cpu
       # builds those behind a feature flag and does not attach them to every
       # release.
       echo "--- cpu: production required, experimental optional ---"
@@ -121,7 +121,7 @@ verify-fetch-miners:
       out=$(DRY_RUN=1 TARGETOS=darwin TARGETARCH=arm64 MINER_SET=auto bash "$S")
       echo "$out"
       echo "$out" | grep -q 'quip-metal-sa-darwin-arm64'
-      # quip-miner-metal publishes an msa kernel. It must be selected, and it
+      # quip-solver-metal publishes an msa kernel. It must be selected, and it
       # must be optional, so a Metal release without it cannot fail the run.
       echo "$out" | grep -q 'would fetch (optional): quip-metal-msa-darwin-arm64' ||
         { echo "ERROR: quip-metal-msa not selected as optional"; exit 1; }
@@ -138,11 +138,11 @@ verify-fetch-miners:
       echo "--- pins resolve to real releases ---"
       for m in cpu cuda metal dwave; do
         tag=$(bash "$S" --print-tag "$m")
-        url="https://gitlab.com/api/v4/projects/quip.network%2Fquip-miner-${m}/releases/${tag}"
+        url="https://gitlab.com/api/v4/projects/quip.network%2Fquip-solver-${m}/releases/${tag}"
         if wget -q -O /dev/null "$url"; then
-          echo "ok   quip-miner-${m} ${tag}"
+          echo "ok   quip-solver-${m} ${tag}"
         else
-          echo "ERROR: quip-miner-${m} has no release ${tag}" >&2
+          echo "ERROR: quip-solver-${m} has no release ${tag}" >&2
           exit 1
         fi
       done
@@ -424,13 +424,14 @@ bundle-darwin-arm64:
       # repo:package:binary triples pulled as <binary>-darwin-arm64. Each repo
       # resolves to its own latest release, so dwave being ahead of the others
       # is fine. The generic-package name is spelled out rather than taken from
-      # the repo path, so a repo rename keeps release history in one package.
-      MINERS="quip-miner-cpu:quip-miner-cpu:quip-cpu-sa quip-miner-cpu:quip-miner-cpu:quip-cpu-gibbs quip-miner-metal:quip-miner-metal:quip-metal-sa quip-miner-metal:quip-miner-metal:quip-metal-gibbs quip-miner-dwave:quip-miner-dwave:quip-dwave-qa"
+      # the repo path: the repos were renamed from quip-miner-* to
+      # quip-solver-*, and their packages kept the old names.
+      MINERS="quip-solver-cpu:quip-miner-cpu:quip-cpu-sa quip-solver-cpu:quip-miner-cpu:quip-cpu-gibbs quip-solver-metal:quip-miner-metal:quip-metal-sa quip-solver-metal:quip-miner-metal:quip-metal-gibbs quip-solver-dwave:quip-miner-dwave:quip-dwave-qa"
 
       # Kernels a release may not carry yet. Mirrors the optional tier in
       # fetch-miners.sh: an absent asset is skipped, so a Metal release cut
       # without this kernel cannot fail a whole tag pipeline.
-      OPTIONAL_MINERS="quip-miner-metal:quip-miner-metal:quip-metal-msa"
+      OPTIONAL_MINERS="quip-solver-metal:quip-miner-metal:quip-metal-msa"
 
       for entry in $MINERS $OPTIONAL_MINERS; do
         repo="${entry%%:*}"
