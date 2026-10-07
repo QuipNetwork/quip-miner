@@ -82,7 +82,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
     && python3 -m venv /opt/venv \
     && DWAVE_TAG="$(bash /usr/local/bin/fetch-miners.sh --print-tag dwave)" \
     && /opt/venv/bin/pip install --no-cache-dir \
-       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${DWAVE_TAG}" \
+       "git+https://gitlab.com/quip.network/quip-miner-dwave.git@${DWAVE_TAG}" \
     && apt-get purge -y git \
     && apt-get autoremove -y --purge \
     && rm -rf /root/.cache /var/lib/apt/lists/*

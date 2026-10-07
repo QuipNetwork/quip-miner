@@ -44,11 +44,20 @@ set -euo pipefail
 API="https://gitlab.com/api/v4"
 GROUP="quip.network"
 
+# Each miner's generic-package name. It is named here rather than derived from
+# the repository path, so a repository rename leaves release history under one
+# package.
+CPU_PKG=quip-miner-cpu
+CUDA_PKG=quip-miner-cuda
+METAL_PKG=quip-miner-metal
+DWAVE_PKG=quip-miner-dwave
+
 # Newest release tag for one miner repo, or empty when it has never cut one.
 # `per_page=1` asks for the most recent release, and the API orders newest
-# first.
+# first. `--location` follows the redirect GitLab answers for a renamed
+# project; without it the 301 body parses to an empty tag.
 latest_tag() {
-  curl --fail --silent --show-error \
+  curl --fail --location --silent --show-error \
     "${API}/projects/${GROUP}%2F${1}/releases?per_page=1" |
     sed -n 's/.*"tag_name":"\([^"]*\)".*/\1/p' | head -n 1
 }
@@ -123,22 +132,23 @@ esac
 
 mkdir -p "$DEST"
 
-# fetch MODE TAG PROJ NAME...  — download "<NAME>-<os>-<arch>" from PROJ's
-# generic package registry at TAG, saving it as "<NAME>" (suffix stripped) in
-# DEST. PROJ is the URL-encoded "group/repo". TAG is per call because the
-# miners version independently. DRY_RUN prints the plan and skips the download.
+# fetch MODE TAG PROJ PKG NAME...  — download "<NAME>-<os>-<arch>" from
+# package PKG in PROJ's generic package registry at TAG, saving it as "<NAME>"
+# (suffix stripped) in DEST. PROJ is the URL-encoded "group/repo". TAG is per
+# call because the miners version independently. DRY_RUN prints the plan and
+# skips the download.
 #
 # MODE is `required` — a missing asset fails the run — or `optional`, where a
 # missing asset is reported and skipped. Optional exists for the experimental
 # CPU kernels below, which a release may or may not carry.
 fetch() {
-  local mode="$1" tag="$2" proj="$3"
-  shift 3
+  local mode="$1" tag="$2" proj="$3" pkg="$4"
+  shift 4
   local name asset url
   local -a curlopts
   for name in "$@"; do
     asset="${name}-${os_tag}-${arch}"
-    url="${API}/projects/${proj}/packages/generic/${proj##*%2F}/${tag}/${asset}"
+    url="${API}/projects/${proj}/packages/generic/${pkg}/${tag}/${asset}"
     if [ -n "${DRY_RUN:-}" ]; then
       echo "would fetch (${mode}): ${asset} -> ${DEST}/${name}  <- ${url}"
       continue
@@ -213,16 +223,16 @@ esac
 # needed can never fail the run.
 if [ "$want_metal" = true ]; then
   METAL_TAG="$(miner_tag metal)"
-  fetch required "$METAL_TAG" "quip.network%2Fquip-miner-metal" "quip-metal-sa" "quip-metal-gibbs"
+  fetch required "$METAL_TAG" "quip.network%2Fquip-miner-metal" "$METAL_PKG" "quip-metal-sa" "quip-metal-gibbs"
   # Optional for the same reason the experimental CPU kernels are: a Metal
   # release that predates this kernel is skipped rather than failing the run.
-  fetch optional "$METAL_TAG" "quip.network%2Fquip-miner-metal" "quip-metal-msa"
+  fetch optional "$METAL_TAG" "quip.network%2Fquip-miner-metal" "$METAL_PKG" "quip-metal-msa"
 fi
 if [ "$want_cpu" = true ]; then
   CPU_TAG="$(miner_tag cpu)"
-  fetch required "$CPU_TAG" "quip.network%2Fquip-miner-cpu" \
+  fetch required "$CPU_TAG" "quip.network%2Fquip-miner-cpu" "$CPU_PKG" \
     "quip-cpu-sa" "quip-cpu-gibbs" "quip-cpu-sb"
-  fetch optional "$CPU_TAG" "quip.network%2Fquip-miner-cpu" "${CPU_EXPERIMENTAL[@]}"
+  fetch optional "$CPU_TAG" "quip.network%2Fquip-miner-cpu" "$CPU_PKG" "${CPU_EXPERIMENTAL[@]}"
 fi
 if [ "$want_cuda" = true ]; then
   if [ "$arch" != amd64 ]; then
@@ -233,10 +243,10 @@ if [ "$want_cuda" = true ]; then
     fi
   elif [ "$cuda_required" = true ]; then
     CUDA_TAG="$(miner_tag cuda)"
-    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" "quip-cuda-msa"
+    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "$CUDA_PKG" "quip-cuda-sa" "quip-cuda-gibbs" "quip-cuda-msa"
   else
     CUDA_TAG="$(miner_tag cuda)"
-    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" "quip-cuda-msa" ||
+    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "$CUDA_PKG" "quip-cuda-sa" "quip-cuda-gibbs" "quip-cuda-msa" ||
       echo "note: cuda binaries optional (no GPU host)"
   fi
 fi
@@ -247,8 +257,8 @@ fi
 # is no published binary yet, so the container images keep installing from git.
 DWAVE_TAG="$(miner_tag dwave)"
 if [ "$os_tag" = darwin ]; then
-  fetch required "$DWAVE_TAG" "quip.network%2Fquip-miner-dwave" "quip-dwave-qa"
+  fetch required "$DWAVE_TAG" "quip.network%2Fquip-miner-dwave" "$DWAVE_PKG" "quip-dwave-qa"
 else
-  echo "dwave: pip install 'quip-miner-dwave @ git+https://gitlab.com/${GROUP}/quip-miner-dwave.git@${DWAVE_TAG}'"
+  echo "dwave: pip install 'git+https://gitlab.com/${GROUP}/quip-miner-dwave.git@${DWAVE_TAG}'"
 fi
 echo "done -> $DEST"

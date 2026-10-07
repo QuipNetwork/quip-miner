@@ -421,22 +421,28 @@ bundle-darwin-arm64:
       mkdir -p "$STAGE"
       cp dist/quip-coordinator-darwin-arm64 "$STAGE/quip-coordinator"
 
-      # repo:binary pairs pulled as <binary>-darwin-arm64. Each repo resolves
-      # to its own latest release, so dwave being ahead of the others is fine.
-      MINERS="quip-miner-cpu:quip-cpu-sa quip-miner-cpu:quip-cpu-gibbs quip-miner-metal:quip-metal-sa quip-miner-metal:quip-metal-gibbs quip-miner-dwave:quip-dwave-qa"
+      # repo:package:binary triples pulled as <binary>-darwin-arm64. Each repo
+      # resolves to its own latest release, so dwave being ahead of the others
+      # is fine. The generic-package name is spelled out rather than taken from
+      # the repo path, so a repo rename keeps release history in one package.
+      MINERS="quip-miner-cpu:quip-miner-cpu:quip-cpu-sa quip-miner-cpu:quip-miner-cpu:quip-cpu-gibbs quip-miner-metal:quip-miner-metal:quip-metal-sa quip-miner-metal:quip-miner-metal:quip-metal-gibbs quip-miner-dwave:quip-miner-dwave:quip-dwave-qa"
 
       # Kernels a release may not carry yet. Mirrors the optional tier in
       # fetch-miners.sh: an absent asset is skipped, so a Metal release cut
       # without this kernel cannot fail a whole tag pipeline.
-      OPTIONAL_MINERS="quip-miner-metal:quip-metal-msa"
+      OPTIONAL_MINERS="quip-miner-metal:quip-miner-metal:quip-metal-msa"
 
-      for pair in $MINERS $OPTIONAL_MINERS; do
-        repo="${pair%%:*}"
-        name="${pair##*:}"
+      for entry in $MINERS $OPTIONAL_MINERS; do
+        repo="${entry%%:*}"
+        pkg="${entry#*:}"
+        pkg="${pkg%%:*}"
+        name="${entry##*:}"
         proj="quip.network%2F${repo}"
         optional=0
-        case " $OPTIONAL_MINERS " in *" $pair "*) optional=1 ;; esac
-        tag=$(curl --fail --silent --show-error \
+        case " $OPTIONAL_MINERS " in *" $entry "*) optional=1 ;; esac
+        # --location: GitLab answers a renamed project's old path with a 301,
+        # and without following it the tag below parses empty.
+        tag=$(curl --fail --location --silent --show-error \
           "${API}/projects/${proj}/releases?per_page=1" \
           | sed -n 's/.*"tag_name":"\([^"]*\)".*/\1/p' | head -n 1)
         if [ -z "$tag" ]; then
@@ -444,7 +450,7 @@ bundle-darwin-arm64:
           exit 1
         fi
         echo "bundling ${repo} ${tag} ${name}-darwin-arm64"
-        URL="${API}/projects/${proj}/packages/generic/${repo}/${tag}/${name}-darwin-arm64"
+        URL="${API}/projects/${proj}/packages/generic/${pkg}/${tag}/${name}-darwin-arm64"
         if [ "$optional" = 1 ]; then
           # curl creates the output file before it reads the status line, so a
           # miss would otherwise leave a zero-byte file the coordinator execs.

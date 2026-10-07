@@ -30,7 +30,7 @@ COPY crates/quip-coordinator/tools/fetch-miners.sh /tmp/fetch-miners.sh
 RUN python -m venv /opt/venv \
     && DWAVE_TAG="$(bash /tmp/fetch-miners.sh --print-tag dwave)" \
     && /opt/venv/bin/pip install --no-cache-dir \
-       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${DWAVE_TAG}"
+       "git+https://gitlab.com/quip.network/quip-miner-dwave.git@${DWAVE_TAG}"
 
 WORKDIR /src
 
