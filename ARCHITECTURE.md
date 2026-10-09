@@ -22,7 +22,7 @@ import higher ones.
 
 | Crate | Role | Depends on |
 |-------|------|-----------|
-| `quip-miner-exec` | Generic external-solver miner: JSON model + exec over the session protocol | `quip-solver-core` |
+| `quip-solver-exec` | Generic external-solver miner: JSON model + exec over the session protocol | `quip-solver-core` |
 | `quip-coordinator` | The `quip-coordinator` binary: chain access, feeder, router, supervisor | `quip-proto`, `quip-protocol` |
 | `quip-mock-miner` | Miner test double | `quip-proto`, `quip-protocol` |
 
@@ -97,7 +97,7 @@ library-only, with no binary of its own.
 The CPU, CUDA, and Metal miners are native binaries in their own repositories
 that call `run`. The D-Wave miner is Python, built on the `quip-solver-core`
 PyPI wheel. For a backend that is a standalone executable rather than a
-Rust `Sampler`, `quip-miner-exec` is the plug-in point: it serializes each job
+Rust `Sampler`, `quip-solver-exec` is the plug-in point: it serializes each job
 to a JSON model, execs a configured external solver (by file or stdin), and
 parses the solver's JSON solutions back over the same session protocol. One part
 of the target design still differs from the source:
@@ -180,8 +180,8 @@ turns a difficulty target into `num_reads` and `num_sweeps`. The
 `quip-solver-conformance` crate's adapt vectors pin cross-language parity.
 
 Per-backend bounds are an `AdaptBounds` struct, not a fixed table in this
-repository. Each miner binary constructs its own; `quip-miner-exec` uses
-conservative CPU-SA-like bounds (`crates/quip-miner-exec/src/main.rs`). The
+repository. Each miner binary constructs its own; `quip-solver-exec` uses
+conservative CPU-SA-like bounds (`crates/quip-solver-exec/src/main.rs`). The
 CUDA, Metal, and D-Wave bounds live in their own repositories.
 
 Genesis and consensus defaults live in the chain pallet, not here. The

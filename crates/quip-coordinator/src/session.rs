@@ -645,7 +645,7 @@ pub(crate) async fn settle_pow_result<C: ChainClient>(
             let target_txt =
                 crate::logging::display_energy(st.target.as_ref().map(|t| t.max_energy_milli));
             let msg = format!(
-                "[quip-miner-{miner_id}] attempt {}: {decision} (stash: {stash_txt}, target <= {target_txt})",
+                "[quip-solver-{miner_id}] attempt {}: {decision} (stash: {stash_txt}, target <= {target_txt})",
                 short_job_id(job_id),
             );
             // A plain PoW job produces at most one Result per dispatched job,

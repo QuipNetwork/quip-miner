@@ -10,24 +10,24 @@ For deeper detail, see the companion guides: `COORDINATOR.md` covers how the coo
 
 - `crates/` — the Cargo workspace (root manifest: `Cargo.toml`):
   - `quip-coordinator` — the coordinator binary: chain access, routing, miner supervision.
-  - `quip-miner-exec` — a miner that shells out to a generic external solver.
+  - `quip-solver-exec` — a miner that shells out to a generic external solver.
   - `quip-mock-miner` — the miner test double the coordinator tests spawn.
-- `docker/` — image builds (`Dockerfile.quip-miner`, `Dockerfile.quip-miner-cuda`) and `config.toml`.
+- `docker/` — image builds (`Dockerfile.quip-solver`, `Dockerfile.quip-solver-cuda`) and `config.toml`.
 - `dwave_topologies/` — D-Wave embedding data.
 - `docs/VERSIONING.md` — the release-tag standard.
 
-The miner binaries live in their own repos: `quip.network/quip-miner-{cpu,cuda,metal,dwave}`. The `quip-proto` (wire types), `quip-protocol` (consensus math), and `quip-solver-core` (`Sampler` trait + session loop) crates come from crates.io; their source repo is `quip.network/quip-solver-core`, which also publishes the `quip-solver-core` Python wheel the D-Wave miner uses.
+The miner binaries live in their own repos: `quip.network/quip-solver-{cpu,cuda,metal,dwave}`. The `quip-proto` (wire types), `quip-protocol` (consensus math), and `quip-solver-core` (`Sampler` trait + session loop) crates come from crates.io; their source repo is `quip.network/quip-solver-core`, which also publishes the `quip-solver-core` Python wheel the D-Wave miner uses.
 
 ## CUDA card support requirement
 
 The CUDA miner supports NVIDIA GPUs with compute capability 7.0 through 12.1
 (the kernels need sm_70 for `__nanosleep`; NVRTC 12.9 supplies the 12.1
 ceiling), host driver from a CUDA 12.9 branch (r535+). The cudarc pin in
-`quip-miner-cuda` (`cuda-12090`) and the runtime image's `cuda-nvrtc-12-9`
+`quip-solver-cuda` (`cuda-12090`) and the runtime image's `cuda-nvrtc-12-9`
 package must move together — the CUDA major of the pin decides which
-`libnvrtc.so.N` the miner dlopens, and `docker/Dockerfile.quip-miner-cuda`
+`libnvrtc.so.N` the miner dlopens, and `docker/Dockerfile.quip-solver-cuda`
 asserts the load at build time. Widening or narrowing card support is a
-reviewed change to `SUPPORTED_ARCHS` in `quip-miner-cuda`
+reviewed change to `SUPPORTED_ARCHS` in `quip-solver-cuda`
 (`tests/arch_coverage.rs` enforces it), not a side effect of a toolkit bump.
 
 ## Build and test
@@ -86,7 +86,7 @@ The coordinator binary embeds the `advantage2-system1` and `smoke` topology
 presets. `drive --topology-preset` and `seed-chain` read those presets from the
 binary.
 
-The config registers miners and their launch plan. Each backend section (`[cpu]`, `[cuda.0]`, `[metal]`, `[dwave]`) becomes one supervised subprocess; `binary` selects the executable — `quip-cpu-sa`, the chromatic `quip-cpu-gibbs`, `quip-cpu-sb`, or one of quip-miner-cpu's experimental kernels when that release published it. See `crates/quip-coordinator/config.toml.example`. Miner binaries are fetched per host by `crates/quip-coordinator/tools/fetch-miners.sh` from the standalone repos and resolved on `PATH` or by absolute path.
+The config registers miners and their launch plan. Each backend section (`[cpu]`, `[cuda.0]`, `[metal]`, `[dwave]`) becomes one supervised subprocess; `binary` selects the executable — `quip-cpu-sa`, the chromatic `quip-cpu-gibbs`, `quip-cpu-sb`, or one of quip-solver-cpu's experimental kernels when that release published it. See `crates/quip-coordinator/config.toml.example`. Miner binaries are fetched per host by `crates/quip-coordinator/tools/fetch-miners.sh` from the standalone repos and resolved on `PATH` or by absolute path.
 
 `signer_key` accepts a keystore path, a 32-byte hex master seed, or a `//DevUri`
 such as `//Alice`. It also accepts any substrate secret URI, including a BIP39

@@ -50,7 +50,7 @@ public_port = 20050
 
 # CPU miner. Bundled production binaries: quip-cpu-sa (simulated annealing),
 # quip-cpu-gibbs (chromatic Gibbs), quip-cpu-sb (discrete Simulated
-# Bifurcation). The image also carries quip-miner-cpu's experimental kernels
+# Bifurcation). The image also carries quip-solver-cpu's experimental kernels
 # when that release publishes them — bsb, hdsb, hbsb, gbsb, gdsb, tedsb, sbqa,
 # ggdsb, fsa, msa, mps, mfa, flatiron. Name one here to run it; `ls
 # /usr/local/bin/quip-cpu-*` in the container shows what this image actually
@@ -72,7 +72,7 @@ binary = "quip-cpu-sa"
 # cap, so a cap below the start threshold means the gate never opens and every
 # job is rejected. The miner lifts such a cap and logs an error naming both.
 #
-# The round strategy (quip-miner-dwave v0.3.4 and later) decides at each qblock
+# The round strategy (quip-solver-dwave v0.3.4 and later) decides at each qblock
 # boundary whether to join the round or bank the budget for a faster hour of
 # the billing period. It ranks the rounds left in the period by the jobs each
 # would deliver, walks down until their cost exhausts the remaining allotment,

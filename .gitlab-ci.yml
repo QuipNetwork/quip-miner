@@ -9,7 +9,7 @@ stages:
 variables:
   # Generic package registry name for the macOS bundle. Only the release jobs
   # below use it; the image jobs address the container registry directly.
-  PKG: quip-miner
+  PKG: quip-solver
 
 # NOTE (v0.3 cutover): the v0.2 image/binary jobs were removed (they built the
 # deleted Python monolith). The v0.3 images below live under a SEPARATE
@@ -68,7 +68,7 @@ coordinator:
     - if: $CI_COMMIT_BRANCH
 
 # fetch-miners.sh is the single source of truth for pulling released miner
-# binaries — the container images (Dockerfile.quip-miner*) and the native/host
+# binaries — the container images (Dockerfile.quip-solver*) and the native/host
 # install both call it. This job lints it and dry-runs each MINER_SET, asserting
 # the right assets are selected. DRY_RUN skips downloads, so it needs no cut
 # releases and no GPU.
@@ -95,7 +95,7 @@ verify-fetch-miners:
       if echo "$out" | grep -q 'quip-cuda'; then echo "ERROR: cpu set pulled cuda"; exit 1; fi
       # The three production kernels must be required; a release that drops one
       # has to fail the image build, not ship an image missing its default
-      # miner. Everything experimental must be optional, because quip-miner-cpu
+      # miner. Everything experimental must be optional, because quip-solver-cpu
       # builds those behind a feature flag and does not attach them to every
       # release.
       echo "--- cpu: production required, experimental optional ---"
@@ -121,7 +121,7 @@ verify-fetch-miners:
       out=$(DRY_RUN=1 TARGETOS=darwin TARGETARCH=arm64 MINER_SET=auto bash "$S")
       echo "$out"
       echo "$out" | grep -q 'quip-metal-sa-darwin-arm64'
-      # quip-miner-metal publishes an msa kernel. It must be selected, and it
+      # quip-solver-metal publishes an msa kernel. It must be selected, and it
       # must be optional, so a Metal release without it cannot fail the run.
       echo "$out" | grep -q 'would fetch (optional): quip-metal-msa-darwin-arm64' ||
         { echo "ERROR: quip-metal-msa not selected as optional"; exit 1; }
@@ -138,11 +138,11 @@ verify-fetch-miners:
       echo "--- pins resolve to real releases ---"
       for m in cpu cuda metal dwave; do
         tag=$(bash "$S" --print-tag "$m")
-        url="https://gitlab.com/api/v4/projects/quip.network%2Fquip-miner-${m}/releases/${tag}"
+        url="https://gitlab.com/api/v4/projects/quip.network%2Fquip-solver-${m}/releases/${tag}"
         if wget -q -O /dev/null "$url"; then
-          echo "ok   quip-miner-${m} ${tag}"
+          echo "ok   quip-solver-${m} ${tag}"
         else
-          echo "ERROR: quip-miner-${m} has no release ${tag}" >&2
+          echo "ERROR: quip-solver-${m} has no release ${tag}" >&2
           exit 1
         fi
       done
@@ -242,9 +242,9 @@ verify-fetch-miners:
       when: manual
       allow_failure: true
 
-# quip-miner: one native kaniko build per arch, each pushing an arch-suffixed
+# quip-solver: one native kaniko build per arch, each pushing an arch-suffixed
 # tag; the manifest job stitches them. Branch = --no-push (validate).
-image-quip-miner-amd64:
+image-quip-solver-amd64:
   extends: .kaniko-image
   tags: [docker, amd64]
   variables:
@@ -252,18 +252,18 @@ image-quip-miner-amd64:
     KANIKO_LIB_IGNORE: "--ignore-path=/lib"
   script:
     - |
-      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
+      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-solver"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       DEST="--destination $IMAGE:$REF-amd64"; [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
       /kaniko/executor \
         --context "$CI_PROJECT_DIR" \
-        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner" \
+        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-solver" \
         --build-arg "TARGETARCH=amd64" \
         --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
         $KANIKO_LIB_IGNORE \
         $DEST
 
-image-quip-miner-arm64:
+image-quip-solver-arm64:
   extends: .kaniko-image
   tags: [docker, arm64]
   # The arm64 runner is a docker-executor on an Apple-Silicon Mac; a cold
@@ -274,12 +274,12 @@ image-quip-miner-arm64:
     KANIKO_EXTRA: "--compressed-caching=false"
   script:
     - |
-      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
+      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-solver"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       DEST="--destination $IMAGE:$REF-arm64"; [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
       /kaniko/executor \
         --context "$CI_PROJECT_DIR" \
-        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner" \
+        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-solver" \
         --build-arg "TARGETARCH=arm64" \
         --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
         $KANIKO_EXTRA \
@@ -288,20 +288,20 @@ image-quip-miner-arm64:
 # Stitch the per-arch images into the consumer-facing multi-arch tag, and move
 # :latest when the tag is a released version.
 # Tags only (needs the per-arch images pushed). manifest-tool substitutes ARCH.
-image-quip-miner-manifest:
+image-quip-solver-manifest:
   stage: build
   image:
     name: mplatform/manifest-tool:alpine
     entrypoint: [""]
   tags: [docker, amd64]
-  needs: [image-quip-miner-amd64, image-quip-miner-arm64]
+  needs: [image-quip-solver-amd64, image-quip-solver-arm64]
   rules:
     - *release-tag-rule
     - *rc-tag-rule
     - if: $CI_COMMIT_TAG
   script:
     - |
-      IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"; REF="$CI_COMMIT_TAG"
+      IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-solver"; REF="$CI_COMMIT_TAG"
       # One comma-separated --tags list, because manifest-tool takes a single
       # flag. POSIX sh only: the alpine image ships no bash.
       FLOATING=""
@@ -317,8 +317,8 @@ image-quip-miner-manifest:
         --template "$IMAGE:$REF-ARCH" \
         --target "$IMAGE:$REF" "$@"
 
-# quip-miner-cuda: amd64-only (nvidia/cuda base), single kaniko job on finney.
-image-quip-miner-cuda:
+# quip-solver-cuda: amd64-only (nvidia/cuda base), single kaniko job on finney.
+image-quip-solver-cuda:
   extends: .kaniko-image
   tags: [docker, amd64]
   variables:
@@ -326,7 +326,7 @@ image-quip-miner-cuda:
     KANIKO_LIB_IGNORE: "--ignore-path=/lib"
   script:
     - |
-      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda"
+      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-solver-cuda"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       DEST="--destination $IMAGE:$REF"
       [ "${MOVE_BETA:-0}" = 1 ] && DEST="$DEST --destination $IMAGE:beta"
@@ -338,7 +338,7 @@ image-quip-miner-cuda:
       echo "publishing: $DEST"
       /kaniko/executor \
         --context "$CI_PROJECT_DIR" \
-        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner-cuda" \
+        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-solver-cuda" \
         --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
         $KANIKO_LIB_IGNORE \
         $DEST
@@ -417,18 +417,18 @@ bundle-darwin-arm64:
     - |
       set -eu
       API="https://gitlab.com/api/v4"
-      STAGE=bundle/quip-miner-darwin-arm64
+      STAGE=bundle/quip-solver-darwin-arm64
       mkdir -p "$STAGE"
       cp dist/quip-coordinator-darwin-arm64 "$STAGE/quip-coordinator"
 
       # repo:binary pairs pulled as <binary>-darwin-arm64. Each repo resolves
       # to its own latest release, so dwave being ahead of the others is fine.
-      MINERS="quip-miner-cpu:quip-cpu-sa quip-miner-cpu:quip-cpu-gibbs quip-miner-metal:quip-metal-sa quip-miner-metal:quip-metal-gibbs quip-miner-dwave:quip-dwave-qa"
+      MINERS="quip-solver-cpu:quip-cpu-sa quip-solver-cpu:quip-cpu-gibbs quip-solver-metal:quip-metal-sa quip-solver-metal:quip-metal-gibbs quip-solver-dwave:quip-dwave-qa"
 
       # Kernels a release may not carry yet. Mirrors the optional tier in
       # fetch-miners.sh: an absent asset is skipped, so a Metal release cut
       # without this kernel cannot fail a whole tag pipeline.
-      OPTIONAL_MINERS="quip-miner-metal:quip-metal-msa"
+      OPTIONAL_MINERS="quip-solver-metal:quip-metal-msa"
 
       for pair in $MINERS $OPTIONAL_MINERS; do
         repo="${pair%%:*}"
@@ -465,19 +465,19 @@ bundle-darwin-arm64:
 
       # One line per repo, not per binary.
       sort -u "${STAGE}/MANIFEST" -o "${STAGE}/MANIFEST"
-      echo "quip-miner ${CI_COMMIT_TAG}" >> "${STAGE}/MANIFEST"
-      tar -czf quip-miner-darwin-arm64.tar.gz -C bundle quip-miner-darwin-arm64
-      ls -l quip-miner-darwin-arm64.tar.gz
+      echo "quip-solver ${CI_COMMIT_TAG}" >> "${STAGE}/MANIFEST"
+      tar -czf quip-solver-darwin-arm64.tar.gz -C bundle quip-solver-darwin-arm64
+      ls -l quip-solver-darwin-arm64.tar.gz
       cat "${STAGE}/MANIFEST"
     - |
       curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" \
-        --upload-file quip-miner-darwin-arm64.tar.gz \
-        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}/quip-miner-darwin-arm64.tar.gz"
+        --upload-file quip-solver-darwin-arm64.tar.gz \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}/quip-solver-darwin-arm64.tar.gz"
   artifacts:
-    paths: [quip-miner-darwin-arm64.tar.gz]
+    paths: [quip-solver-darwin-arm64.tar.gz]
     expire_in: 1 week
 
-# quip-miner tags previously produced container images and nothing else, so no
+# quip-solver tags previously produced container images and nothing else, so no
 # Release object existed for v0.3.0-rc1 or -rc2. quip-node-manager resolves the
 # newest version from Releases, so this job is required, not cosmetic.
 release-binaries:
@@ -496,5 +496,5 @@ release-binaries:
   script:
     - |
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
-      release-cli create --name "quip-miner ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
-        --assets-link "{\"name\":\"quip-miner-darwin-arm64.tar.gz\",\"url\":\"${base}/quip-miner-darwin-arm64.tar.gz\"}"
+      release-cli create --name "quip-solver ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
+        --assets-link "{\"name\":\"quip-solver-darwin-arm64.tar.gz\",\"url\":\"${base}/quip-solver-darwin-arm64.tar.gz\"}"

@@ -5,7 +5,7 @@
 # per-platform binaries as generic-package assets; the coordinator no longer
 # builds them.
 #
-# Single source of truth: the container images (docker/Dockerfile.quip-miner*)
+# Single source of truth: the container images (docker/Dockerfile.quip-solver*)
 # and the native/host install both call this script instead of duplicating the
 # fetch logic.
 #
@@ -57,7 +57,7 @@ latest_tag() {
 # release.
 #
 # Each repo resolves on its own. Never derive these from the coordinator's own
-# release tag: quip-miner v0.3.0-rc4 shipped a coordinator fix while every miner
+# release tag: quip-solver v0.3.0-rc4 shipped a coordinator fix while every miner
 # stood still, and a build that assumed one shared tag looked for miner releases
 # that were never cut. Taking each repo's newest keeps that independence and
 # stops the pins going stale, which had left the images on cpu v0.3.0-rc3 long
@@ -65,10 +65,10 @@ latest_tag() {
 miner_tag() {
   local repo var override tag
   case "${1:-}" in
-  cpu) repo=quip-miner-cpu var=CPU_MINERS_TAG override="${CPU_MINERS_TAG:-}" ;;
-  cuda) repo=quip-miner-cuda var=CUDA_MINERS_TAG override="${CUDA_MINERS_TAG:-}" ;;
-  metal) repo=quip-miner-metal var=METAL_MINERS_TAG override="${METAL_MINERS_TAG:-}" ;;
-  dwave) repo=quip-miner-dwave var=DWAVE_MINERS_TAG override="${DWAVE_MINERS_TAG:-}" ;;
+  cpu) repo=quip-solver-cpu var=CPU_MINERS_TAG override="${CPU_MINERS_TAG:-}" ;;
+  cuda) repo=quip-solver-cuda var=CUDA_MINERS_TAG override="${CUDA_MINERS_TAG:-}" ;;
+  metal) repo=quip-solver-metal var=METAL_MINERS_TAG override="${METAL_MINERS_TAG:-}" ;;
+  dwave) repo=quip-solver-dwave var=DWAVE_MINERS_TAG override="${DWAVE_MINERS_TAG:-}" ;;
   *)
     echo "needs a miner: cpu|cuda|metal|dwave" >&2
     return 1
@@ -167,11 +167,11 @@ fetch() {
 }
 
 # Experimental CPU kernels, fetched alongside the production three. These build
-# behind quip-miner-cpu's opt-in `experimental` cargo feature, and that repo has
+# behind quip-solver-cpu's opt-in `experimental` cargo feature, and that repo has
 # not attached them to a release yet, so every name here is optional: the ones a
 # release carries land in DEST and the rest are skipped without failing an image
 # build. They are inert until a config.toml `[cpu] binary =` names one.
-# Source of truth for the list: the binaries table in quip-miner-cpu's README.
+# Source of truth for the list: the binaries table in quip-solver-cpu's README.
 CPU_EXPERIMENTAL=(
   quip-cpu-bsb quip-cpu-hdsb quip-cpu-hbsb quip-cpu-gbsb quip-cpu-gdsb
   quip-cpu-tedsb quip-cpu-sbqa quip-cpu-ggdsb quip-cpu-fsa quip-cpu-msa
@@ -213,16 +213,16 @@ esac
 # needed can never fail the run.
 if [ "$want_metal" = true ]; then
   METAL_TAG="$(miner_tag metal)"
-  fetch required "$METAL_TAG" "quip.network%2Fquip-miner-metal" "quip-metal-sa" "quip-metal-gibbs"
+  fetch required "$METAL_TAG" "quip.network%2Fquip-solver-metal" "quip-metal-sa" "quip-metal-gibbs"
   # Optional for the same reason the experimental CPU kernels are: a Metal
   # release that predates this kernel is skipped rather than failing the run.
-  fetch optional "$METAL_TAG" "quip.network%2Fquip-miner-metal" "quip-metal-msa"
+  fetch optional "$METAL_TAG" "quip.network%2Fquip-solver-metal" "quip-metal-msa"
 fi
 if [ "$want_cpu" = true ]; then
   CPU_TAG="$(miner_tag cpu)"
-  fetch required "$CPU_TAG" "quip.network%2Fquip-miner-cpu" \
+  fetch required "$CPU_TAG" "quip.network%2Fquip-solver-cpu" \
     "quip-cpu-sa" "quip-cpu-gibbs" "quip-cpu-sb"
-  fetch optional "$CPU_TAG" "quip.network%2Fquip-miner-cpu" "${CPU_EXPERIMENTAL[@]}"
+  fetch optional "$CPU_TAG" "quip.network%2Fquip-solver-cpu" "${CPU_EXPERIMENTAL[@]}"
 fi
 if [ "$want_cuda" = true ]; then
   if [ "$arch" != amd64 ]; then
@@ -233,10 +233,10 @@ if [ "$want_cuda" = true ]; then
     fi
   elif [ "$cuda_required" = true ]; then
     CUDA_TAG="$(miner_tag cuda)"
-    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" "quip-cuda-msa"
+    fetch required "$CUDA_TAG" "quip.network%2Fquip-solver-cuda" "quip-cuda-sa" "quip-cuda-gibbs" "quip-cuda-msa"
   else
     CUDA_TAG="$(miner_tag cuda)"
-    fetch required "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" "quip-cuda-msa" ||
+    fetch required "$CUDA_TAG" "quip.network%2Fquip-solver-cuda" "quip-cuda-sa" "quip-cuda-gibbs" "quip-cuda-msa" ||
       echo "note: cuda binaries optional (no GPU host)"
   fi
 fi
@@ -247,8 +247,8 @@ fi
 # is no published binary yet, so the container images keep installing from git.
 DWAVE_TAG="$(miner_tag dwave)"
 if [ "$os_tag" = darwin ]; then
-  fetch required "$DWAVE_TAG" "quip.network%2Fquip-miner-dwave" "quip-dwave-qa"
+  fetch required "$DWAVE_TAG" "quip.network%2Fquip-solver-dwave" "quip-dwave-qa"
 else
-  echo "dwave: pip install 'quip-miner-dwave @ git+https://gitlab.com/${GROUP}/quip-miner-dwave.git@${DWAVE_TAG}'"
+  echo "dwave: pip install 'quip-solver-dwave @ git+https://gitlab.com/${GROUP}/quip-solver-dwave.git@${DWAVE_TAG}'"
 fi
 echo "done -> $DEST"

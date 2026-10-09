@@ -2,8 +2,8 @@
 //! fake solvers are `sh` one-liners.
 #![cfg(unix)]
 
-use quip_miner_exec::ExecSampler;
 use quip_solver_core::{IsingGraph, SampleError, SampleParams, Sampler};
+use quip_solver_exec::ExecSampler;
 
 /// A 2-node problem, so valid solutions have `spins.len() == 2`.
 fn graph() -> IsingGraph {
