@@ -1,15 +1,15 @@
 [package]
-name = "quip-miner-exec"
+name = "quip-solver-exec"
 version = "0.3.0"
 edition = "2021"
 description = "Generic external-solver miner: exec a standalone solver over the quip session protocol"
 
 [lib]
-name = "quip_miner_exec"
+name = "quip_solver_exec"
 path = "src/lib.rs"
 
 [[bin]]
-name = "quip-miner-exec"
+name = "quip-solver-exec"
 path = "src/main.rs"
 
 [dependencies]

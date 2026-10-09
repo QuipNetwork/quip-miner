@@ -1,10 +1,10 @@
-# quip-miner (v0.3) — coordinator + CPU + D-Wave miners.
+# quip-solver (v0.3) — coordinator + CPU + D-Wave miners.
 # Multi-arch (linux/amd64, linux/arm64) via buildx; TARGETARCH selects the
 # released CPU binaries. The coordinator is built from source; the CPU miner
 # binaries are downloaded from their release; the D-Wave miner is a Python
 # package whose protocol dependency resolves as a prebuilt quip-solver-core
 # wheel from PyPI on both architectures (amd64 and aarch64 wheels since
-# quip-solver-core 0.0.1-rc1, pinned by quip-miner-dwave v0.3.2-rc1).
+# quip-solver-core 0.0.1-rc1, pinned by quip-solver-dwave v0.3.2-rc1).
 
 # --- builder: D-Wave venv (Python) then quip-coordinator (Rust) ---
 # Python is independent of the Rust build. Keep it above cargo so a Rust
@@ -30,7 +30,7 @@ COPY crates/quip-coordinator/tools/fetch-miners.sh /tmp/fetch-miners.sh
 RUN python -m venv /opt/venv \
     && DWAVE_TAG="$(bash /tmp/fetch-miners.sh --print-tag dwave)" \
     && /opt/venv/bin/pip install --no-cache-dir \
-       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${DWAVE_TAG}"
+       "quip-solver-dwave @ git+https://gitlab.com/quip.network/quip-solver-dwave.git@${DWAVE_TAG}"
 
 WORKDIR /src
 
@@ -38,13 +38,13 @@ WORKDIR /src
 # stub sources, then copy real sources and rebuild the binary. A source-only
 # change reuses the compiled external crates in target/.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY crates/quip-miner-exec/Cargo.toml crates/quip-miner-exec/
+COPY crates/quip-solver-exec/Cargo.toml crates/quip-solver-exec/
 COPY crates/quip-coordinator/Cargo.toml crates/quip-coordinator/
 COPY crates/quip-mock-miner/Cargo.toml crates/quip-mock-miner/
 RUN set -eux; \
-    mkdir -p crates/quip-miner-exec/src; \
-    printf 'pub fn _docker_dep_stub() {}\n' > crates/quip-miner-exec/src/lib.rs; \
-    printf 'fn main() {}\n' > crates/quip-miner-exec/src/main.rs; \
+    mkdir -p crates/quip-solver-exec/src; \
+    printf 'pub fn _docker_dep_stub() {}\n' > crates/quip-solver-exec/src/lib.rs; \
+    printf 'fn main() {}\n' > crates/quip-solver-exec/src/main.rs; \
     mkdir -p crates/quip-coordinator/src; \
     printf 'pub fn _docker_dep_stub() {}\n' > crates/quip-coordinator/src/lib.rs; \
     printf 'fn main() {}\n' > crates/quip-coordinator/src/main.rs; \
@@ -62,8 +62,8 @@ RUN find crates -name '*.rs' -exec touch {} + \
 # --- runtime ---
 FROM python:3.12-slim-bookworm
 
-LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-miner"
-LABEL description="quip-miner v0.3 — coordinator + CPU + D-Wave"
+LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-solver"
+LABEL description="quip-solver v0.3 — coordinator + CPU + D-Wave"
 
 ARG TARGETARCH
 ARG QUIP_DOCKER_IMAGE=""

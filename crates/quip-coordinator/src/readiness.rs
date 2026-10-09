@@ -610,7 +610,7 @@ mod tests {
             }],
             python: "3.12.7".into(),
             in_docker: true,
-            docker_image: Some("registry.example/quip-miner:beta".into()),
+            docker_image: Some("registry.example/quip-solver:beta".into()),
         }
     }
 

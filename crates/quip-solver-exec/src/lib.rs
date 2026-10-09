@@ -3,7 +3,7 @@
 //! Each job is serialized to a JSON model, handed to a configured external
 //! solver (by file path or stdin), and the solver's JSON solutions are parsed
 //! back into [`SamplerResult`]s. This lets a standalone executable act as a
-//! quip miner without implementing the Rust [`Sampler`] trait natively — the
+//! quip solver without implementing the Rust [`Sampler`] trait natively — the
 //! unbuilt "wrapper" seam from the v0.3 architecture (design point 4c).
 //!
 //! Contract with the external solver:

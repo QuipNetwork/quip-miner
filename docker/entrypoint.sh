@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Entrypoint for the quip-miner v0.3 image: run the quip-coordinator, which
+# Entrypoint for the quip-solver v0.3 image: run the quip-coordinator, which
 # connects to the chain and supervises the bundled miner binaries per config.
 set -euo pipefail
 

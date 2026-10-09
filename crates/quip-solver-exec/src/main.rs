@@ -1,16 +1,16 @@
-//! `quip-miner-exec`: a miner that shells out to a generic external solver.
+//! `quip-solver-exec`: a miner that shells out to a generic external solver.
 //!
-//! See [`quip_miner_exec`] for the solver contract. Handshake and session flow
+//! See [`quip_solver_exec`] for the solver contract. Handshake and session flow
 //! are handled by [`quip_solver_core::run`]; this binary only parses the
 //! solver-specific flags and builds an [`ExecSampler`].
 
 use clap::Parser;
-use quip_miner_exec::ExecSampler;
 use quip_solver_core::{
     adapt::AdaptBounds,
     quip_proto::v1::{Algorithm, Backend},
     run, BackendIdentity, CommonArgs, OpenError,
 };
+use quip_solver_exec::ExecSampler;
 use std::process::ExitCode;
 
 #[derive(Parser)]

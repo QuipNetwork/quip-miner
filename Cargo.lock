@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "quip-coordinator"
-version = "0.3.5-rc11"
+version = "0.3.5-rc12"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -3079,17 +3079,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quip-miner-exec"
-version = "0.3.0"
-dependencies = [
- "clap",
- "quip-solver-core",
- "serde",
- "serde_json",
- "shlex 1.3.0",
-]
-
-[[package]]
 name = "quip-mock-miner"
 version = "0.3.0"
 dependencies = [
@@ -3157,6 +3146,17 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "quip-solver-exec"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "quip-solver-core",
+ "serde",
+ "serde_json",
+ "shlex 1.3.0",
 ]
 
 [[package]]

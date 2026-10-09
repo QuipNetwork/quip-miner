@@ -1,4 +1,4 @@
-# quip-miner
+# quip-solver
 
 > **Experimental software.** Use at your own risk. No production warranties.
 
@@ -19,11 +19,11 @@ consumed from crates.io. The miner binaries ship from their own repositories.
 ## Repository layout
 
 - `crates/` — the Cargo workspace: `quip-coordinator` (the binary),
-  `quip-miner-exec` (a miner that shells out to an external solver), and
+  `quip-solver-exec` (a miner that shells out to an external solver), and
   `quip-mock-miner` (the miner test double).
 - `docker/` — image builds and the example coordinator config.
 
-The miner binaries live in `quip.network/quip-miner-{cpu,cuda,metal,dwave}`.
+The miner binaries live in `quip.network/quip-solver-{cpu,cuda,metal,dwave}`.
 The `quip-proto`, `quip-protocol`, and `quip-solver-core` dependencies come
 from crates.io at v0.0.0; their source of truth is
 `quip.network/quip-solver-core`.
@@ -33,7 +33,7 @@ from crates.io at v0.0.0; their source of truth is
 The CUDA miner supports NVIDIA GPUs with compute capability 7.0 through 12.1
 (Volta through consumer Blackwell). The floor is set by the kernels (they use
 `__nanosleep`, an sm_70+ instruction); the ceiling by NVRTC 12.9, which the
-`quip-miner-cuda` image ships. The host needs an NVIDIA driver from a
+`quip-solver-cuda` image ships. The host needs an NVIDIA driver from a
 CUDA 12.9-supported branch (r535 or newer) and the NVIDIA container runtime
 (`--gpus all`). Kernels are JIT-compiled per card for its detected
 capability; capabilities outside the range are clamped, and capabilities the

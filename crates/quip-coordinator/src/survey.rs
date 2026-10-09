@@ -974,7 +974,7 @@ mod tests {
         // A probed interpreter survives; the sentinel stands in when none does.
         let probed = sanitize(RawSurvey {
             python: "3.12.7".to_owned(),
-            docker_image: Some("registry.example/quip-miner:beta".to_owned()),
+            docker_image: Some("registry.example/quip-solver:beta".to_owned()),
             in_docker: true,
             ..RawSurvey::default()
         })
@@ -983,7 +983,7 @@ mod tests {
         assert!(probed.in_docker);
         assert_eq!(
             probed.docker_image.as_deref(),
-            Some(b"registry.example/quip-miner:beta".as_slice())
+            Some(b"registry.example/quip-solver:beta".as_slice())
         );
         assert!(super::runtime_fits_pallet_bounds(&probed));
     }
