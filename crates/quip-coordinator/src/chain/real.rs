@@ -2355,6 +2355,13 @@ mod tests {
             }
         }
 
+        fn type_bid(tag: u8) -> JobOrderScale {
+            scale_order(JobMode::Bid {
+                miners: None,
+                miner_types: Some(vec![tag]),
+            })
+        }
+
         fn client_for(
             account: [u8; 32],
             solver_type: Option<SolverType>,
@@ -2385,6 +2392,13 @@ mod tests {
         async fn assert_order_count(client: &RealChainClient, account: [u8; 32], expected: usize) {
             let orders = client.fetch_mempool_orders(account).await.expect("orders");
             assert_eq!(orders.len(), expected);
+        }
+
+        fn assert_decode_error(error: &ChainError) {
+            assert!(match error {
+                ChainError::Decode(_) => true,
+                ChainError::Unavailable(_) | ChainError::Submit(_) => false,
+            });
         }
 
         #[async_trait::async_trait]
@@ -2509,10 +2523,7 @@ mod tests {
             let (validator, client) = client_for(
                 account,
                 Some(SolverType::Gpu),
-                vec![scale_order(JobMode::Bid {
-                    miners: None,
-                    miner_types: Some(vec![1]),
-                })],
+                vec![type_bid(1)],
                 MinerKind::Metal,
             );
             assert_eq!(
@@ -2531,10 +2542,7 @@ mod tests {
             let (validator, client) = client_for(
                 account,
                 Some(SolverType::Cpu),
-                vec![scale_order(JobMode::Bid {
-                    miners: None,
-                    miner_types: Some(vec![1]),
-                })],
+                vec![type_bid(1)],
                 MinerKind::Metal,
             );
             assert_order_count(&client, account, 0).await;
@@ -2557,10 +2565,7 @@ mod tests {
             let (validator, client) = client_for(
                 account,
                 Some(SolverType::Cpu),
-                vec![scale_order(JobMode::Bid {
-                    miners: None,
-                    miner_types: Some(vec![1]),
-                })],
+                vec![type_bid(1)],
                 MinerKind::Metal,
             );
             assert!(!client
@@ -2577,15 +2582,7 @@ mod tests {
         #[tokio::test]
         async fn missing_registration_is_not_cached_as_a_permanent_absence() {
             let account = alice_account();
-            let (validator, client) = client_for(
-                account,
-                None,
-                vec![scale_order(JobMode::Bid {
-                    miners: None,
-                    miner_types: Some(vec![0]),
-                })],
-                MinerKind::Cpu,
-            );
+            let (validator, client) = client_for(account, None, vec![type_bid(0)], MinerKind::Cpu);
             assert_order_count(&client, account, 0).await;
             *validator.registration.lock().expect("registration") =
                 registration(account, SolverType::Cpu);
@@ -2599,10 +2596,7 @@ mod tests {
             let (validator, client) = client_for(
                 account,
                 Some(SolverType::Cpu),
-                vec![scale_order(JobMode::Bid {
-                    miners: None,
-                    miner_types: Some(vec![0]),
-                })],
+                vec![type_bid(0)],
                 MinerKind::Cpu,
             );
             *validator.registration.lock().expect("registration") = Value::String("0xff".into());
@@ -2610,10 +2604,7 @@ mod tests {
                 .fetch_mempool_orders(account)
                 .await
                 .expect_err("truncated registration");
-            assert!(match error {
-                ChainError::Decode(_) => true,
-                ChainError::Unavailable(_) | ChainError::Submit(_) => false,
-            });
+            assert_decode_error(&error);
             *validator.registration.lock().expect("registration") =
                 registration(account, SolverType::Cpu);
             assert_order_count(&client, account, 1).await;
@@ -2626,10 +2617,7 @@ mod tests {
             let (validator, client) = client_for(
                 account,
                 Some(SolverType::Cpu),
-                vec![scale_order(JobMode::Bid {
-                    miners: None,
-                    miner_types: Some(vec![0]),
-                })],
+                vec![type_bid(0)],
                 MinerKind::Cpu,
             );
             *validator.registration.lock().expect("registration") =
@@ -2654,10 +2642,7 @@ mod tests {
             let (validator, client) = client_for(
                 account,
                 Some(SolverType::Gpu),
-                vec![scale_order(JobMode::Bid {
-                    miners: None,
-                    miner_types: Some(vec![1]),
-                })],
+                vec![type_bid(1)],
                 MinerKind::Metal,
             );
             let _ = client
@@ -2669,10 +2654,7 @@ mod tests {
                 .ensure_solver_registered()
                 .await
                 .expect_err("bad refresh");
-            assert!(match error {
-                ChainError::Decode(_) => true,
-                ChainError::Unavailable(_) | ChainError::Submit(_) => false,
-            });
+            assert_decode_error(&error);
             *validator.registration.lock().expect("registration") =
                 registration(account, SolverType::Cpu);
             assert_order_count(&client, account, 0).await;
@@ -2685,10 +2667,7 @@ mod tests {
             let (validator, client) = client_for(
                 account,
                 Some(SolverType::Cpu),
-                vec![scale_order(JobMode::Bid {
-                    miners: None,
-                    miner_types: Some(vec![0]),
-                })],
+                vec![type_bid(0)],
                 MinerKind::Cpu,
             );
             assert_order_count(&client, account, 1).await;
