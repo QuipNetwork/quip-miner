@@ -6,12 +6,13 @@ use quip_coordinator::chain::extrinsic::{
 };
 use quip_coordinator::chain::scale_types::DifficultyConfig;
 use quip_coordinator::chain::{
-    seed_chain, RealChainClient, SeedParams, SeedReport, SeedTopology, DEFAULT_SEED_DIFFICULTY,
+    seed_chain, MinerKind, RealChainClient, SeedParams, SeedReport, SeedTopology,
+    DEFAULT_SEED_DIFFICULTY,
 };
 use quip_coordinator::config::{parse_config, CoordinatorConfig, LaunchEntry};
 use quip_coordinator::drive::{
     aggregate, drain_all, parse_topology_spec, print_table, run_drive, write_jsonl,
-    DriveManyParams, LeaseSource, ListSource, RandomSource,
+    DriveManyParams, LeaseSource, ListSource, RandomSource, TopologySpec,
 };
 use quip_coordinator::logging::LogLevel;
 use quip_coordinator::presets::preset_spec;
@@ -50,7 +51,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Drive a spawned miner with synthetic work; no chain, no submit.
+    /// Drive a spawned miner with generated or replayed work; no submit.
     Drive(DriveArgs),
     /// Create a signer keystore at --out. Refuses to overwrite.
     Keygen(KeygenArgs),
@@ -110,22 +111,29 @@ enum DriveSourceKind {
 }
 
 #[derive(clap::Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("drive_topology")
+        .args(["topology", "topology_preset", "topology_from_chain"])
+        .multiple(false)
+))]
 struct DriveArgs {
     /// Miner binary to spawn.
     #[arg(long)]
     miner: PathBuf,
-    /// Job source: golden-draw random problems, salt leases, or a JSONL replay list.
+    /// Job source: random problems, salt leases, or a JSONL replay list.
     #[arg(long, value_enum)]
     source: DriveSourceKind,
-    /// Topology spec JSON. For `--source random`, optional — defaults to the
-    /// `advantage2-system1` preset if neither this nor `--topology-preset` is
-    /// given. For `--source list`, needed only if the list has a nonce-ref entry.
+    /// Topology spec JSON. Random and lease default to Advantage2 when no
+    /// topology selector is given. Nonce-ref list entries need a topology.
     #[arg(long)]
     topology: Option<PathBuf>,
-    /// Built-in topology by name (`advantage2-system1`, `smoke`), embedded in
-    /// the binary. Mutually exclusive with `--topology`.
+    /// Built-in topology: `advantage2-system1`, `aglais`, or `smoke`.
     #[arg(long)]
     topology_preset: Option<String>,
+    /// Read the validator's default topology once from this RPC URL.
+    /// Mutually exclusive with `--topology` and `--topology-preset`.
+    #[arg(long, value_name = "URL")]
+    topology_from_chain: Option<String>,
     /// Number of problems (`random`) or salts (`lease`) to draw.
     #[arg(long, default_value_t = 10)]
     count: u32,
@@ -623,10 +631,7 @@ fn energy_to_milli(e: f64) -> i64 {
 
 /// Build the `SetTarget` a drive run advertises, from the spec's gates, with
 /// optional CLI overrides (`--target-energy`, `--min-solutions`).
-fn set_target_from_spec(
-    spec: &quip_coordinator::drive::TopologySpec,
-    args: &DriveArgs,
-) -> quip_proto::v1::SetTarget {
+fn set_target_from_spec(spec: &TopologySpec, args: &DriveArgs) -> quip_proto::v1::SetTarget {
     let max_energy_milli = args
         .target_energy
         .map_or(spec.max_energy_milli, energy_to_milli);
@@ -641,37 +646,30 @@ fn set_target_from_spec(
     }
 }
 
-/// Load the requested job source, returning its jobs plus the wire `Topology`
-/// message (if any). Any synthetic `MiningSnapshot` needed to re-derive
-/// nonce-ref list entries is consumed inside `ListSource::load` and is not
-/// returned: drive mode has no chain to wire it into.
-fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
-    let topo_text = resolve_topology_text(args)?;
+/// Build jobs from one resolved topology spec, without network I/O.
+fn build_jobs(
+    args: &DriveArgs,
+    spec: Option<TopologySpec>,
+    deadline_ms: u64,
+) -> Result<BuiltJobs, String> {
     match args.source {
         DriveSourceKind::Random => {
-            let text =
-                topo_text.ok_or("--source random requires --topology or --topology-preset")?;
-            let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
-            let miner_account = [0u8; 32];
-            let mut src =
-                RandomSource::new(&spec, miner_account, args.seed, args.count, deadline_ms);
-            let jobs = drain_all(&mut src);
+            let spec = spec.ok_or("--source random requires a topology")?;
+            let mut source = RandomSource::new(&spec, [0; 32], args.seed, args.count, deadline_ms);
+            let jobs = drain_all(&mut source);
             let target = set_target_from_spec(&spec, args);
             Ok((jobs, Some(spec.topology), Some(target)))
         }
         DriveSourceKind::Lease => {
-            let text =
-                topo_text.ok_or("--source lease requires --topology or --topology-preset")?;
-            let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
-            let miner_account = [0u8; 32];
-            let mut src = LeaseSource::new(
+            let spec = spec.ok_or("--source lease requires a topology")?;
+            let mut source = LeaseSource::new(
                 &spec,
-                miner_account,
+                [0; 32],
                 args.seed,
                 u64::from(args.count),
                 args.lease_size,
             );
-            let jobs = drain_all(&mut src);
+            let jobs = drain_all(&mut source);
             let target = set_target_from_spec(&spec, args);
             Ok((jobs, Some(spec.topology), Some(target)))
         }
@@ -680,49 +678,53 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
                 .list
                 .as_ref()
                 .ok_or("--source list requires --list <models.jsonl>")?;
-            let (topology, snapshot, target) = match &topo_text {
-                Some(text) => {
-                    let spec = parse_topology_spec(text).map_err(|e| e.to_string())?;
+            let (topology, snapshot, target) = match spec {
+                Some(spec) => {
                     let target = set_target_from_spec(&spec, args);
-                    (
-                        Some(spec.topology.clone()),
-                        Some(spec.to_snapshot()),
-                        Some(target),
-                    )
+                    let snapshot = spec.to_snapshot();
+                    (Some(spec.topology), Some(snapshot), Some(target))
                 }
                 None => (None, None, None),
             };
-            let mut src = ListSource::load(list_path, snapshot.as_ref(), deadline_ms)
-                .map_err(|e| e.to_string())?;
-            let jobs = drain_all(&mut src);
-            Ok((jobs, topology, target))
+            let mut source = ListSource::load(list_path, snapshot.as_ref(), deadline_ms)
+                .map_err(|error| error.to_string())?;
+            Ok((drain_all(&mut source), topology, target))
         }
     }
 }
 
-/// Default preset used by `--source random` and `--source lease` when no topology is specified.
+/// Default for generated work when no topology selector is supplied.
 const DEFAULT_PRESET: &str = "advantage2-system1";
 
-/// Resolve the topology spec text from `--topology` / `--topology-preset`.
-/// `--source random` and `--source lease` fall back to [`DEFAULT_PRESET`];
-/// `--source list` returns `None` (a nonce-ref list supplies its own topology or needs none).
-fn resolve_topology_text(args: &DriveArgs) -> Result<Option<String>, String> {
-    if args.topology.is_some() && args.topology_preset.is_some() {
-        return Err("--topology and --topology-preset are mutually exclusive".into());
-    }
-    if let Some(p) = &args.topology {
-        return std::fs::read_to_string(p)
+/// Resolve a file, preset, or one read-only chain lookup before job creation.
+async fn resolve_topology(args: &DriveArgs) -> Result<Option<TopologySpec>, String> {
+    if let Some(url) = &args.topology_from_chain {
+        let client = RealChainClient::new(vec![url.clone()], String::new(), MinerKind::Cpu);
+        let (hash, meta) = client
+            .fetch_default_topology()
+            .await
+            .map_err(|error| format!("fetch topology from {url}: {error}"))?
+            .ok_or_else(|| format!("fetch topology from {url}: chain has no default topology"))?;
+        return TopologySpec::from_chain_meta(hash, meta)
             .map(Some)
-            .map_err(|e| format!("read topology {}: {e}", p.display()));
+            .map_err(|error| format!("topology from {url}: {error}"));
     }
-    if let Some(name) = &args.topology_preset {
-        return preset_spec(name).map(|s| Some(s.to_string()));
-    }
-    match args.source {
-        DriveSourceKind::Random => preset_spec(DEFAULT_PRESET).map(|s| Some(s.to_string())),
-        DriveSourceKind::Lease => preset_spec(DEFAULT_PRESET).map(|s| Some(s.to_string())),
-        DriveSourceKind::List => Ok(None),
-    }
+    let text = if let Some(path) = &args.topology {
+        std::fs::read_to_string(path)
+            .map_err(|error| format!("read topology {}: {error}", path.display()))?
+    } else if let Some(name) = &args.topology_preset {
+        preset_spec(name)?.to_string()
+    } else {
+        match args.source {
+            DriveSourceKind::Random | DriveSourceKind::Lease => {
+                preset_spec(DEFAULT_PRESET)?.to_string()
+            }
+            DriveSourceKind::List => return Ok(None),
+        }
+    };
+    parse_topology_spec(&text)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 #[expect(
@@ -767,14 +769,20 @@ fn drive_entry(args: &DriveArgs) -> LaunchEntry {
     reason = "CLI binary reports drive run failures to stderr"
 )]
 async fn drive_main(args: DriveArgs, log_level: LogLevel) -> StdExitCode {
-    // 0 => no deadline (the sentinel the miner honors); otherwise an absolute
-    // wall-clock deadline `now + args.deadline_ms`.
+    let spec = match resolve_topology(&args).await {
+        Ok(spec) => spec,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+        }
+    };
+    // 0 means no deadline. Compute a live deadline after the topology lookup.
     let deadline_ms = if args.deadline_ms == 0 {
         0
     } else {
         now_unix_ms() + args.deadline_ms
     };
-    let (jobs, topology, target) = match build_jobs(&args, deadline_ms) {
+    let (jobs, topology, target) = match build_jobs(&args, spec, deadline_ms) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -856,6 +864,7 @@ mod tests {
             source,
             topology: None,
             topology_preset: None,
+            topology_from_chain: None,
             count: 10,
             seed: 0,
             lease_size: 64,
@@ -873,33 +882,241 @@ mod tests {
     }
 
     #[test]
-    fn topology_and_preset_together_is_error() {
-        let mut a = drive_args(DriveSourceKind::Random);
-        a.topology = Some(PathBuf::from("t.json"));
-        a.topology_preset = Some("smoke".into());
-        assert!(resolve_topology_text(&a).is_err());
+    fn drive_topology_selectors_conflict_in_clap() {
+        for selectors in [
+            ["--topology", "missing.json", "--topology-preset", "aglais"],
+            [
+                "--topology",
+                "missing.json",
+                "--topology-from-chain",
+                "ws://fixture",
+            ],
+            [
+                "--topology-preset",
+                "aglais",
+                "--topology-from-chain",
+                "ws://fixture",
+            ],
+        ] {
+            let error = Cli::try_parse_from(
+                [
+                    "quip-coordinator",
+                    "drive",
+                    "--miner",
+                    "miner",
+                    "--source",
+                    "random",
+                ]
+                .into_iter()
+                .chain(selectors),
+            )
+            .expect_err("expected conflicting topology selectors");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]
-    fn random_source_defaults_to_the_advantage2_preset() {
-        let a = drive_args(DriveSourceKind::Random);
-        let text = resolve_topology_text(&a).unwrap().unwrap();
-        let spec = parse_topology_spec(&text).unwrap();
-        assert_eq!(spec.topology.nodes.len(), 4577);
+    fn drive_chain_selector_parses_for_each_source() {
+        for source in ["random", "lease", "list"] {
+            let cli = Cli::try_parse_from([
+                "quip-coordinator",
+                "drive",
+                "--miner",
+                "miner",
+                "--source",
+                source,
+                "--topology-from-chain",
+                "ws://fixture",
+            ])
+            .expect("chain topology selector parses");
+            let Some(Command::Drive(args)) = cli.command else {
+                panic!("expected drive command");
+            };
+            assert_eq!(args.topology_from_chain.as_deref(), Some("ws://fixture"));
+            assert!(args.topology.is_none());
+            assert!(args.topology_preset.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_random_and_lease_keep_the_default_preset() {
+        for source in [DriveSourceKind::Random, DriveSourceKind::Lease] {
+            let args = drive_args(source);
+            let spec = resolve_topology(&args)
+                .await
+                .expect("resolve default topology")
+                .expect("missing default preset");
+            assert_eq!(spec.topology.nodes.len(), 4_577);
+            assert_eq!(spec.topology.edge_pairs().len(), 41_515);
+            assert_eq!(spec.allowed_h_milli, vec![-1000, 0, 1000]);
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_list_defaults_to_no_topology() {
+        let args = drive_args(DriveSourceKind::List);
+        assert!(resolve_topology(&args)
+            .await
+            .expect("resolve list topology")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn drive_named_presets_and_files_resolve() {
+        let mut args = drive_args(DriveSourceKind::Random);
+        args.topology_preset = Some("aglais".into());
+        let spec = resolve_topology(&args)
+            .await
+            .expect("resolve Aglais")
+            .expect("missing Aglais");
+        assert_eq!(spec.topology.edge_pairs().len(), 41_514);
+        let file = tempfile::NamedTempFile::new().expect("temporary topology file");
+        std::fs::write(file.path(), preset_spec("smoke").expect("smoke preset"))
+            .expect("write topology file");
+        args.topology_preset = None;
+        args.topology = Some(file.path().to_path_buf());
+        let spec = resolve_topology(&args)
+            .await
+            .expect("resolve topology file")
+            .expect("missing file topology");
+        let smoke = parse_topology_spec(preset_spec("smoke").expect("smoke preset"))
+            .expect("valid smoke topology");
+        assert_eq!(spec.topology.hash, smoke.topology.hash);
+        args.topology = None;
+        args.topology_preset = Some("unknown".into());
+        assert!(resolve_topology(&args).await.is_err());
+    }
+
+    fn resolved_chain_fixture() -> Result<TopologySpec, String> {
+        use quantum_validation::AllowedValueSpec;
+        use quip_coordinator::chain::scale_types::TopologyMetaScale;
+        let spec = parse_topology_spec(
+            r#"{"nodes":[30,10],"edges":[[30,10]],
+                "allowed_h_milli":[0],"allowed_j_milli":[1000,-1000]}"#,
+        )
+        .map_err(|error| error.to_string())?;
+        let hash = spec
+            .topology
+            .hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| "topology hash is not 32 bytes".to_string())?;
+        let edges = spec.topology.edge_pairs();
+        TopologySpec::from_chain_meta(
+            hash,
+            TopologyMetaScale {
+                nodes: spec.topology.nodes,
+                edges,
+                allowed_h_values: AllowedValueSpec::Set(spec.allowed_h_milli),
+                allowed_j_values: AllowedValueSpec::Set(spec.allowed_j_milli),
+                allowed_spin_values: AllowedValueSpec::Set(spec.allowed_spin_milli),
+                registered_at: 99,
+            },
+        )
+    }
+
+    fn assert_chain_topology(topology: &Topology, expected_hash: &[u8]) {
+        assert_eq!(topology.nodes, vec![30, 10]);
+        assert_eq!(topology.edge_pairs(), vec![(30, 10)]);
+        assert_eq!(topology.allowed_h, vec![0]);
+        assert_eq!(topology.allowed_j, vec![1000, -1000]);
+        assert_eq!(topology.hash, expected_hash);
     }
 
     #[test]
-    fn list_defaults_to_no_topology() {
-        let a = drive_args(DriveSourceKind::List);
-        assert!(resolve_topology_text(&a).unwrap().is_none());
+    fn drive_resolved_chain_topology_drives_random_jobs_and_overrides() {
+        use quip_coordinator::producer::problem::problem_milli;
+        let spec = resolved_chain_fixture().expect("valid chain fixture");
+        let expected_hash = spec.topology.hash.clone();
+        let mut args = drive_args(DriveSourceKind::Random);
+        args.count = 2;
+        args.target_energy = Some(-4.0);
+        args.min_solutions = Some(2);
+        args.num_reads = Some(3);
+        args.num_sweeps = Some(10);
+        let (jobs, topology, target) =
+            build_jobs(&args, Some(spec), 0).expect("build random jobs from chain topology");
+        assert_chain_topology(&topology.expect("missing topology"), &expected_hash);
+        let target = target.expect("missing target");
+        assert_eq!(target.max_energy_milli, -4000);
+        assert_eq!(target.min_solutions, 2);
+        assert_eq!(target.num_reads, 3);
+        assert_eq!(target.num_sweeps, 10);
+        assert_eq!(jobs.len(), 2);
+        for job in jobs {
+            let problem = job.ising.as_ref().expect("missing problem");
+            let (h, j) = problem_milli(problem).expect("valid random coefficients");
+            assert_eq!(h, vec![0, 0]);
+            assert_eq!(j.len(), 1);
+            assert_eq!(
+                problem.graph,
+                Some(quip_proto::v1::ising_problem::Graph::TopologyHash(
+                    expected_hash.clone()
+                ))
+            );
+        }
     }
 
     #[test]
-    fn named_preset_resolves_to_its_embedded_spec() {
-        let mut a = drive_args(DriveSourceKind::Random);
-        a.topology_preset = Some("smoke".into());
-        let text = resolve_topology_text(&a).unwrap().unwrap();
-        assert!(parse_topology_spec(&text).is_ok());
+    fn drive_resolved_chain_topology_drives_leases_and_nonce_replay() {
+        use quip_coordinator::producer::problem::problem_milli;
+        let spec = resolved_chain_fixture().expect("valid chain fixture");
+        let hash = spec.topology.hash.clone();
+        let mut lease_args = drive_args(DriveSourceKind::Lease);
+        lease_args.count = 3;
+        lease_args.lease_size = 2;
+        let (jobs, topology, target) = build_jobs(&lease_args, Some(spec.clone()), 0)
+            .expect("build leases from chain topology");
+        assert_chain_topology(&topology.expect("missing lease topology"), &hash);
+        let target = target.expect("missing lease target");
+        assert_eq!(target.min_solutions, 0);
+        assert_eq!(target.max_energy_milli, i64::MAX);
+        assert_eq!(target.min_diversity_milli, 0);
+        assert_eq!(jobs.len(), 2);
+        for (job, count) in jobs.iter().zip([2, 1]) {
+            let generator = job.generator.as_ref().expect("missing generator");
+            assert_eq!(generator.topology_hash, hash);
+            assert_eq!(generator.salt_count, count);
+        }
+        let file = tempfile::NamedTempFile::new().expect("temporary nonce list");
+        std::fs::write(
+            file.path(),
+            concat!(
+                r#"{"nonce":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+                "\n"
+            ),
+        )
+        .expect("write nonce list");
+        let mut list_args = drive_args(DriveSourceKind::List);
+        list_args.list = Some(file.path().to_path_buf());
+        let (jobs, topology, _) =
+            build_jobs(&list_args, Some(spec), 0).expect("build nonce replay from chain topology");
+        assert_chain_topology(&topology.expect("missing replay topology"), &hash);
+        assert_eq!(jobs.len(), 1);
+        let problem = jobs
+            .first()
+            .and_then(|job| job.ising.as_ref())
+            .expect("missing replay problem");
+        assert_eq!(
+            problem_milli(problem).expect("valid replay coefficients").0,
+            vec![0, 0]
+        );
+        assert!(build_jobs(&list_args, None, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn drive_chain_failure_does_not_fall_back_or_start_a_miner() {
+        let mut args = drive_args(DriveSourceKind::Random);
+        args.topology_from_chain = Some("://invalid-url".into());
+        args.miner = PathBuf::from("/nonexistent/quip-miner-QUI-1539");
+        let error = resolve_topology(&args)
+            .await
+            .expect_err("expected invalid RPC URL failure");
+        assert!(error.contains("fetch topology from ://invalid-url"));
+        assert_eq!(
+            drive_main(args, LogLevel::Info).await,
+            StdExitCode::from(ExitCode::ConfigInvalid as u8)
+        );
     }
 
     #[test]
