@@ -341,6 +341,35 @@ impl RealChainClient {
         Ok(meta)
     }
 
+    /// Fetch the chain's default topology at one best-block hash.
+    ///
+    /// Returns `None` when `QuantumPow.DefaultTopology` is unset. This reads
+    /// topology metadata only and never loads signing material.
+    ///
+    /// # Errors
+    /// Returns transport or decode errors. A stored default whose metadata
+    /// is absent returns a decode error.
+    pub async fn fetch_default_topology(
+        &self,
+    ) -> Result<Option<([u8; 32], TopologyMetaScale)>, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+        let Some(hash) = self.snapshot_topology_hash(None, at).await? else {
+            return Ok(None);
+        };
+        let metadata = self.topology_meta(hash, at).await?.ok_or_else(|| {
+            ChainError::Decode(format!(
+                "default topology {} is not registered",
+                hex_encode(&hash)
+            ))
+        })?;
+        Ok(Some((hash, metadata)))
+    }
+
     /// Read `QuantumPow.DefaultTopology` at the current head.
     ///
     /// `Ok(None)` means no topology is registered, which is the state a fresh
@@ -2222,5 +2251,204 @@ mod tests {
             validator,
         );
         assert!(client.fetch_pending_proofs().await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod default_topology_tests {
+    use super::RealChainClient;
+    use crate::chain::extrinsic::{default_topology_storage_key, hex_encode};
+    use crate::chain::scale_types::TopologyMetaScale;
+    use crate::chain::{BoxStream, ChainError, MinerKind, RpcTransport};
+    use parity_scale_codec::Encode;
+    use quantum_validation::AllowedValueSpec;
+    use serde_json::Value;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    const HEAD: [u8; 32] = [0xaa; 32];
+    const URL: &str = "ws://topology-fixture";
+
+    struct ExpectedCall {
+        method: &'static str,
+        params: Value,
+        response: Result<Value, ChainError>,
+    }
+
+    struct TopologyTransport {
+        steps: Mutex<VecDeque<ExpectedCall>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcTransport for TopologyTransport {
+        async fn request(
+            &self,
+            url: &str,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, ChainError> {
+            let step = self
+                .steps
+                .lock()
+                .map_err(|_| ChainError::Unavailable("RPC script lock poisoned".into()))?
+                .pop_front()
+                .ok_or_else(|| ChainError::Unavailable("unexpected extra RPC".into()))?;
+            assert_eq!(url, URL);
+            assert_eq!(method, step.method);
+            assert_eq!(params, step.params);
+            step.response
+        }
+
+        async fn subscribe(
+            &self,
+            _url: &str,
+            _sub: &str,
+            _params: Value,
+            _unsub: &str,
+        ) -> Result<BoxStream<'static, Result<Value, ChainError>>, ChainError> {
+            Err(ChainError::Unavailable(
+                "topology reads do not subscribe".into(),
+            ))
+        }
+    }
+
+    fn meta() -> TopologyMetaScale {
+        TopologyMetaScale {
+            nodes: vec![10, 30],
+            edges: vec![(10, 30)],
+            allowed_h_values: AllowedValueSpec::Set(vec![0]),
+            allowed_j_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            allowed_spin_values: AllowedValueSpec::Set(vec![-1000, 1000]),
+            registered_at: 7,
+        }
+    }
+
+    fn topology_steps(
+        hash: Option<[u8; 32]>,
+        metadata: Result<Value, ChainError>,
+    ) -> Vec<ExpectedCall> {
+        let mut steps = vec![
+            ExpectedCall {
+                method: "chain_getBlockHash",
+                params: serde_json::json!([]),
+                response: Ok(Value::String(hex_encode(&HEAD))),
+            },
+            ExpectedCall {
+                method: "state_getStorage",
+                params: serde_json::json!([
+                    hex_encode(&default_topology_storage_key()),
+                    hex_encode(&HEAD),
+                ]),
+                response: Ok(hash.map_or(Value::Null, |hash| Value::String(hex_encode(&hash)))),
+            },
+        ];
+        if let Some(hash) = hash {
+            steps.push(ExpectedCall {
+                method: "state_call",
+                params: serde_json::json!([
+                    "QuantumPowApi_topology_meta",
+                    hex_encode(&hash),
+                    hex_encode(&HEAD),
+                ]),
+                response: metadata,
+            });
+        }
+        steps
+    }
+
+    fn client(steps: Vec<ExpectedCall>) -> (RealChainClient, Arc<TopologyTransport>) {
+        let transport = Arc::new(TopologyTransport {
+            steps: Mutex::new(steps.into()),
+        });
+        let client = RealChainClient::with_transport(
+            vec![URL.to_string()],
+            String::new(),
+            MinerKind::Cpu,
+            transport.clone(),
+        );
+        (client, transport)
+    }
+
+    fn assert_drained(transport: &TopologyTransport) {
+        assert!(transport
+            .steps
+            .lock()
+            .expect("RPC script lock poisoned")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_topology_uses_one_head_and_needs_no_signer() {
+        let hash = [0x11; 32];
+        let metadata = meta();
+        let response = Value::String(hex_encode(&Some(metadata.clone()).encode()));
+        let (client, transport) = client(topology_steps(Some(hash), Ok(response)));
+        let fetched = client
+            .fetch_default_topology()
+            .await
+            .expect("fetch default topology")
+            .expect("missing default topology");
+        assert_eq!(fetched, (hash, metadata));
+        assert!(client.pair.lock().expect("signer lock poisoned").is_none());
+        assert_drained(&transport);
+    }
+
+    #[tokio::test]
+    async fn unset_default_topology_skips_metadata() {
+        let (client, transport) = client(topology_steps(None, Ok(Value::Null)));
+        assert!(client
+            .fetch_default_topology()
+            .await
+            .expect("fetch unset default topology")
+            .is_none());
+        assert_drained(&transport);
+    }
+
+    #[tokio::test]
+    async fn stored_default_without_metadata_is_an_error() {
+        let response = Value::String(hex_encode(&Option::<TopologyMetaScale>::None.encode()));
+        let (client, transport) = client(topology_steps(Some([0x11; 32]), Ok(response)));
+        let error = client
+            .fetch_default_topology()
+            .await
+            .expect_err("expected missing metadata error");
+        assert!(error.to_string().contains("is not registered"));
+        assert_drained(&transport);
+    }
+
+    #[tokio::test]
+    async fn topology_read_preserves_transport_and_decode_errors() {
+        for (response, expected) in [
+            (
+                Err(ChainError::Unavailable("fixture unavailable".into())),
+                "chain unavailable: fixture unavailable",
+            ),
+            (Ok(Value::String("0x03".into())), "decode error:"),
+        ] {
+            let (client, transport) = client(topology_steps(Some([0x11; 32]), response));
+            let error = client
+                .fetch_default_topology()
+                .await
+                .expect_err("expected topology read failure");
+            assert!(error.to_string().contains(expected));
+            assert_drained(&transport);
+        }
+    }
+
+    #[tokio::test]
+    async fn non_string_head_fails_before_storage_reads() {
+        let (client, transport) = client(vec![ExpectedCall {
+            method: "chain_getBlockHash",
+            params: serde_json::json!([]),
+            response: Ok(Value::Null),
+        }]);
+        let error = client
+            .fetch_default_topology()
+            .await
+            .expect_err("expected invalid head error");
+        assert!(error
+            .to_string()
+            .contains("chain_getBlockHash not a string"));
+        assert_drained(&transport);
     }
 }
