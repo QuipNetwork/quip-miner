@@ -2,6 +2,7 @@
 
 use parity_scale_codec::{Compact, Encode};
 use quip_transaction_crypto::{account_id_from_public, HybridPair, HybridTxSignature};
+use sp_core::crypto::SecretStringError;
 use sp_core::hashing::blake2_256;
 use sp_core::Pair as _;
 
@@ -124,12 +125,32 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if !s.len().is_multiple_of(2) {
-        return Err(format!("odd-length hex: {s}"));
+        return Err(format!("odd-length hex ({} digits)", s.len()));
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
+    let decode_nibble = |byte| match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("invalid hex digit".to_string()),
+    };
+    let (pairs, _) = s.as_bytes().as_chunks::<2>();
+    let mut bytes = Vec::with_capacity(pairs.len());
+    for &[high, low] in pairs {
+        bytes.push((decode_nibble(high)? << 4) | decode_nibble(low)?);
+    }
+    Ok(bytes)
+}
+
+fn secret_uri_error_kind(error: &SecretStringError) -> &'static str {
+    // Never format parser errors: InvalidFormat stores the original URI.
+    match error {
+        SecretStringError::InvalidFormat(_) => "invalid format",
+        SecretStringError::InvalidPhrase => "invalid phrase",
+        SecretStringError::InvalidPassword => "invalid password",
+        SecretStringError::InvalidSeed => "invalid seed",
+        SecretStringError::InvalidSeedLength => "invalid seed length",
+        SecretStringError::InvalidPath => "invalid path",
+    }
 }
 
 /// Load a hybrid pair from signer material.
@@ -143,6 +164,8 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 /// # Errors
 /// Returns an error when the path cannot be read or parsed, the keystore seed
 /// is not 32 bytes, or the secret URI fails to derive a pair.
+/// The error text never contains the key material.
+/// Secret URI errors name only a fixed error kind and omit parser payloads.
 pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
     let path = std::path::Path::new(signer_key);
     if path.exists() {
@@ -176,8 +199,13 @@ pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
     }
     // Any substrate secret URI: a dev path (//Alice), a BIP39 mnemonic, or a
     // mnemonic with derivation and password (phrase//hard/soft///password).
-    HybridPair::from_string(signer_key, None)
-        .map_err(|e| format!("cannot derive a signer from {signer_key:?}: {e:?}"))
+    HybridPair::from_string(signer_key, None).map_err(|error| {
+        let kind = secret_uri_error_kind(&error);
+        format!(
+            "signer_key is not an existing keystore file, a 32-byte hex seed, \
+             or a valid secret URI: {kind}"
+        )
+    })
 }
 
 /// The 32-byte `AccountId32` this pair signs and pays with.
@@ -426,6 +454,16 @@ mod tests {
     }
 
     #[test]
+    fn hex_decode_rejects_even_length_unicode() {
+        assert!(hex_decode("00€0").is_err());
+    }
+
+    #[test]
+    fn hex_decode_rejects_non_hex_ascii() {
+        assert!(hex_decode("0g").is_err());
+    }
+
+    #[test]
     fn hybrid_extrinsic_has_signed_v4_prefix_and_compact_len() {
         let pair = HybridPair::from_string("//Alice", None).expect("alice");
         let proof = QuantumProof {
@@ -612,12 +650,60 @@ mod tests {
     }
 
     #[test]
-    fn garbage_signer_material_is_rejected_with_the_input_named() {
+    fn a_bad_secret_uri_is_rejected_without_echoing_it() {
+        // A mistyped mnemonic with a derivation path and password. Not a real key.
+        let secret =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit wolk//hard///pw";
         // HybridPair is not Debug, so Result::expect_err does not compile.
-        let err = load_hybrid_pair("not a key")
+        let err = load_hybrid_pair(secret)
             .err()
-            .expect("garbage is rejected");
-        assert!(err.contains("not a key"), "error names the input: {err}");
+            .expect("a bad phrase is rejected");
+        for fragment in ["lake", "wolk", "hard", "pw"] {
+            assert!(!err.contains(fragment), "error echoes {fragment:?}: {err}");
+        }
+        assert!(
+            err.contains("keystore") && err.contains("secret URI"),
+            "error names the accepted forms: {err}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_secret_uri_is_rejected_without_echoing_it() {
+        // An empty hard-derivation path triggers a grammar error with the original URI.
+        let secret = "review sentinel//";
+        let err = load_hybrid_pair(secret)
+            .err()
+            .expect("a malformed URI is rejected");
+        for fragment in [secret, "review", "sentinel", "//"] {
+            assert!(!err.contains(fragment), "error echoes {fragment:?}: {err}");
+        }
+        assert!(
+            err.contains("keystore") && err.contains("secret URI"),
+            "error names the accepted forms: {err}"
+        );
+    }
+
+    #[test]
+    fn a_bad_keystore_seed_is_rejected_without_echoing_it() {
+        let path = std::env::temp_dir().join(format!("quip-ks-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"master_seed_hex":"0xabcdef123"}"#).expect("write keystore");
+        let err = load_hybrid_pair(path.to_str().expect("utf-8 path"))
+            .err()
+            .expect("an odd-length seed is rejected");
+        let _ = std::fs::remove_file(&path);
+        assert!(!err.contains("abcdef123"), "error echoes the seed: {err}");
+    }
+
+    #[test]
+    fn a_unicode_keystore_seed_is_rejected_without_echoing_it() {
+        let path =
+            std::env::temp_dir().join(format!("quip-ks-unicode-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"master_seed_hex":"00€0"}"#).expect("write keystore");
+        let result = load_hybrid_pair(path.to_str().expect("utf-8 path"));
+        let _ = std::fs::remove_file(&path);
+        let err = result.err().expect("a Unicode seed is rejected");
+        assert!(!err.contains("00€0"), "error echoes the seed: {err}");
+        assert!(!err.contains('€'), "error echoes a seed character: {err}");
     }
 
     #[test]
