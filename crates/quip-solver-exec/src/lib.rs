@@ -339,6 +339,7 @@ mod tests {
             sweeps_per_beta: 2,
             beta_range: Some((0.1, 3.0)),
             seed: 7,
+            ..SampleParams::default()
         };
         let v: serde_json::Value =
             serde_json::from_slice(&serde_json::to_vec(&ModelJson::new(&graph, &params)).unwrap())

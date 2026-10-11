@@ -46,8 +46,8 @@ fn main() -> ExitCode {
             max_nodes: 100_000,
             max_edges: 1_000_000,
             features: &[],
-            // The external solver's real sampling envelope is unknown, so the
-            // coordinator adapts against conservative CPU-SA-like bounds.
+            limits: quip_solver_core::ModelLimits::UNSTATED,
+            // The external solver's sampling envelope is unknown.
             adapt: AdaptBounds {
                 min_sweeps: 64,
                 max_sweeps: 4096,
