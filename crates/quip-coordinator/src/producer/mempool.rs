@@ -77,6 +77,7 @@ mod tests {
     fn sample_order() -> JobOrder {
         JobOrder {
             order_id: b"order-1".to_vec(),
+            mode: crate::chain::scale_types::JobMode::Open,
             nodes: vec![0, 1],
             edges: vec![(0, 1)],
             h_milli: vec![1000, -1000],

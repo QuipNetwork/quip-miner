@@ -1474,6 +1474,7 @@ mod tests {
     fn order(min_energy: Option<i64>, min_diversity: Option<u32>) -> JobOrder {
         JobOrder {
             order_id: 5u64.to_le_bytes().to_vec(),
+            mode: crate::chain::scale_types::JobMode::Open,
             nodes: vec![0, 1],
             edges: vec![(0, 1)],
             h_milli: vec![0, 0],
