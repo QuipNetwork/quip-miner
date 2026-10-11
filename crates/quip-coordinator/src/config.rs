@@ -785,6 +785,19 @@ budget_reset_day = 1
         assert_eq!(cuda.binary, "quip-cuda-sa");
     }
 
+    fn assert_dwave_period_budget(backend: &toml::Table) {
+        assert_eq!(
+            backend.get("budget").and_then(toml::Value::as_str),
+            Some("30s")
+        );
+        assert_eq!(
+            backend
+                .get("budget_reset_day")
+                .and_then(toml::Value::as_integer),
+            Some(1)
+        );
+    }
+
     #[test]
     #[expect(
         clippy::panic_in_result_fn,
@@ -799,16 +812,7 @@ budget_reset_day = 1
             .ok_or("missing D-Wave launch entry")?;
         let backend: toml::Table = toml::from_str(&dwave.configure.backend_toml)?;
 
-        assert_eq!(
-            backend.get("budget").and_then(toml::Value::as_str),
-            Some("30s")
-        );
-        assert_eq!(
-            backend
-                .get("budget_reset_day")
-                .and_then(toml::Value::as_integer),
-            Some(1)
-        );
+        assert_dwave_period_budget(&backend);
         assert_eq!(backend.len(), 2);
         Ok(())
     }
@@ -828,16 +832,7 @@ budget_reset_day = 1
         let backend: toml::Table = toml::from_str(&dwave.configure.backend_toml)?;
 
         assert_eq!(dwave.binary, "quip-dwave-qa");
-        assert_eq!(
-            backend.get("budget").and_then(toml::Value::as_str),
-            Some("30s")
-        );
-        assert_eq!(
-            backend
-                .get("budget_reset_day")
-                .and_then(toml::Value::as_integer),
-            Some(1)
-        );
+        assert_dwave_period_budget(&backend);
         assert_eq!(backend.len(), 2);
         Ok(())
     }
@@ -878,16 +873,7 @@ budget_reset_day = 1
         let backend: toml::Table = toml::from_str(&dwave.configure.backend_toml)?;
 
         assert_eq!(dwave.binary, "quip-dwave-qa");
-        assert_eq!(
-            backend.get("budget").and_then(toml::Value::as_str),
-            Some("30s")
-        );
-        assert_eq!(
-            backend
-                .get("budget_reset_day")
-                .and_then(toml::Value::as_integer),
-            Some(1)
-        );
+        assert_dwave_period_budget(&backend);
         assert_eq!(
             backend
                 .get("min_throughput_advantage")
