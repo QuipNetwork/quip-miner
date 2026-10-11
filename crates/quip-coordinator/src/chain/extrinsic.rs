@@ -124,7 +124,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if !s.len().is_multiple_of(2) {
-        return Err(format!("odd-length hex: {s}"));
+        return Err(format!("odd-length hex ({} digits)", s.len()));
     }
     (0..s.len())
         .step_by(2)
@@ -143,6 +143,7 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 /// # Errors
 /// Returns an error when the path cannot be read or parsed, the keystore seed
 /// is not 32 bytes, or the secret URI fails to derive a pair.
+/// The error text never contains the key material.
 pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
     let path = std::path::Path::new(signer_key);
     if path.exists() {
@@ -176,8 +177,12 @@ pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
     }
     // Any substrate secret URI: a dev path (//Alice), a BIP39 mnemonic, or a
     // mnemonic with derivation and password (phrase//hard/soft///password).
-    HybridPair::from_string(signer_key, None)
-        .map_err(|e| format!("cannot derive a signer from {signer_key:?}: {e:?}"))
+    HybridPair::from_string(signer_key, None).map_err(|e| {
+        format!(
+            "signer_key is not an existing keystore file, a 32-byte hex seed, \
+             or a valid secret URI: {e:?}"
+        )
+    })
 }
 
 /// The 32-byte `AccountId32` this pair signs and pays with.
@@ -612,12 +617,32 @@ mod tests {
     }
 
     #[test]
-    fn garbage_signer_material_is_rejected_with_the_input_named() {
+    fn a_bad_secret_uri_is_rejected_without_echoing_it() {
+        // A mistyped mnemonic with a derivation path and password. Not a real key.
+        let secret =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit wolk//hard///pw";
         // HybridPair is not Debug, so Result::expect_err does not compile.
-        let err = load_hybrid_pair("not a key")
+        let err = load_hybrid_pair(secret)
             .err()
-            .expect("garbage is rejected");
-        assert!(err.contains("not a key"), "error names the input: {err}");
+            .expect("a bad phrase is rejected");
+        for fragment in ["lake", "wolk", "hard", "pw"] {
+            assert!(!err.contains(fragment), "error echoes {fragment:?}: {err}");
+        }
+        assert!(
+            err.contains("keystore") && err.contains("secret URI"),
+            "error names the accepted forms: {err}"
+        );
+    }
+
+    #[test]
+    fn a_bad_keystore_seed_is_rejected_without_echoing_it() {
+        let path = std::env::temp_dir().join(format!("quip-ks-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"master_seed_hex":"0xabcdef123"}"#).expect("write keystore");
+        let err = load_hybrid_pair(path.to_str().expect("utf-8 path"))
+            .err()
+            .expect("an odd-length seed is rejected");
+        let _ = std::fs::remove_file(&path);
+        assert!(!err.contains("abcdef123"), "error echoes the seed: {err}");
     }
 
     #[test]
