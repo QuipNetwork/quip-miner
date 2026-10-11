@@ -20,6 +20,19 @@ pub struct SignedExtensionContext {
     pub tip: u128,
 }
 
+/// Chain facts a signer commits to without writing them into the extrinsic:
+/// the `additional_signed` inputs of `CheckSpecVersion`, `CheckTxVersion`,
+/// `CheckGenesis`, and an immortal `CheckMortality`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeTxContext {
+    /// Hash of block 0.
+    pub genesis_hash: [u8; 32],
+    /// Runtime `specVersion`.
+    pub spec_version: u32,
+    /// Runtime `transactionVersion`.
+    pub transaction_version: u32,
+}
+
 /// Build a signed v4 extrinsic for the given call bytes.
 ///
 /// Layout:
@@ -38,36 +51,41 @@ pub fn build_hybrid_signed_extrinsic(
     call_bytes: &[u8],
     ctx: &SignedExtensionContext,
 ) -> Vec<u8> {
-    let account = account_id_from_public(&pair.public());
-    let account_bytes: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(&account);
-
     let extra = encode_extra(ctx.account_nonce, ctx.tip);
     let additional =
         encode_additional(ctx.spec_version, ctx.transaction_version, &ctx.genesis_hash);
+    let sig = HybridTxSignature::sign(pair, &signing_payload(call_bytes, &extra, &additional));
+    assemble_signed_extrinsic(&signer_account_bytes(pair), &sig, &extra, call_bytes)
+}
 
-    let payload = {
-        let mut p = Vec::with_capacity(call_bytes.len() + extra.len() + additional.len());
-        p.extend_from_slice(call_bytes);
-        p.extend_from_slice(&extra);
-        p.extend_from_slice(&additional);
-        p
-    };
-    let payload_to_sign: Vec<u8> = if payload.len() > 256 {
+/// The bytes a signer signs: `call || extra || additional`, replaced by its
+/// `blake2_256` when longer than 256 bytes (Substrate `SignedPayload`).
+pub(crate) fn signing_payload(call: &[u8], extra: &[u8], additional: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(call.len() + extra.len() + additional.len());
+    payload.extend_from_slice(call);
+    payload.extend_from_slice(extra);
+    payload.extend_from_slice(additional);
+    if payload.len() > 256 {
         blake2_256(&payload).to_vec()
     } else {
         payload
-    };
+    }
+}
 
-    let sig = HybridTxSignature::sign(pair, &payload_to_sign);
-    let hybrid_sig_scale = sig.encode(); // public || signature
-
+/// Wrap a signed call in the v4 envelope with its compact length prefix.
+pub(crate) fn assemble_signed_extrinsic(
+    account: &[u8; 32],
+    signature: &HybridTxSignature,
+    extra: &[u8],
+    call: &[u8],
+) -> Vec<u8> {
     let mut body = Vec::new();
     body.push(0x84); // v4 | signed
     body.push(0x00); // MultiAddress::Id
-    body.extend_from_slice(&account_bytes);
-    body.extend_from_slice(&hybrid_sig_scale);
-    body.extend_from_slice(&extra);
-    body.extend_from_slice(call_bytes);
+    body.extend_from_slice(account);
+    body.extend_from_slice(&signature.encode()); // public || signature
+    body.extend_from_slice(extra);
+    body.extend_from_slice(call);
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -91,7 +109,7 @@ fn encode_extra(nonce: u32, tip: u128) -> Vec<u8> {
 }
 
 /// Signed-extension `additional_signed` in metadata order.
-fn encode_additional(
+pub(crate) fn encode_additional(
     spec_version: u32,
     transaction_version: u32,
     genesis_hash: &[u8; 32],
