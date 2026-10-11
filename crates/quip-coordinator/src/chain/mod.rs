@@ -23,6 +23,7 @@ pub mod watch;
 
 pub use account::{free_from_account_bytes, system_account_storage_key};
 pub use dryrun::{decode_dispatch_error, describe_module_error, ModuleError};
+pub use extrinsic::RuntimeTxContext;
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
 pub use orders::{job_orders_prefix, order_id_from_key};
