@@ -682,7 +682,8 @@ device_index = 0
 api_key = "{SENTINEL}"
 
 [dwave]
-daily_budget = "30s"
+budget = "30s"
+budget_reset_day = 1
 token = "{SENTINEL}"
 "#
         );

@@ -63,14 +63,14 @@ binary = "quip-cpu-sa"
 # Connection credentials (token/solver/region) come from D-Wave's own config
 # (dwave.conf + env), not here.
 #
-# Keys below tune the QPU-access-time budget the miner spends. The pool accrues
-# at daily_budget/86400 per wall-second; the miner idles until it reaches
-# min_block_budget, then bursts until the pool drains. Durations accept
-# s/m/h/d/w suffixes or a plain number of seconds. num_reads/anneal_time come
-# from the chain difficulty target (SetTarget), not this section.
-# budget_cap must be at or above min_block_budget: the pool cannot exceed the
-# cap, so a cap below the start threshold means the gate never opens and every
-# job is rejected. The miner lifts such a cap and logs an error naming both.
+# budget is QPU access time for one monthly billing period. Durations accept
+# quoted s/m/h/d/w suffixes or numeric seconds. Set this example to your
+# actual Leap allotment and set budget_reset_day to your billing reset day.
+# The reset occurs at midnight UTC on day 1-31, clamped to the month's end.
+# The miner paces spend at round boundaries against the elapsed period share.
+# Exhausting the whole period allowance also stops an active round.
+# Spend survives restarts in /data/qpu-usage.db by default. Keep /data writable
+# and persistent. The miner refuses budgeted mining if the ledger cannot open.
 #
 # The round strategy (quip-solver-dwave v0.3.4 and later) decides at each qblock
 # boundary whether to join the round or bank the budget for a faster hour of
@@ -80,10 +80,8 @@ binary = "quip-cpu-sa"
 # defaults change nothing until the miner has recorded history.
 # [dwave]
 # binary = "quip-dwave-qa"
-# daily_budget = "30s"      # QPU access time granted per day
-# min_block_budget = "90s"  # start threshold; default min(90s, daily_budget)
-# budget_cap = "5m"         # max pool size; default uncapped
-# initial_budget = "90s"    # pool at process start; default min_block_budget
+# budget = "30s"           # example allowance for the whole monthly period
+# budget_reset_day = 1     # first day of each month
 # min_throughput_advantage = 0.25  # skip a round only when the bar sits more than 25% above its jobs
 # participation_chance = 0.10      # join this share of rounds regardless, so every slot keeps getting measured
 

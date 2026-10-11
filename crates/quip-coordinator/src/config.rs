@@ -636,9 +636,8 @@ idle_timeout_s = 120
 [cuda.1]
 
 [dwave]
-daily_budget = "30s"
-min_block_budget = "90s"
-budget_cap = "5m"
+budget = "30s"
+budget_reset_day = 1
 "#;
 
     #[test]
@@ -786,17 +785,204 @@ budget_cap = "5m"
         assert_eq!(cuda.binary, "quip-cuda-sa");
     }
 
+    fn assert_dwave_period_budget(backend: &toml::Table) {
+        assert_eq!(
+            backend.get("budget").and_then(toml::Value::as_str),
+            Some("30s")
+        );
+        assert_eq!(
+            backend
+                .get("budget_reset_day")
+                .and_then(toml::Value::as_integer),
+            Some(1)
+        );
+    }
+
     #[test]
-    fn backend_toml_carries_unknown_keys() {
-        // The dwave miner consumes its budget knobs from `backend_toml`; the
-        // coordinator forwards every non-coordinator key verbatim, so all three
-        // budget dimensions reach the miner.
-        let c = parse_config(SAMPLE).unwrap();
-        let dwave = c.launch.iter().find(|e| e.miner_id == "qpu-0").unwrap();
-        let backend_toml = &dwave.configure.backend_toml;
-        assert!(backend_toml.contains("daily_budget"));
-        assert!(backend_toml.contains("min_block_budget"));
-        assert!(backend_toml.contains("budget_cap"));
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "Test assertions report mismatches while Result propagates setup errors."
+    )]
+    fn backend_toml_carries_dwave_period_budget() -> Result<(), Box<dyn std::error::Error>> {
+        let config = parse_config(SAMPLE)?;
+        let dwave = config
+            .launch
+            .iter()
+            .find(|entry| entry.miner_id == "qpu-0")
+            .ok_or("missing D-Wave launch entry")?;
+        let backend: toml::Table = toml::from_str(&dwave.configure.backend_toml)?;
+
+        assert_dwave_period_budget(&backend);
+        assert_eq!(backend.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "Test assertions report mismatches while Result propagates setup errors."
+    )]
+    fn example_dwave_config_is_metered() -> Result<(), Box<dyn std::error::Error>> {
+        let config = parse_config(include_str!("../config.toml.example"))?;
+        let dwave = config
+            .launch
+            .iter()
+            .find(|entry| entry.miner_id == "qpu-0")
+            .ok_or("example config must launch D-Wave")?;
+        let backend: toml::Table = toml::from_str(&dwave.configure.backend_toml)?;
+
+        assert_eq!(dwave.binary, "quip-dwave-qa");
+        assert_dwave_period_budget(&backend);
+        assert_eq!(backend.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "Test assertions report mismatches while Result propagates setup errors."
+    )]
+    fn docker_dwave_config_is_metered_when_enabled() -> Result<(), Box<dyn std::error::Error>> {
+        let template = include_str!("../../../docker/config.toml");
+        let config = parse_config(template)?;
+        assert!(!config.launch.iter().any(|entry| entry.backend == "dwave"));
+
+        let mut enabled = String::new();
+        let mut in_dwave = false;
+        for line in template.lines() {
+            if line.trim() == "# [dwave]" {
+                in_dwave = true;
+            } else if in_dwave && line.trim().is_empty() {
+                in_dwave = false;
+            }
+            let line = if in_dwave {
+                line.strip_prefix("# ").unwrap_or(line)
+            } else {
+                line
+            };
+            enabled.push_str(line);
+            enabled.push('\n');
+        }
+
+        let config = parse_config(&enabled)?;
+        let dwave = config
+            .launch
+            .iter()
+            .find(|entry| entry.miner_id == "qpu-0")
+            .ok_or("enabled Docker config must launch D-Wave")?;
+        let backend: toml::Table = toml::from_str(&dwave.configure.backend_toml)?;
+
+        assert_eq!(dwave.binary, "quip-dwave-qa");
+        assert_dwave_period_budget(&backend);
+        assert_eq!(
+            backend
+                .get("min_throughput_advantage")
+                .and_then(toml::Value::as_float),
+            Some(0.25)
+        );
+        assert_eq!(
+            backend
+                .get("participation_chance")
+                .and_then(toml::Value::as_float),
+            Some(0.10)
+        );
+        assert_eq!(backend.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "Test assertions report mismatches while Result propagates setup errors."
+    )]
+    fn qpu_alias_keeps_budget_separate_from_session_settings(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = parse_config(
+            r#"
+[miner]
+public_host = "203.0.113.10"
+public_port = 20050
+
+[qpu]
+binary = "/opt/miners/quip-dwave-qa"
+queue_depth = 7
+idle_timeout_s = 90
+heartbeat_s = 5
+reconnect_window_s = 30
+budget = "2h"
+budget_reset_day = 17
+"#,
+        )?;
+        let dwave = config
+            .launch
+            .iter()
+            .find(|entry| entry.miner_id == "qpu-0")
+            .ok_or("qpu alias must launch D-Wave")?;
+        let backend: toml::Table = toml::from_str(&dwave.configure.backend_toml)?;
+
+        assert_eq!(dwave.backend, "dwave");
+        assert_eq!(dwave.binary, "/opt/miners/quip-dwave-qa");
+        assert_eq!(dwave.device, None);
+        assert_eq!(dwave.configure.queue_depth, 7);
+        assert_eq!(dwave.configure.idle_timeout_s, 90);
+        assert_eq!(dwave.configure.heartbeat_s, 5);
+        assert_eq!(dwave.configure.reconnect_window_s, 30);
+        assert_eq!(
+            backend.get("budget").and_then(toml::Value::as_str),
+            Some("2h")
+        );
+        assert_eq!(
+            backend
+                .get("budget_reset_day")
+                .and_then(toml::Value::as_integer),
+            Some(17)
+        );
+        assert_eq!(backend.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "Test assertions report mismatches while Result propagates setup errors."
+    )]
+    fn dwave_budget_formats_and_reset_days_pass_through() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for (budget, expected, reset_day) in [
+            ("900", toml::Value::Integer(900), 1_i64),
+            ("900.5", toml::Value::Float(900.5), 31),
+            ("\"0.5m\"", toml::Value::String("0.5m".into()), 31),
+            ("\"900\"", toml::Value::String("900".into()), 17),
+        ] {
+            let text = format!(
+                r#"
+[miner]
+public_host = "203.0.113.10"
+public_port = 20050
+
+[dwave]
+budget = {budget}
+budget_reset_day = {reset_day}
+"#
+            );
+            let config = parse_config(&text)?;
+            let dwave = config
+                .launch
+                .iter()
+                .find(|entry| entry.miner_id == "qpu-0")
+                .ok_or("budget config must launch D-Wave")?;
+            let backend: toml::Table = toml::from_str(&dwave.configure.backend_toml)?;
+
+            assert_eq!(backend.get("budget"), Some(&expected));
+            assert_eq!(
+                backend
+                    .get("budget_reset_day")
+                    .and_then(toml::Value::as_integer),
+                Some(reset_day)
+            );
+            assert_eq!(backend.len(), 2);
+        }
+        Ok(())
     }
 
     #[test]
