@@ -112,6 +112,9 @@ struct RoutingTopology {
     n_nodes: u32,
     n_edges: u32,
     max_degree: u32,
+    native_hash: [u8; 32],
+    nodes: HashSet<u32>,
+    edges: HashSet<(u32, u32)>,
 }
 
 impl RoutingTopology {
@@ -130,18 +133,18 @@ impl RoutingTopology {
         {
             return None;
         }
+        let pairs = topology.edge_pairs();
         Some(Self {
             hash: topology.hash.clone(),
             n_nodes: u32::try_from(topology.nodes.len()).ok()?,
-            n_edges: u32::try_from(topology.edges.0.len()).ok()?,
-            max_degree: maximum_degree(
-                topology
-                    .edges
-                    .0
-                    .iter()
-                    .copied()
-                    .zip(topology.edges.1.iter().copied()),
-            ),
+            n_edges: u32::try_from(pairs.len()).ok()?,
+            max_degree: maximum_degree(pairs.iter().copied()),
+            native_hash: crate::topology::native_topology_hash(&topology.nodes, &pairs)?,
+            nodes,
+            edges: pairs
+                .into_iter()
+                .map(|(u, v)| (u.min(v), u.max(v)))
+                .collect(),
         })
     }
 }
@@ -496,7 +499,50 @@ fn capable(q: &MinerQueue, job: &Job, topology: Option<&RoutingTopology>) -> boo
             return false;
         }
     }
-    true
+    native_compatible(&q.caps, job, topology)
+}
+
+fn native_compatible(caps: &MinerCaps, job: &Job, topology: Option<&RoutingTopology>) -> bool {
+    let Some(native_hash) = caps.native_topology_hash.as_ref() else {
+        return true;
+    };
+    if native_hash.len() != 32 {
+        return false;
+    }
+    if job.kind == JobKind::IsingGenerate as i32 {
+        return job_topology(job, topology).is_some();
+    }
+    let Some(ising) = job.ising.as_ref() else {
+        return false;
+    };
+    match ising.graph.as_ref() {
+        Some(ising_problem::Graph::TopologyHash(hash)) => topology.is_some_and(|t| t.hash == *hash),
+        Some(ising_problem::Graph::Edges(edges)) => {
+            let Some(topology) = topology else {
+                return false;
+            };
+            if native_hash.as_slice() != topology.native_hash.as_slice()
+                || edges.u.len() != edges.v.len()
+                || ising.encoding != quip_proto::v1::CoefficientEncoding::I32 as i32
+                || ising.scale != crate::producer::problem::MILLI_SCALE
+                || !ising.h.len().is_multiple_of(4)
+                || ising.j.len() != edges.u.len().saturating_mul(4)
+            {
+                return false;
+            }
+            let n_nodes = job_node_count(job, Some(topology));
+            if !(0..n_nodes).all(|node| topology.nodes.contains(&node)) {
+                return false;
+            }
+            edges.u.iter().zip(&edges.v).all(|(&u, &v)| {
+                u < n_nodes
+                    && v < n_nodes
+                    && u != v
+                    && topology.edges.contains(&(u.min(v), u.max(v)))
+            })
+        }
+        None => false,
+    }
 }
 
 fn job_topology<'a>(
@@ -1252,6 +1298,244 @@ mod tests {
             assert_graph_job_staging(&mut r, &topology, false);
             r.set_topology(Some(&invalid));
             assert_graph_job_staging(&mut r, &topology, true);
+        }
+    }
+
+    fn native_caps(topology: &Topology) -> MinerCaps {
+        MinerCaps {
+            native_topology_hash: crate::topology::native_topology_hash(
+                &topology.nodes,
+                &topology.edge_pairs(),
+            )
+            .map(|hash| hash.to_vec()),
+            ..caps_ising()
+        }
+    }
+
+    fn inline_job(nodes: usize, edges: &[(u32, u32)]) -> Job {
+        let (u, v) = edges.iter().copied().unzip();
+        Job {
+            kind: JobKind::IsingSample as i32,
+            ising: Some(crate::producer::problem::milli_problem(
+                Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                    u,
+                    v,
+                })),
+                &vec![0; nodes],
+                &vec![0; edges.len()],
+            )),
+            ..Job::default()
+        }
+    }
+
+    #[test]
+    fn native_router_accepts_hash_jobs_and_only_proven_inline_subgraphs() {
+        let topology = Topology::from_nodes_edges(
+            vec![0, 1, 2, 3],
+            vec![(0, 1), (1, 2), (2, 3)],
+            &[0],
+            &[1000],
+            &[-1000, 1000],
+        );
+        let caps = native_caps(&topology);
+        assert!(caps.native_topology_hash.is_some());
+        assert_ne!(caps.native_topology_hash.as_ref(), Some(&topology.hash));
+        let mut r = Router::new();
+        r.set_topology(Some(&topology));
+        r.register_miner("a-qpu", caps);
+        r.register_miner("z-cpu", caps_ising());
+        assert_eq!(r.route(hash_job(&topology)).as_deref(), Some("a-qpu"));
+        assert_eq!(r.route(inline_job(2, &[(1, 0)])).as_deref(), Some("a-qpu"));
+        assert_eq!(r.route(inline_job(3, &[(0, 2)])).as_deref(), Some("z-cpu"));
+        assert!(!r.stage_on("a-qpu", inline_job(3, &[(0, 2)])));
+        assert!(!r.stage_on("a-qpu", inline_job(5, &[])));
+        assert!(!r.stage_on("a-qpu", inline_job(2, &[(1, 2)])));
+        assert!(r.stage_on("a-qpu", inline_job(2, &[])));
+    }
+
+    #[test]
+    fn unknown_native_graph_keeps_hash_fallback_and_skips_inline_work() {
+        let topology =
+            Topology::from_nodes_edges(vec![0, 1], vec![(0, 1)], &[0], &[1000], &[-1000, 1000]);
+        let mut r = Router::new();
+        r.set_topology(Some(&topology));
+        r.register_miner(
+            "qpu",
+            MinerCaps {
+                native_topology_hash: Some(vec![8; 32]),
+                ..caps_ising()
+            },
+        );
+        assert!(r.stage_on("qpu", hash_job(&topology)));
+        assert!(!r.stage_on("qpu", inline_job(2, &[(0, 1)])));
+        let mut wrong_hash_job = hash_job(&topology);
+        if let Some(ising) = wrong_hash_job.ising.as_mut() {
+            ising.graph = Some(ising_problem::Graph::TopologyHash(vec![8; 32]));
+        }
+        assert!(!r.stage_on("qpu", wrong_hash_job));
+        r.set_topology(None);
+        assert!(!r.stage_on("qpu", hash_job(&topology)));
+        assert!(!r.stage_on("qpu", inline_job(2, &[(0, 1)])));
+    }
+
+    #[test]
+    fn inline_positions_are_never_relabelled_through_sparse_native_nodes() {
+        let topology = Topology::from_nodes_edges(
+            vec![10, 20, 30],
+            vec![(10, 20), (20, 30)],
+            &[0],
+            &[1000],
+            &[-1000, 1000],
+        );
+        let mut r = Router::new();
+        r.set_topology(Some(&topology));
+        r.register_miner("qpu", native_caps(&topology));
+        assert!(r.stage_on("qpu", hash_job(&topology)));
+        assert!(!r.stage_on("qpu", inline_job(2, &[(0, 1)])));
+        assert!(!r.stage_on("qpu", inline_job(2, &[])));
+    }
+
+    #[test]
+    fn native_snapshot_and_topology_changes_recheck_queued_jobs() {
+        let topology =
+            Topology::from_nodes_edges(vec![0, 1], vec![(0, 1)], &[0], &[1000], &[-1000, 1000]);
+        let mut r = Router::new();
+        r.set_topology(Some(&topology));
+        r.register_miner("a", native_caps(&topology));
+        r.register_miner("b", caps_ising());
+        r.grant_credits("a", 2);
+        assert!(r.stage_on("a", inline_job(2, &[(0, 1)])));
+        assert!(r.update_capabilities(
+            "a",
+            MinerCaps {
+                native_topology_hash: Some(vec![8; 32]),
+                ..caps_ising()
+            }
+        ));
+        assert_eq!(r.staged_len("a"), 0);
+        assert_eq!(r.staged_len("b"), 1);
+        assert_eq!(r.miners.get("a").map(|q| q.granted_credits), Some(2));
+        assert!(r.update_capabilities("a", native_caps(&topology)));
+        assert!(r.stage_on("a", inline_job(2, &[(0, 1)])));
+        let replacement =
+            Topology::from_nodes_edges(vec![0, 1], vec![], &[0], &[1000], &[-1000, 1000]);
+        r.set_topology(Some(&replacement));
+        assert!(r.next_job("a").is_none());
+        assert_eq!(r.staged_len("b"), 2);
+        assert_eq!(r.miners.get("a").map(|q| q.granted_credits), Some(2));
+    }
+
+    #[test]
+    fn malformed_native_evidence_never_admits_inline_work() {
+        let topology =
+            Topology::from_nodes_edges(vec![0, 1], vec![(0, 1)], &[0], &[1000], &[-1000, 1000]);
+        let mut r = Router::new();
+        r.set_topology(Some(&topology));
+        r.register_miner(
+            "qpu",
+            MinerCaps {
+                native_topology_hash: Some(vec![0; 31]),
+                ..caps_ising()
+            },
+        );
+        assert!(!r.stage_on("qpu", inline_job(2, &[(0, 1)])));
+        assert!(!r.stage_on("qpu", hash_job(&topology)));
+        assert!(r.update_capabilities("qpu", native_caps(&topology)));
+        let mut malformed = inline_job(2, &[(0, 1)]);
+        if let Some(ising) = malformed.ising.as_mut() {
+            ising.graph = Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                u: vec![0],
+                v: vec![],
+            }));
+        }
+        assert!(!r.stage_on("qpu", malformed));
+        let mut invalid_topology = topology;
+        invalid_topology.edges.1.clear();
+        r.set_topology(Some(&invalid_topology));
+        assert!(!r.stage_on("qpu", inline_job(2, &[(0, 1)])));
+    }
+
+    fn assert_native_inline_rejected(
+        r: &mut Router,
+        mutate: impl FnOnce(&mut quip_proto::v1::IsingProblem),
+    ) {
+        let mut job = inline_job(2, &[(0, 1)]);
+        if let Some(ising) = job.ising.as_mut() {
+            mutate(ising);
+        }
+        assert!(!r.stage_on("qpu", job));
+    }
+
+    #[test]
+    fn native_inline_proof_rejects_invalid_coefficients_and_missing_graphs() {
+        let topology =
+            Topology::from_nodes_edges(vec![0, 1], vec![(0, 1)], &[0], &[1000], &[-1000, 1000]);
+        let mut r = Router::new();
+        r.set_topology(Some(&topology));
+        r.register_miner("qpu", native_caps(&topology));
+        assert!(r.stage_on("qpu", inline_job(2, &[(0, 1)])));
+        assert_native_inline_rejected(&mut r, |ising| {
+            ising.encoding = quip_proto::v1::CoefficientEncoding::I8 as i32;
+        });
+        assert_native_inline_rejected(&mut r, |ising| ising.scale = 1);
+        assert_native_inline_rejected(&mut r, |ising| ising.h.push(0));
+        assert_native_inline_rejected(&mut r, |ising| ising.j.clear());
+        assert_native_inline_rejected(&mut r, |ising| ising.j.push(0));
+        assert_native_inline_rejected(&mut r, |ising| ising.graph = None);
+        assert!(!r.stage_on("qpu", inline_job(2, &[(0, 0)])));
+        assert!(!r.stage_on(
+            "qpu",
+            Job {
+                kind: JobKind::IsingSample as i32,
+                ..Job::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn native_hash_jobs_and_leases_use_only_active_chain_hash() {
+        let topology =
+            Topology::from_nodes_edges(vec![0, 1], vec![(0, 1)], &[0], &[1000], &[-1000, 1000]);
+        let mut r = Router::new();
+        r.register_miner(
+            "m",
+            MinerCaps {
+                native_topology_hash: Some(vec![8; 32]),
+                ..caps_lease()
+            },
+        );
+        r.set_topology(Some(&topology));
+        assert_graph_job_staging(&mut r, &topology, true);
+        let mut wrong = topology.clone();
+        wrong.hash = vec![8; 32];
+        assert_graph_job_staging(&mut r, &wrong, false);
+        r.set_topology(None);
+        assert_graph_job_staging(&mut r, &topology, false);
+        r.set_topology(Some(&topology));
+        assert!(r.update_capabilities(
+            "m",
+            MinerCaps {
+                native_topology_hash: Some(vec![0; 31]),
+                ..caps_lease()
+            }
+        ));
+        assert_graph_job_staging(&mut r, &topology, false);
+    }
+
+    #[test]
+    fn refusal_fallback_still_excludes_the_rejecting_miner_and_drops_without_alternative() {
+        for reason in [RejectReason::TopologyMismatch, RejectReason::TooLarge] {
+            let mut r = Router::new();
+            r.register_miner("a", caps_ising());
+            r.register_miner("b", caps_ising());
+            r.on_reject("a", make_job(1, JobKind::IsingSample), reason as i32);
+            assert_eq!(r.staged_len("a"), 0);
+            assert_eq!(r.staged_len("b"), 1);
+            let mut single = Router::new();
+            single.register_miner("a", caps_ising());
+            single.on_reject("a", make_job(1, JobKind::IsingSample), reason as i32);
+            assert_eq!(single.staged_len("a"), 0);
+            assert_eq!(single.unroutable.len(), 1);
         }
     }
 }

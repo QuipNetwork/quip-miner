@@ -490,6 +490,25 @@ On a reject with `UnsupportedKind`, the router records that the miner can't
 serve that job kind and re-routes the job to another capable miner. On a miner
 crash, `reclaim` returns its staged and in-flight jobs for re-queue.
 
+A miner with a native fingerprint receives hash jobs for the active session topology.
+The miner keeps its refusal or defect handling for those jobs.
+The native fingerprint uses a separate namespace from the chain topology hash
+and is never a chain lookup key.
+
+Inline work reaches that miner only when the coordinator proves graph membership.
+It computes the D-Wave graph-only fingerprint of the active topology.
+An equal fingerprint supplies the native nodes and edges for the subgraph check.
+Each inline node and undirected edge must belong to that graph.
+Inline ids are dense and start at zero without a mapping through the sparse
+session node list. Isolated nodes must also exist on the chip.
+If the native graph is unknown or the fingerprints differ, inline work goes
+to another capable miner without embedding.
+
+A reject re-routes to another capable miner and excludes the miner that
+rejected it. If none exists, the job enters `unroutable`.
+The production feeder does not retry it. Capability snapshots affect queued and future work.
+They do not restore dropped jobs.
+
 ## The miner session
 
 `CoordinatorService<C>` is the server side of the gRPC `MinerService`
