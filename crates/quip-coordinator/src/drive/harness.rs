@@ -719,3 +719,259 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
         run_wall_ms,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drive::{
+        aggregate, drain_all, parse_topology_spec, write_jsonl, LeaseSource, ListSource,
+        TopologySpec, TopologySpecError,
+    };
+    use crate::validate::MAX_PROOF_SOLUTIONS_WIRE;
+    use quip_proto::v1::{LeaseDone, SetTarget, Solution};
+    use quip_protocol::chacha8::draw_ising_milli;
+    use quip_protocol::wire::encode_spins_packed;
+
+    fn report_spec() -> Result<TopologySpec, TopologySpecError> {
+        parse_topology_spec(
+            r#"{
+                "nodes": [40, 7, 81, 2],
+                "edges": [],
+                "allowed_h_milli": [-1000],
+                "allowed_j_milli": [1000],
+                "gates": {
+                    "min_solutions": 2,
+                    "max_energy_milli": 0,
+                    "min_diversity_milli": 400
+                }
+            }"#,
+        )
+    }
+
+    fn packed_solution(spins: &[i8]) -> Solution {
+        Solution {
+            spins: encode_spins_packed(spins),
+            // A wire energy claim must not determine either report metric.
+            energy_milli: i64::MIN,
+        }
+    }
+
+    async fn score_nonce_result(
+        spec: &TopologySpec,
+        solutions: Vec<Solution>,
+    ) -> Result<JobRow, Box<dyn std::error::Error>> {
+        let text = format!(r#"{{"nonce":"{}"}}"#, "11".repeat(32));
+        let snapshot = spec.to_snapshot();
+        let mut source = ListSource::parse(&text, Some(&snapshot), 0)?;
+        let job = drain_all(&mut source)
+            .into_iter()
+            .next()
+            .ok_or("nonce replay produced no job")?;
+        let job_id = job.job_id.clone();
+        let mut state = CoordinatorState::new();
+        state.set_topology(Some(spec.topology.clone()));
+        state.target = Some(SetTarget {
+            max_energy_milli: spec.max_energy_milli,
+            min_solutions: spec.min_solutions,
+            min_diversity_milli: spec.min_diversity_milli,
+            max_proof_solutions: MAX_PROOF_SOLUTIONS_WIRE,
+            num_reads: 0,
+            num_sweeps: 0,
+            anneal_time_us: 0,
+        });
+        let _ = state.inflight.insert(job_id.clone(), job);
+        let state = Arc::new(Mutex::new(state));
+        let run = Arc::new(RunState::new(1));
+        run.note_dispatch(job_id.clone());
+        handle_result(
+            &state,
+            JobResult {
+                job_id,
+                solutions,
+                meta: None,
+                salt: Vec::new(),
+                nonce: Vec::new(),
+            },
+            &run,
+        )
+        .await;
+        let mut rows = run.rows.lock().map_err(|error| error.to_string())?;
+        if rows.len() != 1 {
+            return Err(
+                format!("result handler recorded {} rows instead of one", rows.len()).into(),
+            );
+        }
+        rows.pop()
+            .ok_or_else(|| "result handler recorded no row".into())
+    }
+
+    fn assert_selected_and_raw_energy(row: &JobRow) {
+        assert_eq!(row.best_energy_milli, -2000);
+        assert_eq!(row.raw_best_energy_milli, -4000);
+    }
+
+    #[tokio::test]
+    async fn qui_1540_report_distinguishes_selected_and_raw_energy() {
+        let spec = report_spec().expect("report topology is valid");
+        let row = score_nonce_result(
+            &spec,
+            vec![
+                packed_solution(&[1, 1, 1, 1]),
+                packed_solution(&[1, -1, 1, 1]),
+                packed_solution(&[1, 1, -1, 1]),
+            ],
+        )
+        .await
+        .expect("nonce result produces one report row");
+        assert_selected_and_raw_energy(&row);
+        assert_eq!(row.diversity_milli, 500);
+        assert_eq!(row.n_solutions, 3);
+        assert!(row.is_pow);
+        assert!(row.passed);
+
+        let directory = tempfile::tempdir().expect("temporary report directory is created");
+        let path = directory.path().join("report.jsonl");
+        let rows = std::slice::from_ref(&row);
+        write_jsonl(&path, rows, &aggregate(rows, 1)).expect("JSONL report is written");
+        let text = std::fs::read_to_string(path).expect("JSONL report is readable");
+        let first = text.lines().next().expect("JSONL report contains a row");
+        let json: serde_json::Value =
+            serde_json::from_str(first).expect("report row is valid JSON");
+        assert_eq!(
+            json.get("best_energy_milli"),
+            Some(&serde_json::json!(-2000))
+        );
+        assert_eq!(
+            json.get("raw_best_energy_milli"),
+            Some(&serde_json::json!(-4000))
+        );
+    }
+
+    #[tokio::test]
+    async fn qui_1540_failed_diversity_gate_keeps_selected_energy() {
+        let mut spec = report_spec().expect("report topology is valid");
+        spec.min_diversity_milli = 600;
+        let row = score_nonce_result(
+            &spec,
+            vec![
+                packed_solution(&[1, 1, 1, 1]),
+                packed_solution(&[1, -1, 1, 1]),
+                packed_solution(&[1, 1, -1, 1]),
+            ],
+        )
+        .await
+        .expect("nonce result produces one report row");
+        assert!(!row.passed);
+        assert_selected_and_raw_energy(&row);
+    }
+
+    #[tokio::test]
+    async fn qui_1540_report_handles_empty_invalid_and_ceiling_equal_rows() {
+        let mut spec = report_spec().expect("report topology is valid");
+        spec.max_energy_milli = -4000;
+        let invalid = Solution {
+            // Bits 4 through 7 are padding for this four-node topology.
+            spins: vec![0xff],
+            energy_milli: i64::MIN,
+        };
+        for (solutions, expected_raw) in [
+            (vec![packed_solution(&[1, 1, 1, 1]), invalid.clone()], -4000),
+            (vec![invalid], i64::MAX),
+            (Vec::new(), i64::MAX),
+            (
+                vec![Solution {
+                    spins: Vec::new(),
+                    energy_milli: i64::MIN,
+                }],
+                i64::MAX,
+            ),
+        ] {
+            let count = solutions.len();
+            let row = score_nonce_result(&spec, solutions)
+                .await
+                .expect("nonce result produces one report row");
+            assert_eq!(row.n_solutions, count);
+            assert_eq!(row.best_energy_milli, i64::MAX);
+            assert_eq!(row.raw_best_energy_milli, expected_raw);
+            assert!(!row.passed);
+            assert!(!row.rejected);
+        }
+    }
+
+    #[tokio::test]
+    async fn qui_1540_nonce_replay_preserves_sparse_node_and_edge_order() {
+        let spec = parse_topology_spec(
+            r#"{
+                "nodes": [40, 7, 81, 2],
+                "edges": [[81, 2], [40, 81], [7, 2]],
+                "allowed_h_milli": [0],
+                "allowed_j_milli": [700, 1700, 2900],
+                "gates": {"min_solutions": 1}
+            }"#,
+        )
+        .expect("sparse report topology is valid");
+        assert_eq!(spec.topology.nodes, vec![40, 7, 81, 2]);
+        assert_eq!(spec.topology.edge_pairs(), vec![(81, 2), (40, 81), (7, 2)]);
+        let (h, j) = draw_ising_milli(
+            [0x11; 32],
+            4,
+            3,
+            &spec.allowed_h_milli,
+            &spec.allowed_j_milli,
+        )
+        .expect("nonce draws valid coefficients");
+        assert_eq!(h, vec![0, 0, 0, 0]);
+        let [first, second, third] = j.as_slice() else {
+            panic!("expected three replay couplings");
+        };
+        // Dense edges are (2,3), (0,2), (1,3), in that received order.
+        let expected = -i64::from(*first) + i64::from(*second) + i64::from(*third);
+        let row = score_nonce_result(&spec, vec![packed_solution(&[1, -1, 1, -1])])
+            .await
+            .expect("nonce result produces one report row");
+        assert_eq!(row.best_energy_milli, expected);
+        assert_eq!(row.raw_best_energy_milli, expected);
+        assert!(row.passed);
+    }
+
+    #[tokio::test]
+    async fn qui_1540_lease_summary_copies_the_miner_minimum() {
+        let spec = report_spec().expect("report topology is valid");
+        let mut source = LeaseSource::new(&spec, [0; 32], 7, 1, 1);
+        let job = drain_all(&mut source)
+            .into_iter()
+            .next()
+            .expect("lease source produces one job");
+        let job_id = job.job_id.clone();
+        let mut state = CoordinatorState::new();
+        let _ = state.inflight.insert(job_id.clone(), job);
+        let state = Arc::new(Mutex::new(state));
+        let run = RunState::new(1);
+        handle_lease_done(
+            &state,
+            LeaseDone {
+                job_id,
+                salts_done: 1,
+                best_energy_milli: -700,
+            },
+            &run,
+        )
+        .await;
+        let mut rows = run.rows.lock().expect("report rows lock is not poisoned");
+        let row = rows.pop().expect("lease handler records one row");
+        assert_eq!(row.best_energy_milli, -700);
+        assert_eq!(row.raw_best_energy_milli, -700);
+        assert_eq!(row.diversity_milli, 0);
+        assert_eq!(row.salts_done, 1);
+        assert!(!row.passed);
+    }
+
+    #[test]
+    fn qui_1540_terminal_failure_uses_missing_energy_sentinels() {
+        let row = failing_row(vec![1], true, 0);
+        assert_eq!(row.best_energy_milli, i64::MAX);
+        assert_eq!(row.raw_best_energy_milli, i64::MAX);
+        assert!(row.rejected);
+        assert!(!row.passed);
+    }
+}

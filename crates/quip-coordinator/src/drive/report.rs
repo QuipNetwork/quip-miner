@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::Path;
 
-/// One row: a job's validated `Result` scored against its quality gates.
+/// One drive row: a validated `Result`, lease summary, or terminal failure.
 #[derive(Debug, Clone)]
 pub struct JobRow {
     /// Job identifier bytes (nonce for `PoW`, synthetic label for explicit jobs).
@@ -15,13 +15,17 @@ pub struct JobRow {
     pub is_pow: bool,
     /// Number of solutions returned by the miner for this job.
     pub n_solutions: usize,
-    /// Best (lowest) energy among accepted solutions, in milli-units.
+    /// For an ordinary `Result`, the minimum recomputed energy after the energy
+    /// gate, Z2 deduplication, and diversity selection, in milli-units.
+    /// `i64::MAX` when no row clears the energy gate. A finite value does not
+    /// imply `passed`. For a lease summary, the miner's `LeaseDone` minimum.
     pub best_energy_milli: i64,
-    /// Lowest energy over every shape-valid solution, before the gate and the
-    /// diversity selection. `best_energy_milli` covers only the selected
-    /// subset, so a replay that wants the miner's best reads this field.
+    /// For an ordinary `Result`, the minimum recomputed energy over every
+    /// shape-valid returned solution, before the energy gate, Z2 deduplication,
+    /// and diversity selection. `i64::MAX` when no shape-valid row exists.
+    /// For a lease summary, the same `LeaseDone` minimum as `best_energy_milli`.
     pub raw_best_energy_milli: i64,
-    /// Diversity score of the solution set, in milli-units.
+    /// Diversity of the selected subset, in milli-units; zero for lease rows.
     pub diversity_milli: u32,
     /// Whether the result passed the quality gates.
     pub passed: bool,

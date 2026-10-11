@@ -51,7 +51,9 @@ pub struct QualityGates {
 /// Outcome of coordinator-side result revalidation for miner gating.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Validated {
-    /// Best energy among gate-passing rows, or `i64::MAX` if none cleared.
+    /// Minimum recomputed energy after the energy gate, Z2 deduplication, and
+    /// diversity selection. `i64::MAX` when no row clears the energy gate.
+    /// A finite value does not imply `accepted`.
     pub best_energy_milli: i64,
     /// Diversity (milli) of the diverse-selected subset.
     pub diversity_milli: u32,
@@ -64,10 +66,10 @@ pub struct Validated {
     /// Packed into the immediate-submit proof instead of the raw result rows so
     /// submissions stay within the pallet's bound.
     pub selected_solutions: Vec<SpinRow>,
-    /// Minimum energy over *all* shape-valid rows, ignoring the current gate.
-    /// Unlike `best_energy_milli` (which is `i64::MAX` when nothing clears the
-    /// gate) this reflects the true best the miner found, so the decay-ratchet
-    /// stash can project when the easing gate will admit it.
+    /// Minimum recomputed energy over all shape-valid returned rows, before the
+    /// energy gate, Z2 deduplication, and diversity selection. `i64::MAX` when
+    /// no shape-valid row exists. The decay-ratchet stash uses this minimum to
+    /// project when an easing gate can admit a returned solution.
     pub raw_best_energy_milli: i64,
     /// The deduped rows (≤ [`MAX_PROOF_SOLUTIONS`]) the stash retains for a
     /// future, eased-ceiling submission, chosen regardless of the current gate.
