@@ -1,5 +1,6 @@
 //! Capability index, per-miner staged queue, credit accounting, cancel, reject.
 
+use crate::topology::Topology;
 use quip_proto::v1::{ising_problem, Capabilities, Job, JobKind, RejectReason};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -105,10 +106,62 @@ struct DropLog {
     last_warn: Instant,
 }
 
+#[derive(Debug)]
+struct RoutingTopology {
+    hash: Vec<u8>,
+    n_nodes: u32,
+    n_edges: u32,
+    max_degree: u32,
+}
+
+impl RoutingTopology {
+    fn new(topology: &Topology) -> Option<Self> {
+        if topology.edges.0.len() != topology.edges.1.len() {
+            return None;
+        }
+        let nodes: HashSet<u32> = topology.nodes.iter().copied().collect();
+        if nodes.len() != topology.nodes.len()
+            || topology
+                .edges
+                .0
+                .iter()
+                .zip(&topology.edges.1)
+                .any(|(u, v)| u == v || !nodes.contains(u) || !nodes.contains(v))
+        {
+            return None;
+        }
+        Some(Self {
+            hash: topology.hash.clone(),
+            n_nodes: u32::try_from(topology.nodes.len()).ok()?,
+            n_edges: u32::try_from(topology.edges.0.len()).ok()?,
+            max_degree: maximum_degree(
+                topology
+                    .edges
+                    .0
+                    .iter()
+                    .copied()
+                    .zip(topology.edges.1.iter().copied()),
+            ),
+        })
+    }
+}
+
+fn maximum_degree(edges: impl Iterator<Item = (u32, u32)>) -> u32 {
+    let mut degrees: HashMap<u32, u32> = HashMap::new();
+    for (u, v) in edges {
+        for node in [u, v] {
+            let degree = degrees.entry(node).or_default();
+            *degree = degree.saturating_add(1);
+        }
+    }
+    degrees.values().copied().max().unwrap_or(0)
+}
+
 /// Routes jobs to miners by capability, stages them, and gates dispatch on credits.
 #[derive(Debug, Default)]
 pub struct Router {
     miners: HashMap<String, MinerQueue>,
+    topology: Option<RoutingTopology>,
     /// Jobs that could not be routed (no capable miner).
     pub unroutable: Vec<Job>,
     /// Per-miner drop counters behind [`DROP_WARN_INTERVAL`].
@@ -120,6 +173,11 @@ impl Router {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cache the active session graph for hash-job and lease routing.
+    pub fn set_topology(&mut self, topology: Option<&Topology>) {
+        self.topology = topology.and_then(RoutingTopology::new);
     }
 
     /// Register (or re-register) a miner with the given capability envelope.
@@ -163,7 +221,7 @@ impl Router {
     fn is_capable(&self, miner_id: &str, job: &Job) -> bool {
         self.miners
             .get(miner_id)
-            .is_some_and(|q| capable(q, job.kind, job_node_count(job), job_edge_count(job)))
+            .is_some_and(|q| capable(q, job, self.topology.as_ref()))
     }
 
     /// Like [`Router::route`], but never selects `exclude`. Used by
@@ -416,7 +474,8 @@ impl Router {
     }
 }
 
-fn capable(q: &MinerQueue, kind: i32, n_nodes: u32, n_edges: u32) -> bool {
+fn capable(q: &MinerQueue, job: &Job, topology: Option<&RoutingTopology>) -> bool {
+    let kind = job.kind;
     if q.unsupported_kinds.contains(&kind) {
         return false;
     }
@@ -426,40 +485,75 @@ fn capable(q: &MinerQueue, kind: i32, n_nodes: u32, n_edges: u32) -> bool {
     if kind == JobKind::IsingGenerate as i32 && !q.caps.accepts_leases() {
         return false;
     }
-    // max_nodes/max_edges of 0 means unlimited (Hello default when unset).
-    if q.caps.max_nodes > 0 && n_nodes > q.caps.max_nodes {
+    if q.caps.max_nodes > 0 && job_node_count(job, topology) > q.caps.max_nodes {
         return false;
     }
-    if q.caps.max_edges > 0 && n_edges > q.caps.max_edges {
+    if q.caps.max_edges > 0 && job_edge_count(job, topology) > q.caps.max_edges {
         return false;
+    }
+    if let Some(limit) = q.caps.max_degree.filter(|&limit| limit > 0) {
+        if job_max_degree(job, topology).is_some_and(|degree| degree > limit) {
+            return false;
+        }
     }
     true
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "Ising h-field length / 4 is a node count that fits in u32"
-)]
-fn job_node_count(job: &Job) -> u32 {
-    let Some(ising) = job.ising.as_ref() else {
-        return 0;
+fn job_topology<'a>(
+    job: &Job,
+    topology: Option<&'a RoutingTopology>,
+) -> Option<&'a RoutingTopology> {
+    let hash = if job.kind == JobKind::IsingGenerate as i32 {
+        job.generator.as_ref()?.topology_hash.as_slice()
+    } else {
+        let ising = job.ising.as_ref()?;
+        match ising.graph.as_ref()? {
+            ising_problem::Graph::TopologyHash(hash) => hash.as_slice(),
+            ising_problem::Graph::Edges(_) => return None,
+        }
     };
-    // h field length / 4 = node count
-    // Coordinator-authored problems are always `I32`, four bytes per element.
-    (ising.h.len() / 4) as u32
+    topology.filter(|t| t.hash.as_slice() == hash)
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "Ising edge counts fit in u32 for staged problems"
-)]
-fn job_edge_count(job: &Job) -> u32 {
+fn job_node_count(job: &Job, topology: Option<&RoutingTopology>) -> u32 {
+    if job.kind == JobKind::IsingGenerate as i32 {
+        return job_topology(job, topology).map_or(0, |t| t.n_nodes);
+    }
+    job.ising.as_ref().map_or(0, |ising| {
+        u32::try_from(ising.h.len() / 4).unwrap_or(u32::MAX)
+    })
+}
+
+fn job_edge_count(job: &Job, topology: Option<&RoutingTopology>) -> u32 {
+    if job.kind == JobKind::IsingGenerate as i32 {
+        return job_topology(job, topology).map_or(0, |t| t.n_edges);
+    }
     let Some(ising) = job.ising.as_ref() else {
         return 0;
     };
-    match &ising.graph {
-        Some(ising_problem::Graph::Edges(e)) => e.u.len() as u32,
-        _ => (ising.j.len() / 4) as u32,
+    let count = match ising.graph.as_ref() {
+        Some(ising_problem::Graph::Edges(edges)) => edges.u.len(),
+        Some(ising_problem::Graph::TopologyHash(_)) | None => ising.j.len() / 4,
+    };
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+fn job_max_degree(job: &Job, topology: Option<&RoutingTopology>) -> Option<u32> {
+    if let Some(topology) = job_topology(job, topology) {
+        return Some(topology.max_degree);
+    }
+    let ising = job.ising.as_ref()?;
+    match ising.graph.as_ref() {
+        Some(ising_problem::Graph::Edges(edges)) => {
+            if edges.u.len() != edges.v.len() {
+                return None;
+            }
+            Some(maximum_degree(
+                edges.u.iter().copied().zip(edges.v.iter().copied()),
+            ))
+        }
+        Some(ising_problem::Graph::TopologyHash(_)) => None,
+        None => ising.j.is_empty().then_some(0),
     }
 }
 
@@ -869,5 +963,295 @@ mod tests {
         assert!(r.next_job("a").is_none());
         assert_eq!(r.staged_len("b"), 1);
         assert_eq!(r.miners.get("a").map(|q| q.granted_credits), Some(1));
+    }
+
+    fn degree_job(degree: u32) -> Job {
+        let h: Vec<i32> = (0..=degree).map(|_| 0).collect();
+        let j: Vec<i32> = (0..degree).map(|_| 0).collect();
+        let edges = quip_proto::v1::EdgeList {
+            u: (0..degree).map(|_| 0).collect(),
+            v: (1..=degree).collect(),
+        };
+        Job {
+            job_id: degree.to_le_bytes().to_vec(),
+            kind: JobKind::IsingSample as i32,
+            ising: Some(crate::producer::problem::milli_problem(
+                Some(ising_problem::Graph::Edges(edges)),
+                &h,
+                &j,
+            )),
+            ..Job::default()
+        }
+    }
+
+    fn hash_job(topology: &Topology) -> Job {
+        let h: Vec<i32> = topology.nodes.iter().map(|_| 0).collect();
+        let j: Vec<i32> = topology.edges.0.iter().map(|_| 0).collect();
+        Job {
+            job_id: topology.hash.clone(),
+            kind: JobKind::IsingSample as i32,
+            ising: Some(crate::producer::problem::milli_problem(
+                Some(ising_problem::Graph::TopologyHash(topology.hash.clone())),
+                &h,
+                &j,
+            )),
+            ..Job::default()
+        }
+    }
+
+    #[test]
+    fn degree_boundary_routes_and_stages_before_dispatch() {
+        let mut r = Router::new();
+        r.register_miner(
+            "a-msa",
+            MinerCaps {
+                max_degree: Some(20),
+                ..caps_ising()
+            },
+        );
+        r.register_miner("z-cpu", caps_ising());
+        assert_eq!(r.route(degree_job(20)).as_deref(), Some("a-msa"));
+        assert_eq!(r.route(degree_job(21)).as_deref(), Some("z-cpu"));
+        assert!(!r.stage_on("a-msa", degree_job(21)));
+        assert!(r.stage_on("a-msa", degree_job(20)));
+    }
+
+    #[test]
+    fn cached_sparse_graph_bounds_hash_jobs_and_leases() {
+        let topology = Topology::from_nodes_edges(
+            (0..=21).map(|n| 10 + n * 10).collect(),
+            (1..=21).map(|n| (10, 10 + n * 10)).collect(),
+            &[0],
+            &[1000],
+            &[-1000, 1000],
+        );
+        let mut r = Router::new();
+        r.set_topology(Some(&topology));
+        r.register_miner(
+            "msa",
+            MinerCaps {
+                max_degree: Some(20),
+                ..caps_lease()
+            },
+        );
+        assert!(!r.stage_on("msa", hash_job(&topology)));
+        let mut lease = lease_job(100);
+        if let Some(generator) = lease.generator.as_mut() {
+            generator.topology_hash.clone_from(&topology.hash);
+        }
+        assert!(!r.stage_on("msa", lease.clone()));
+        assert!(r.update_capabilities(
+            "msa",
+            MinerCaps {
+                max_degree: Some(21),
+                max_nodes: 21,
+                ..caps_lease()
+            }
+        ));
+        assert!(!r.stage_on("msa", lease.clone()));
+        assert!(r.update_capabilities(
+            "msa",
+            MinerCaps {
+                max_degree: Some(21),
+                max_edges: 20,
+                ..caps_lease()
+            }
+        ));
+        assert!(!r.stage_on("msa", lease.clone()));
+        assert!(r.update_capabilities(
+            "msa",
+            MinerCaps {
+                max_degree: Some(21),
+                ..caps_lease()
+            }
+        ));
+        assert!(r.stage_on("msa", lease));
+        assert!(r.stage_on("msa", hash_job(&topology)));
+    }
+
+    #[test]
+    fn degree_snapshot_rechecks_staged_jobs_without_spending_credits() {
+        let mut r = Router::new();
+        r.register_miner("a", caps_ising());
+        r.register_miner("b", caps_ising());
+        r.grant_credits("a", 2);
+        r.grant_credits("b", 3);
+        for degree in [21, 20, 22, 19, 23, 18] {
+            assert!(r.stage_on("a", degree_job(degree)));
+        }
+        assert!(r.update_capabilities(
+            "a",
+            MinerCaps {
+                max_degree: Some(20),
+                ..caps_ising()
+            }
+        ));
+        assert_eq!(
+            r.miners.get("a").map(|q| q
+                .staged
+                .iter()
+                .map(|j| j.job_id.clone())
+                .collect::<Vec<_>>()),
+            Some(vec![
+                20_u32.to_le_bytes().to_vec(),
+                19_u32.to_le_bytes().to_vec(),
+                18_u32.to_le_bytes().to_vec(),
+            ])
+        );
+        assert_eq!(
+            r.miners.get("b").map(|q| q
+                .staged
+                .iter()
+                .map(|j| j.job_id.clone())
+                .collect::<Vec<_>>()),
+            Some(vec![
+                21_u32.to_le_bytes().to_vec(),
+                22_u32.to_le_bytes().to_vec(),
+                23_u32.to_le_bytes().to_vec(),
+            ])
+        );
+        assert_eq!(r.miners.get("a").map(|q| q.granted_credits), Some(2));
+        assert_eq!(r.miners.get("b").map(|q| q.granted_credits), Some(3));
+        assert_eq!(r.take_consumed("a"), 0);
+        assert_eq!(r.take_consumed("b"), 0);
+        assert_eq!(
+            r.next_job("a").map(|j| j.job_id),
+            Some(20_u32.to_le_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn unspecified_and_zero_degree_keep_the_fallback() {
+        let mut r = Router::new();
+        r.register_miner("m", caps_ising());
+        assert!(r.stage_on("m", degree_job(21)));
+        assert!(r.update_capabilities(
+            "m",
+            MinerCaps {
+                max_degree: Some(0),
+                ..caps_ising()
+            }
+        ));
+        assert!(r.stage_on("m", degree_job(21)));
+        assert!(r.update_capabilities(
+            "m",
+            MinerCaps {
+                max_degree: Some(20),
+                ..caps_ising()
+            }
+        ));
+        let topology =
+            Topology::from_nodes_edges(vec![0, 1], vec![(0, 1)], &[0], &[1000], &[-1000, 1000]);
+        assert!(r.stage_on("m", hash_job(&topology)));
+        r.set_topology(Some(&topology));
+        assert!(r.stage_on("m", hash_job(&topology)));
+        r.set_topology(None);
+        assert!(r.stage_on("m", hash_job(&topology)));
+    }
+
+    #[test]
+    fn degree_counts_duplicate_and_zero_coupling_edges() {
+        let mut r = Router::new();
+        r.register_miner(
+            "m",
+            MinerCaps {
+                max_degree: Some(1),
+                ..caps_ising()
+            },
+        );
+        let duplicate = Job {
+            kind: JobKind::IsingSample as i32,
+            ising: Some(crate::producer::problem::milli_problem(
+                Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                    u: vec![0, 0],
+                    v: vec![1, 1],
+                })),
+                &[0, 0],
+                &[0, 0],
+            )),
+            ..Job::default()
+        };
+        assert!(!r.stage_on("m", duplicate));
+        assert!(r.stage_on("m", degree_job(1)));
+        assert!(r.stage_on("m", degree_job(0)));
+    }
+
+    fn assert_graph_job_staging(r: &mut Router, topology: &Topology, expected: bool) {
+        assert_eq!(r.stage_on("m", hash_job(topology)), expected);
+        let mut lease = lease_job(100);
+        if let Some(generator) = lease.generator.as_mut() {
+            generator.topology_hash.clone_from(&topology.hash);
+        }
+        assert_eq!(r.stage_on("m", lease), expected);
+    }
+
+    #[test]
+    fn unmatched_and_cleared_topology_keep_the_fallback() {
+        let topology = Topology::from_nodes_edges(
+            vec![10, 20, 30],
+            vec![(10, 20), (10, 30)],
+            &[0],
+            &[1000],
+            &[-1000, 1000],
+        );
+        let mut r = Router::new();
+        r.register_miner(
+            "m",
+            MinerCaps {
+                max_degree: Some(1),
+                ..caps_lease()
+            },
+        );
+        r.set_topology(Some(&topology));
+        assert_graph_job_staging(&mut r, &topology, false);
+
+        let mut unmatched = topology.clone();
+        unmatched.hash = vec![99; 32];
+        assert_graph_job_staging(&mut r, &unmatched, true);
+        r.set_topology(None);
+        assert_graph_job_staging(&mut r, &topology, true);
+    }
+
+    #[test]
+    fn invalid_topologies_clear_cached_graph_metrics() {
+        let topology = Topology::from_nodes_edges(
+            vec![10, 20, 30],
+            vec![(10, 20), (10, 30)],
+            &[0],
+            &[1000],
+            &[-1000, 1000],
+        );
+        let invalid = [
+            Topology {
+                edges: (vec![10, 10], vec![20]),
+                ..topology.clone()
+            },
+            Topology {
+                nodes: vec![10, 20, 30, 10],
+                ..topology.clone()
+            },
+            Topology {
+                edges: (vec![10], vec![10]),
+                ..topology.clone()
+            },
+            Topology {
+                edges: (vec![10], vec![40]),
+                ..topology.clone()
+            },
+        ];
+        let mut r = Router::new();
+        r.register_miner(
+            "m",
+            MinerCaps {
+                max_degree: Some(1),
+                ..caps_lease()
+            },
+        );
+        for invalid in invalid {
+            r.set_topology(Some(&topology));
+            assert_graph_job_staging(&mut r, &topology, false);
+            r.set_topology(Some(&invalid));
+            assert_graph_job_staging(&mut r, &topology, true);
+        }
     }
 }

@@ -267,6 +267,7 @@ impl CoordinatorState {
     /// once. Both drive and production go through here so `validate_result`
     /// never rebuilds the graph per result.
     pub fn set_topology(&mut self, topology: Option<Topology>) {
+        self.router.set_topology(topology.as_ref());
         self.lease_topology = topology.as_ref().and_then(|t| {
             quip_protocol::lease::TopologyView::from_proto(&t.to_proto())
                 .map_err(|e| tracing::error!(error = ?e, "topology cannot back lease verification"))
@@ -2008,5 +2009,40 @@ mod tests {
             Some(updated.features.as_slice())
         );
         assert!(st.inflight.contains_key(b"already-dispatched".as_slice()));
+    }
+
+    #[test]
+    fn set_topology_populates_the_router_graph_metrics() {
+        let topology = Topology::from_nodes_edges(
+            vec![10, 20, 30],
+            vec![(10, 20), (10, 30)],
+            &[0],
+            &[1000],
+            &[-1000, 1000],
+        );
+        let problem = crate::producer::problem::milli_problem(
+            Some(quip_proto::v1::ising_problem::Graph::TopologyHash(
+                topology.hash.clone(),
+            )),
+            &[0; 3],
+            &[0; 2],
+        );
+        let mut st = CoordinatorState::new();
+        st.router.register_miner(
+            "m",
+            MinerCaps {
+                max_degree: Some(1),
+                ..caps()
+            },
+        );
+        st.set_topology(Some(topology));
+        assert!(!st.router.stage_on(
+            "m",
+            Job {
+                kind: JobKind::IsingSample as i32,
+                ising: Some(problem),
+                ..Job::default()
+            }
+        ));
     }
 }

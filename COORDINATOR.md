@@ -462,10 +462,14 @@ rule a round ran under.
 
 ## Routing and credits
 
-`Router` (`router.rs`) indexes miners by capability and holds a staged queue
-per miner. `route` first-fits a job to a capable miner (by `supported_kinds`
-and `max_nodes`/`max_edges` from the miner's `Hello`); `stage_on` targets a
-specific miner, which is what the feeder uses.
+`Router` (`router.rs`) indexes miner capabilities and holds a staged queue per miner.
+`route` selects the first capable miner by sorted miner id.
+`stage_on` targets a specific miner, which is what the feeder uses.
+Both paths check job kinds, the lease generator, node and edge limits, and degree.
+Inline graphs supply their own degree. Hash jobs and leases use the active session graph.
+Lease node and edge counts also come from that graph.
+An absent degree limit makes no claim. A degree limit of zero permits any degree.
+If the graph is unknown, the miner's reject path remains the fallback.
 
 The router retains the miner's native topology fingerprint, feature names,
 and optional degree limit. A protocol-2 `Capabilities` message replaces the
