@@ -2377,6 +2377,15 @@ mod default_topology_tests {
             .is_empty());
     }
 
+    fn assert_topology_read_error(error: &ChainError, expected: &ChainError, message: &str) {
+        assert_eq!(
+            std::mem::discriminant(error),
+            std::mem::discriminant(expected),
+            "unexpected chain error variant: {error}"
+        );
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
     #[tokio::test]
     async fn default_topology_uses_one_head_and_needs_no_signer() {
         let hash = [0x11; 32];
@@ -2412,25 +2421,34 @@ mod default_topology_tests {
             .fetch_default_topology()
             .await
             .expect_err("expected missing metadata error");
-        assert!(error.to_string().contains("is not registered"));
+        assert_topology_read_error(
+            &error,
+            &ChainError::Decode(String::new()),
+            "is not registered",
+        );
         assert_drained(&transport);
     }
 
     #[tokio::test]
     async fn topology_read_preserves_transport_and_decode_errors() {
-        for (response, expected) in [
+        for (response, expected_variant, expected) in [
             (
                 Err(ChainError::Unavailable("fixture unavailable".into())),
+                ChainError::Unavailable(String::new()),
                 "chain unavailable: fixture unavailable",
             ),
-            (Ok(Value::String("0x03".into())), "decode error:"),
+            (
+                Ok(Value::String("0x03".into())),
+                ChainError::Decode(String::new()),
+                "decode error:",
+            ),
         ] {
             let (client, transport) = client(topology_steps(Some([0x11; 32]), response));
             let error = client
                 .fetch_default_topology()
                 .await
                 .expect_err("expected topology read failure");
-            assert!(error.to_string().contains(expected));
+            assert_topology_read_error(&error, &expected_variant, expected);
             assert_drained(&transport);
         }
     }
@@ -2446,9 +2464,11 @@ mod default_topology_tests {
             .fetch_default_topology()
             .await
             .expect_err("expected invalid head error");
-        assert!(error
-            .to_string()
-            .contains("chain_getBlockHash not a string"));
+        assert_topology_read_error(
+            &error,
+            &ChainError::Decode(String::new()),
+            "chain_getBlockHash not a string",
+        );
         assert_drained(&transport);
     }
 }
