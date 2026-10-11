@@ -5,26 +5,20 @@
     reason = "helper builds mock miner outside #[test]"
 )]
 #![expect(
-    clippy::unwrap_used,
-    reason = "now_ms / config helpers outside #[test]"
-)]
-#![expect(
-    clippy::cast_possible_truncation,
-    reason = "test wall-clock millis fit u64"
-)]
-#![expect(
     clippy::indexing_slicing,
     reason = "config launch table is fixture-sized"
 )]
 
 use quip_coordinator::chain::{FakeChain, MiningSnapshot};
 use quip_coordinator::config::{parse_config, LaunchEntry};
-use quip_coordinator::producer::derive_pow_job;
-use quip_coordinator::session::{drive_pow_round, DrivePowParams};
-use quip_coordinator::topology::Topology;
+use quip_coordinator::runtime::{run_runtime, RuntimeParams};
+use quip_coordinator::session::CoordinatorState;
+use quip_coordinator::supervisor::BackoffPolicy;
 use quip_proto::v1::Configure;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use tokio::sync::{oneshot, Mutex};
 
 fn mock_miner() -> String {
     let status = std::process::Command::new(env!("CARGO"))
@@ -42,13 +36,6 @@ fn mock_miner() -> String {
     let _ = p.pop();
     p.push(name);
     p.to_string_lossy().into_owned()
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
 }
 
 fn loose_snapshot() -> MiningSnapshot {
@@ -79,31 +66,30 @@ fn loose_snapshot() -> MiningSnapshot {
 
 #[tokio::test]
 async fn e2e_mock_miner_pow_submit_via_fake_chain() {
-    let snap = loose_snapshot();
-    let chain = Arc::new(FakeChain::new(snap.clone(), None));
-
-    let topology = Topology::from_nodes_edges(
-        snap.nodes.clone(),
-        snap.edges.clone(),
-        &snap.allowed_h_milli,
-        &snap.allowed_j_milli,
-        &snap.allowed_spin_milli,
-    );
-    // Ensure topology hash matches snapshot.
-    assert_eq!(topology.hash, snap.topology_hash);
-
-    let deadline = now_ms() + 3_600_000;
-    let job = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 1, deadline).unwrap();
-
-    // Second-generation job for cancel path.
-    let mut snap2 = snap.clone();
-    snap2.last_proof_block_hash = [8u8; 32];
-    let job2 = derive_pow_job(&snap2, [1u8; 32], [3u8; 32], 2, deadline).unwrap();
-
     let miner = mock_miner();
+    let chain = Arc::new(FakeChain::new(loose_snapshot(), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let params = RuntimeParams {
+        max_submit_attempts: 5,
+        sock_path: format!("/tmp/quip-e2e-{}.sock", std::process::id()),
+        grace_ms: 500,
+        backoff: BackoffPolicy::default(),
+        miner_identity: [0x11; 32],
+        miner_account: [0x22; 32],
+        buffer_depth: 2,
+        poll_interval_ms: 100,
+        dashboard: None,
+        log_level: quip_coordinator::logging::LogLevel::Info,
+        funding: quip_coordinator::funding::FundingParams::default(),
+        descriptor: quip_coordinator::config::DescriptorParams::default(),
+        descriptor_filed: Arc::new(AtomicBool::new(false)),
+        miner_registered: Arc::new(AtomicBool::new(false)),
+        solver_registered: Arc::new(AtomicBool::new(false)),
+        identity: quip_coordinator::metrics::Identity::default(),
+    };
     let entry = LaunchEntry {
         miner_id: "cpu-0".into(),
-        binary: miner.clone(),
+        binary: miner,
         backend: "cpu".into(),
         device: None,
         configure: Configure {
@@ -115,34 +101,37 @@ async fn e2e_mock_miner_pow_submit_via_fake_chain() {
         },
     };
 
-    let sock = format!("/tmp/quip-e2e-{}.sock", std::process::id());
-    let report = drive_pow_round(DrivePowParams {
-        miner_bin: &miner,
-        sock_path: &sock,
-        miner_id: "cpu-0",
-        token: "e2e-token",
-        entry: &entry,
-        topology,
-        job,
-        chain: Arc::clone(&chain),
-        cancel_then_job: Some((1, job2)),
-    })
-    .await;
+    let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
+    let chain_for_run = Arc::clone(&chain);
+    let run = tokio::spawn(async move {
+        run_runtime(vec![entry], chain_for_run, state, params, async move {
+            let _ = trigger_rx.await;
+        })
+        .await
+    });
 
-    assert!(report.handshake_ok, "handshake failed");
+    // The supervisor spawns the mock miner. The feeder stages derived PoW
+    // jobs. The mock miner answers all +1, which clears the loose gates, and
+    // the session validates the result and submits it to FakeChain.
+    let mut submitted = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if chain.submitted_count() >= 1 {
+            submitted = true;
+            break;
+        }
+    }
     assert!(
-        report.results_validated >= 1,
-        "expected ≥1 validated result, got {}",
-        report.results_validated
+        submitted,
+        "FakeChain never captured a submit from the mock miner"
     );
-    assert!(
-        chain.submitted_count() >= 1,
-        "FakeChain should capture ≥1 submit"
-    );
-    // Cancel path: mock-miner reports Status on Cancel (abandoned_generation
-    // may stay 0 because the mock has no buffered work). At least the first
-    // submit path is the hard gate.
-    let _ = report.abandoned_generation;
+
+    trigger_tx.send(()).expect("send shutdown trigger");
+    tokio::time::timeout(Duration::from_secs(6), run)
+        .await
+        .expect("run_runtime did not return after shutdown")
+        .expect("run_runtime task panicked")
+        .expect("run_runtime returned an error");
 }
 
 #[test]

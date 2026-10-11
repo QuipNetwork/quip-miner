@@ -629,7 +629,7 @@ address the operator trusts, because it applies no authentication.
 
 ## Drive mode
 
-`quip-coordinator drive` (the `drive` module and `DriveService` in `session.rs`)
+`quip-coordinator drive` (the `drive` module)
 spawns one miner and feeds it synthetic work with no chain and no submit. Jobs
 come from a golden random draw (`--source random`, optionally with a topology
 preset embedded in the binary) or a JSONL replay (`--source list`). Drive reports
