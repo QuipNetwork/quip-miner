@@ -467,6 +467,14 @@ per miner. `route` first-fits a job to a capable miner (by `supported_kinds`
 and `max_nodes`/`max_edges` from the miner's `Hello`); `stage_on` targets a
 specific miner, which is what the feeder uses.
 
+The router retains the miner's native topology fingerprint, feature names,
+and optional degree limit. A protocol-2 `Capabilities` message replaces the
+stored envelope during a session. The update preserves credits and counters.
+Queued jobs that no longer fit move to another capable miner, in queue order.
+The dispatch path checks each queued job again before spending a credit.
+Jobs already dispatched continue under the existing result and reject rules.
+A snapshot with an incompatible protocol version leaves the current envelope intact.
+
 Dispatch is gated by a **credit pool**, not a queue depth. The miner grants
 `width` credits up front and one more per terminal event (`Result` or
 `Reject`); each dispatch spends one credit (`next_job`). Dispatch stays

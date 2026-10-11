@@ -4,22 +4,28 @@ use quip_proto::v1::{ising_problem, Capabilities, Job, JobKind, RejectReason};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-/// Capability envelope advertised in `Hello`.
+/// Capability envelope from the latest accepted miner advertisement.
 #[derive(Debug, Clone, Default)]
 pub struct MinerCaps {
-    /// Backend name (e.g. `"cpu"`, `"cuda"`).
+    /// Backend name.
     pub backend: String,
-    /// Sampling algorithm name (e.g. `"sa"`, `"gibbs"`).
+    /// Sampling algorithm name.
     pub algorithm: String,
-    /// Job kinds this miner accepts; empty means all kinds.
+    /// Accepted job kinds. Empty means all kinds.
     pub supported_kinds: Vec<i32>,
-    /// Maximum nodes; `0` means unlimited.
+    /// Maximum nodes. Zero is unbounded.
     pub max_nodes: u32,
-    /// Maximum edges; `0` means unlimited.
+    /// Maximum edges. Zero is unbounded.
     pub max_edges: u32,
-    /// Problem generators this miner runs for `ISING_GENERATE` leases.
+    /// Maximum degree. None makes no claim. Some(0) is unbounded.
+    pub max_degree: Option<u32>,
+    /// Fingerprint of the native graph, independent of chain topology hashes.
+    pub native_topology_hash: Option<Vec<u8>>,
+    /// Feature names advertised by the miner.
+    pub features: Vec<String>,
+    /// Problem generators supported for leases.
     pub generators: Vec<i32>,
-    /// Problems the miner keeps in flight. `0` means unknown until the device opens.
+    /// Models kept in flight. Zero means unknown.
     pub stream_width: u32,
 }
 
@@ -36,7 +42,7 @@ impl MinerCaps {
                 .contains(&(quip_proto::v1::GeneratorAlgorithm::Blake3Chacha8V1 as i32))
     }
 
-    /// Index a v2 `Capabilities` message.
+    /// Index a protocol-2 capability snapshot.
     #[must_use]
     pub fn from_capabilities(c: &Capabilities) -> Self {
         use quip_protocol::session::{algorithm_name, backend_name};
@@ -46,6 +52,9 @@ impl MinerCaps {
             supported_kinds: c.supported_kinds.clone(),
             max_nodes: c.max_nodes,
             max_edges: c.max_edges,
+            max_degree: c.max_degree,
+            native_topology_hash: c.native_topology_hash.clone(),
+            features: c.features.clone(),
             generators: c.generators.clone(),
             stream_width: c.stream_width,
         }
@@ -151,24 +160,24 @@ impl Router {
         self.route_excluding(job, None)
     }
 
+    fn is_capable(&self, miner_id: &str, job: &Job) -> bool {
+        self.miners
+            .get(miner_id)
+            .is_some_and(|q| capable(q, job.kind, job_node_count(job), job_edge_count(job)))
+    }
+
     /// Like [`Router::route`], but never selects `exclude`. Used by
     /// [`Router::on_reject`] so a rejected job is not re-staged onto the miner
     /// that just rejected it.
     fn route_excluding(&mut self, job: Job, exclude: Option<&str>) -> Option<String> {
-        let n_nodes = job_node_count(&job);
-        let n_edges = job_edge_count(&job);
-        let kind = job.kind;
-
-        let mut candidates: Vec<&String> = self
+        let mut candidates: Vec<String> = self
             .miners
-            .iter()
-            .filter(|(id, q)| exclude != Some(id.as_str()) && capable(q, kind, n_nodes, n_edges))
-            .map(|(id, _)| id)
+            .keys()
+            .filter(|id| exclude != Some(id.as_str()) && self.is_capable(id, &job))
+            .cloned()
             .collect();
-        candidates.sort(); // deterministic pick
-
-        if let Some(id) = candidates.first().copied() {
-            let id = id.clone();
+        candidates.sort();
+        if let Some(id) = candidates.first().cloned() {
             if let Some(q) = self.miners.get_mut(&id) {
                 q.staged.push_back(job);
             }
@@ -177,6 +186,27 @@ impl Router {
             self.unroutable.push(job);
             None
         }
+    }
+
+    /// Replace a live envelope and re-route queued jobs that no longer fit.
+    /// Credits, counters, and jobs already dispatched stay intact.
+    pub fn update_capabilities(&mut self, miner_id: &str, caps: MinerCaps) -> bool {
+        let Some(q) = self.miners.get_mut(miner_id) else {
+            return false;
+        };
+        q.caps = caps;
+        q.unsupported_kinds.clear();
+        let staged = std::mem::take(&mut q.staged);
+        for job in staged {
+            if self.is_capable(miner_id, &job) {
+                if let Some(q) = self.miners.get_mut(miner_id) {
+                    q.staged.push_back(job);
+                }
+            } else {
+                let _ = self.route_excluding(job, Some(miner_id));
+            }
+        }
+        true
     }
 
     /// Add `credits` to the miner's consumable credit pool.
@@ -220,17 +250,25 @@ impl Router {
             .map_or(0, |q| std::mem::take(&mut q.salts_since_poll))
     }
 
-    /// Pop the next staged job, spending one credit. Returns `None` when the
-    /// miner has no credits left or nothing is staged.
+    /// Dispatch a compatible staged job, spending one credit only on dispatch.
     pub fn next_job(&mut self, miner_id: &str) -> Option<Job> {
-        let q = self.miners.get_mut(miner_id)?;
-        if q.granted_credits == 0 {
-            return None;
+        loop {
+            let job = {
+                let q = self.miners.get_mut(miner_id)?;
+                if q.granted_credits == 0 {
+                    return None;
+                }
+                q.staged.pop_front()?
+            };
+            if !self.is_capable(miner_id, &job) {
+                let _ = self.route_excluding(job, Some(miner_id));
+                continue;
+            }
+            let q = self.miners.get_mut(miner_id)?;
+            q.granted_credits -= 1;
+            q.consumed_since_poll = q.consumed_since_poll.saturating_add(1);
+            return Some(job);
         }
-        let job = q.staged.pop_front()?;
-        q.granted_credits -= 1;
-        q.consumed_since_poll = q.consumed_since_poll.saturating_add(1);
-        Some(job)
     }
 
     /// Read and reset the jobs-consumed counter for `miner_id` — the feeder's
@@ -365,18 +403,14 @@ impl Router {
         ids
     }
 
-    /// Stage `job` directly on `miner_id` if it is registered and capable —
-    /// the feeder tops up a specific miner rather than first-fit `route`. Returns
-    /// whether the job was staged.
+    /// Stage a job on a specific capable miner.
     pub fn stage_on(&mut self, miner_id: &str, job: Job) -> bool {
-        let n_nodes = job_node_count(&job);
-        let n_edges = job_edge_count(&job);
-        let kind = job.kind;
+        if !self.is_capable(miner_id, &job) {
+            return false;
+        }
         if let Some(q) = self.miners.get_mut(miner_id) {
-            if capable(q, kind, n_nodes, n_edges) {
-                q.staged.push_back(job);
-                return true;
-            }
+            q.staged.push_back(job);
+            return true;
         }
         false
     }
@@ -740,5 +774,100 @@ mod tests {
         // Re-handshake with the same id: queue survives, credits reset.
         r.register_miner("cpu-0", caps_ising());
         assert_eq!(r.staged_len("cpu-0"), 1);
+    }
+
+    #[test]
+    fn indexes_native_hash_features_and_degree() {
+        let wire = Capabilities {
+            native_topology_hash: Some(vec![7; 32]),
+            features: vec!["streaming".to_owned(), "initial-spins".to_owned()],
+            max_degree: Some(20),
+            ..Capabilities::default()
+        };
+        let caps = MinerCaps::from_capabilities(&wire);
+        assert_eq!(caps.native_topology_hash, wire.native_topology_hash);
+        assert_eq!(caps.features, wire.features);
+        assert_eq!(caps.max_degree, Some(20));
+    }
+
+    #[test]
+    fn capability_update_preserves_accounting_and_moves_incompatible_staged_jobs() {
+        let mut r = Router::new();
+        r.register_miner("a", caps_ising());
+        r.register_miner("b", caps_ising());
+        r.grant_credits("a", 2);
+        assert!(r.stage_on("a", make_job(1, JobKind::IsingSample)));
+        assert!(r.next_job("a").is_some());
+        r.record_completion("a");
+        r.record_lease_salts("a", 7);
+        r.record_round_salts("a", 9);
+        assert!(r.stage_on("a", make_job(2, JobKind::IsingSample)));
+
+        assert!(r.update_capabilities(
+            "a",
+            MinerCaps {
+                max_nodes: 1,
+                ..caps_ising()
+            }
+        ));
+        assert_eq!(r.staged_len("a"), 0);
+        assert_eq!(r.staged_len("b"), 1);
+        assert_eq!(r.jobs_completed("a"), 1);
+        assert_eq!(r.take_consumed("a"), 1);
+        assert_eq!(r.take_lease_salts("a"), 7);
+        assert_eq!(r.round_salts("a"), 9);
+        assert_eq!(r.miners.get("a").map(|q| q.granted_credits), Some(1));
+
+        let mut small = make_job(3, JobKind::IsingSample);
+        small.ising = Some(crate::producer::problem::milli_problem(None, &[0], &[]));
+        assert!(r.stage_on("a", small));
+        assert!(r.next_job("a").is_some());
+        assert!(!r.update_capabilities("missing", caps_ising()));
+        assert_eq!(r.miner_ids(), vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    #[test]
+    fn fresh_snapshot_replaces_fields_and_clears_learned_unsupported_kinds() {
+        let mut r = Router::new();
+        r.register_miner(
+            "a",
+            MinerCaps {
+                native_topology_hash: Some(vec![7; 32]),
+                features: vec!["initial-spins".to_owned()],
+                max_degree: Some(20),
+                ..caps_ising()
+            },
+        );
+        r.on_reject(
+            "a",
+            make_job(1, JobKind::IsingSample),
+            RejectReason::UnsupportedKind as i32,
+        );
+        assert!(!r.stage_on("a", make_job(2, JobKind::IsingSample)));
+        assert!(r.update_capabilities("a", caps_ising()));
+        let caps = r.caps("a");
+        assert_eq!(caps.and_then(|c| c.native_topology_hash.as_ref()), None);
+        assert_eq!(caps.map(|c| c.features.as_slice()), Some(&[][..]));
+        assert_eq!(caps.and_then(|c| c.max_degree), None);
+        assert!(r.stage_on("a", make_job(3, JobKind::IsingSample)));
+    }
+
+    #[test]
+    fn dispatch_rechecks_a_queue_preserved_across_reregistration() {
+        let mut r = Router::new();
+        r.register_miner("a", caps_ising());
+        r.register_miner("b", caps_ising());
+        assert!(r.stage_on("a", make_job(1, JobKind::IsingSample)));
+        r.register_miner(
+            "a",
+            MinerCaps {
+                max_nodes: 1,
+                ..caps_ising()
+            },
+        );
+        r.grant_credits("a", 1);
+        assert!(r.next_job("a").is_none());
+        assert_eq!(r.staged_len("b"), 1);
+        assert_eq!(r.miners.get("a").map(|q| q.granted_credits), Some(1));
     }
 }

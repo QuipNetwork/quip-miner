@@ -8,7 +8,7 @@ use crate::topology::Topology;
 use crate::validate::{beats_current, validate_result, ResolvedTopo};
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, Shutdown, Welcome};
-use quip_protocol::session::{backend_name, PROTOCOL_VERSION};
+use quip_protocol::session::PROTOCOL_VERSION;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -1077,18 +1077,30 @@ async fn run_session<C: ChainClient>(
             Some(miner_msg::Msg::Hello(_)) => {
                 tracing::warn!(miner = %miner_id, "miner sent Hello mid-session; ignoring");
             }
-            // A miner may send Capabilities unprompted when what it supports
-            // changes mid-session (e.g. a degraded device lowering max_nodes).
-            // This coordinator does not route on capabilities yet, so record it
-            // in the log and move on.
             Some(miner_msg::Msg::Capabilities(caps)) => {
-                tracing::debug!(
-                    miner = %miner_id,
-                    backend = %backend_name(caps.backend()),
-                    max_nodes = caps.max_nodes,
-                    stream_width = caps.stream_width,
-                    "miner advertised capabilities; ignored (no capability routing)"
-                );
+                if caps.protocol_version == PROTOCOL_VERSION {
+                    let indexed = MinerCaps::from_capabilities(&caps);
+                    let mut st = state.lock().await;
+                    if st.router.update_capabilities(&miner_id, indexed) {
+                        tracing::debug!(
+                            miner = %miner_id,
+                            max_nodes = caps.max_nodes,
+                            max_edges = caps.max_edges,
+                            max_degree = ?caps.max_degree,
+                            stream_width = caps.stream_width,
+                            "miner capability snapshot applied"
+                        );
+                        for id in st.router.miner_ids() {
+                            st.wake_dispatcher(&id);
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        miner = %miner_id,
+                        offered_protocol = caps.protocol_version,
+                        "ignoring capability snapshot with incompatible protocol"
+                    );
+                }
             }
             Some(miner_msg::Msg::LeaseDone(done)) => {
                 let mut st = state.lock().await;
@@ -1925,5 +1937,76 @@ mod tests {
             !st.wakeups.contains_key("cpu-0"),
             "a dead session must not be woken"
         );
+    }
+
+    #[tokio::test]
+    async fn capabilities_frames_replace_the_envelope_and_ignore_wrong_protocol() {
+        use quip_proto::v1::{Algorithm, Backend, Capabilities, Hello};
+
+        let mut st = CoordinatorState::new();
+        let _ = st
+            .expected_tokens
+            .insert("m".to_owned(), "token".to_owned());
+        st.dispatch_inflight("m", job(b"already-dispatched"));
+        let state = Arc::new(Mutex::new(st));
+        let hello_caps = Capabilities {
+            protocol_version: PROTOCOL_VERSION,
+            max_nodes: 100,
+            ..Capabilities::default()
+        };
+        let updated = Capabilities {
+            protocol_version: PROTOCOL_VERSION,
+            backend: Backend::Cuda as i32,
+            algorithm: Algorithm::Msa as i32,
+            max_nodes: 64,
+            max_edges: 128,
+            max_degree: Some(20),
+            stream_width: 4,
+            native_topology_hash: Some(vec![9; 32]),
+            features: vec!["streaming".to_owned()],
+            ..Capabilities::default()
+        };
+        let wrong = Capabilities {
+            protocol_version: 1,
+            max_nodes: 1,
+            ..Capabilities::default()
+        };
+        let frame = |msg: miner_msg::Msg| MinerMsg { msg: Some(msg) };
+        let mut inbound = tokio_stream::iter(
+            [
+                frame(miner_msg::Msg::Hello(Hello {
+                    miner_id: "m".to_owned(),
+                    session_token: "token".to_owned(),
+                    capabilities: Some(hello_caps),
+                })),
+                frame(miner_msg::Msg::Capabilities(updated.clone())),
+                frame(miner_msg::Msg::Capabilities(wrong)),
+            ]
+            .map(Ok),
+        );
+        let (tx, _rx) = mpsc::channel(8);
+        run_session(
+            &mut inbound,
+            &tx,
+            Arc::clone(&state),
+            Arc::new(FakeChain::new(lease_snapshot(), None)),
+            Arc::new(Mutex::new(None)),
+        )
+        .await;
+        let st = state.lock().await;
+        let actual = st.router.caps("m");
+        assert_eq!(actual.map(|c| c.max_nodes), Some(64));
+        assert_eq!(actual.map(|c| c.max_edges), Some(128));
+        assert_eq!(actual.and_then(|c| c.max_degree), Some(20));
+        assert_eq!(actual.map(|c| c.stream_width), Some(4));
+        assert_eq!(
+            actual.and_then(|c| c.native_topology_hash.as_ref()),
+            updated.native_topology_hash.as_ref()
+        );
+        assert_eq!(
+            actual.map(|c| c.features.as_slice()),
+            Some(updated.features.as_slice())
+        );
+        assert!(st.inflight.contains_key(b"already-dispatched".as_slice()));
     }
 }
