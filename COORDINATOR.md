@@ -278,7 +278,11 @@ The states, in order:
 8. **Awaiting qblock.** Off the walk. On each poll in state 7 the feeder
    reads `author_pendingExtrinsics`, decodes every signed
    `QuantumPow.submit_proof`, and replays the pallet gates against the
-   snapshot (`pool_watch::judge_pending_proof`). If one clears, the feeder
+   snapshot (`pool_watch::judge_pending_proof`). The decoder drops an entry
+   whose compact length does not match its bytes, and an entry with a mortal
+   era. It verifies the hybrid signature with the genesis hash and the runtime
+   versions. For `CheckMetadataHash` mode Enabled it checks only that the
+   embedded public key derives the signing account. If one clears, the feeder
    raises the generation and cancels the miners. It then enters this state. It
    stages nothing here. It leaves on a new root, or it resumes on the same
    root when no clearing proof is pending for two polls or two blocks pass.

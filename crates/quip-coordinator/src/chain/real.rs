@@ -10,7 +10,7 @@ use super::extrinsic::{
     last_proof_block_hash_storage_key, last_proof_block_storage_key, load_hybrid_pair,
     miner_identity_bytes, miners_storage_key, node_descriptors_storage_key,
     order_solutions_storage_key, participants_by_qblock_storage_key, qblocks_storage_key,
-    signer_account_bytes, solvers_storage_key, topology_curve_c_storage_key,
+    signer_account_bytes, solvers_storage_key, topology_curve_c_storage_key, RuntimeTxContext,
     SignedExtensionContext,
 };
 use super::pool::{decode_pending_proof, PendingProof};
@@ -75,6 +75,9 @@ pub struct RealChainClient {
     /// hash reuses it and only the difficulty and root are read again. One
     /// slot: a poll on another hash downloads that topology and replaces it.
     topology: Mutex<Option<CachedTopology>>,
+    /// Genesis hash and runtime versions that pool signatures commit to.
+    /// Reused while it matches the last snapshot's `spec_version`.
+    tx_context: Mutex<Option<RuntimeTxContext>>,
     /// How this client reaches the validator. Boxed so a WebAssembly build can
     /// supply a browser transport in place of the native one.
     transport: Arc<dyn RpcTransport>,
@@ -98,6 +101,7 @@ impl RealChainClient {
             last_snapshot: Mutex::new(None),
             last_spin_spec: Mutex::new(None),
             topology: Mutex::new(None),
+            tx_context: Mutex::new(None),
             transport: Arc::new(JsonrpseeTransport),
             reachable: Mutex::new(None),
             participate_kind,
@@ -356,25 +360,8 @@ impl RealChainClient {
             .await
     }
 
-    /// Nonce, genesis hash, and runtime versions for a signed extrinsic.
-    async fn signed_extension_context(
-        &self,
-        pair: &HybridPair,
-    ) -> Result<SignedExtensionContext, ChainError> {
-        let account_ss58 = account_id_from_public(&pair.public()).to_ss58check();
-        let nonce_val = self
-            .rpc_call(
-                "system_accountNextIndex",
-                Value::Array(vec![Value::String(account_ss58)]),
-            )
-            .await?;
-        let account_nonce = u32::try_from(
-            nonce_val
-                .as_u64()
-                .ok_or_else(|| ChainError::Decode("system_accountNextIndex not a u64".into()))?,
-        )
-        .map_err(|_| ChainError::Decode("account nonce exceeds u32".into()))?;
-
+    /// Read the genesis hash and the runtime versions from the validator.
+    async fn fetch_runtime_tx_context(&self) -> Result<RuntimeTxContext, ChainError> {
         let genesis = self
             .rpc_call(
                 "chain_getBlockHash",
@@ -404,11 +391,59 @@ impl RealChainClient {
         )
         .map_err(|_| ChainError::Decode("transactionVersion exceeds u32".into()))?;
 
-        Ok(SignedExtensionContext {
-            account_nonce,
+        Ok(RuntimeTxContext {
             genesis_hash,
             spec_version,
             transaction_version,
+        })
+    }
+
+    /// The runtime context, reused while it matches the last snapshot's
+    /// `spec_version`. A runtime upgrade moves `spec_version` and forces a read.
+    async fn runtime_tx_context(&self) -> Result<RuntimeTxContext, ChainError> {
+        let current_spec = self
+            .last_snapshot
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.spec_version));
+        let cached = self.tx_context.lock().ok().and_then(|g| *g);
+        if let (Some(ctx), Some(spec)) = (cached, current_spec) {
+            if ctx.spec_version == spec {
+                return Ok(ctx);
+            }
+        }
+        let ctx = self.fetch_runtime_tx_context().await?;
+        if let Ok(mut g) = self.tx_context.lock() {
+            *g = Some(ctx);
+        }
+        Ok(ctx)
+    }
+
+    /// Nonce, genesis hash, and runtime versions for a signed extrinsic.
+    async fn signed_extension_context(
+        &self,
+        pair: &HybridPair,
+    ) -> Result<SignedExtensionContext, ChainError> {
+        let account_ss58 = account_id_from_public(&pair.public()).to_ss58check();
+        let nonce_val = self
+            .rpc_call(
+                "system_accountNextIndex",
+                Value::Array(vec![Value::String(account_ss58)]),
+            )
+            .await?;
+        let account_nonce = u32::try_from(
+            nonce_val
+                .as_u64()
+                .ok_or_else(|| ChainError::Decode("system_accountNextIndex not a u64".into()))?,
+        )
+        .map_err(|_| ChainError::Decode("account nonce exceeds u32".into()))?;
+
+        let runtime = self.fetch_runtime_tx_context().await?;
+        Ok(SignedExtensionContext {
+            account_nonce,
+            genesis_hash: runtime.genesis_hash,
+            spec_version: runtime.spec_version,
+            transaction_version: runtime.transaction_version,
             tip: 0,
         })
     }
@@ -1198,11 +1233,12 @@ impl ChainClient for RealChainClient {
                 "author_pendingExtrinsics did not return an array".into(),
             ));
         };
+        let ctx = self.runtime_tx_context().await?;
         let mut proofs = Vec::new();
         for entry in entries {
             let Some(hex) = entry.as_str() else { continue };
             let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
-            if let Some(p) = decode_pending_proof(&bytes) {
+            if let Some(p) = decode_pending_proof(&bytes, &ctx) {
                 proofs.push(p);
             }
         }
@@ -1627,8 +1663,11 @@ mod tests {
         assert!(parse_spec_version(&missing).is_err());
     }
     use crate::chain::scale_types::MinerKind;
-    use crate::chain::ChainError;
+    use crate::chain::transport::RpcTransport;
+    use crate::chain::{ChainError, MiningSnapshot};
+    use quip_transaction_crypto::HybridPair;
     use serde_json::Value as JsonValue;
+    use sp_core::Pair as _;
     use std::time::{Duration, Instant};
     use tokio::net::TcpListener;
 
@@ -1822,7 +1861,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::chain::transport::RpcTransport for SnapshotValidator {
+    impl RpcTransport for SnapshotValidator {
         async fn request(
             &self,
             _url: &str,
@@ -2011,5 +2050,177 @@ mod tests {
             .expect("registered");
         assert_eq!(chosen.nodes, moved.nodes);
         assert_eq!(validator.topology_meta_calls.lock().unwrap().len(), 2);
+    }
+
+    /// Answers the pool decoder's reads and counts the runtime-version calls.
+    struct PoolValidator {
+        pending: Vec<String>,
+        runtime_version_calls: std::sync::Mutex<u32>,
+        spec_version: std::sync::Mutex<u32>,
+        transaction_version: std::sync::Mutex<u32>,
+        fail_runtime_version: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcTransport for PoolValidator {
+        async fn request(
+            &self,
+            _url: &str,
+            method: &str,
+            _params: JsonValue,
+        ) -> Result<JsonValue, ChainError> {
+            match method {
+                "chain_getBlockHash" => Ok(JsonValue::String(hex_encode(&[0x11; 32]))),
+                "state_getRuntimeVersion" => {
+                    *self.runtime_version_calls.lock().unwrap() += 1;
+                    if self.fail_runtime_version {
+                        return Err(ChainError::Unavailable("scripted outage".into()));
+                    }
+                    Ok(serde_json::json!({
+                        "specVersion": *self.spec_version.lock().unwrap(),
+                        "transactionVersion": *self.transaction_version.lock().unwrap(),
+                    }))
+                }
+                "author_pendingExtrinsics" => Ok(JsonValue::Array(
+                    self.pending
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect(),
+                )),
+                other => panic!("unexpected rpc method {other}"),
+            }
+        }
+
+        async fn subscribe(
+            &self,
+            _url: &str,
+            _sub: &str,
+            _params: JsonValue,
+            _unsub: &str,
+        ) -> Result<
+            crate::chain::transport::BoxStream<'static, Result<JsonValue, ChainError>>,
+            ChainError,
+        > {
+            Err(ChainError::Unavailable(
+                "no subscriptions in this test".into(),
+            ))
+        }
+    }
+
+    fn pool_snapshot(spec_version: u32) -> MiningSnapshot {
+        MiningSnapshot {
+            head_hash: [0u8; 32],
+            last_proof_block_hash: [0u8; 32],
+            topology_hash: vec![0u8; 32],
+            nodes: vec![0, 1],
+            edges: vec![(0, 1)],
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![-1000, 1000],
+            allowed_spin_milli: vec![-1000, 1000],
+            min_solutions: 1,
+            max_energy_milli: 0,
+            min_diversity_milli: 0,
+            block_number: 1,
+            spec_version,
+        }
+    }
+
+    fn pool_entry(genesis_hash: [u8; 32], spec_version: u32, transaction_version: u32) -> String {
+        use crate::chain::extrinsic::{build_hybrid_signed_extrinsic, SignedExtensionContext};
+        use crate::chain::scale_types::{encode_submit_proof_call, QuantumProof};
+        let pair = HybridPair::from_string("//Alice", None).expect("alice");
+        let call = encode_submit_proof_call(&QuantumProof {
+            topology_hash: sp_core::H256::repeat_byte(1),
+            nonce: sp_core::U256::from(42u64),
+            salt: [7u8; 32],
+            solutions: vec![vec![0b01]],
+            device_access_time_us: 5,
+        });
+        let ctx = SignedExtensionContext {
+            account_nonce: 0,
+            genesis_hash,
+            spec_version,
+            transaction_version,
+            tip: 0,
+        };
+        hex_encode(&build_hybrid_signed_extrinsic(&pair, &call, &ctx))
+    }
+
+    #[tokio::test]
+    async fn pending_proofs_are_verified_and_the_context_is_cached_per_spec_version() {
+        use crate::chain::extrinsic::{extrinsic_hash, hex_decode};
+        use crate::chain::ChainClient as _;
+        let upgraded_entry = pool_entry([0x11; 32], 101, 2);
+        let upgraded_hash = extrinsic_hash(&hex_decode(&upgraded_entry).expect("upgraded hex"));
+        let validator = std::sync::Arc::new(PoolValidator {
+            pending: vec![
+                pool_entry([0x11; 32], 100, 1),
+                pool_entry([0x22; 32], 100, 1),
+                upgraded_entry,
+            ],
+            runtime_version_calls: std::sync::Mutex::new(0),
+            spec_version: std::sync::Mutex::new(100),
+            transaction_version: std::sync::Mutex::new(1),
+            fail_runtime_version: false,
+        });
+        let client = RealChainClient::with_transport(
+            vec!["ws://scripted".to_string()],
+            "//Alice".to_string(),
+            MinerKind::Cpu,
+            validator.clone(),
+        );
+        *client.last_snapshot.lock().unwrap() = Some(pool_snapshot(100));
+
+        let proofs = client.fetch_pending_proofs().await.expect("pool read");
+        assert_eq!(
+            proofs.len(),
+            1,
+            "entries signed for another genesis or runtime are dropped"
+        );
+        let _ = client.fetch_pending_proofs().await.expect("pool read");
+        assert_eq!(
+            *validator.runtime_version_calls.lock().unwrap(),
+            1,
+            "the second poll at the same spec_version reuses the context"
+        );
+
+        *validator.spec_version.lock().unwrap() = 101;
+        *validator.transaction_version.lock().unwrap() = 2;
+        *client.last_snapshot.lock().unwrap() = Some(pool_snapshot(101));
+        let after_upgrade = client.fetch_pending_proofs().await.expect("pool read");
+        assert_eq!(*validator.runtime_version_calls.lock().unwrap(), 2);
+        assert_eq!(
+            after_upgrade.len(),
+            1,
+            "only the entry signed for spec 101 / transaction version 2 is accepted"
+        );
+        assert_eq!(
+            after_upgrade
+                .first()
+                .expect("upgraded proof")
+                .extrinsic_hash,
+            upgraded_hash,
+            "entries signed for spec 100 / transaction version 1 are dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_version_outage_is_an_error_not_a_panic() {
+        use crate::chain::ChainClient as _;
+        let validator = std::sync::Arc::new(PoolValidator {
+            pending: vec![pool_entry([0x11; 32], 100, 1)],
+            runtime_version_calls: std::sync::Mutex::new(0),
+            spec_version: std::sync::Mutex::new(100),
+            transaction_version: std::sync::Mutex::new(1),
+            fail_runtime_version: true,
+        });
+        let client = RealChainClient::with_transport(
+            vec!["ws://scripted".to_string()],
+            "//Alice".to_string(),
+            MinerKind::Cpu,
+            validator,
+        );
+        assert!(client.fetch_pending_proofs().await.is_err());
     }
 }
