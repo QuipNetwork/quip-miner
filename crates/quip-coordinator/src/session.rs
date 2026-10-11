@@ -846,7 +846,8 @@ async fn run_session<C: ChainClient>(
             miner = %miner_id,
             token_ok,
             protocol_ok,
-            offered_protocol = caps.protocol_version,
+            capabilities_present = hello.capabilities.is_some(),
+            offered_protocol = ?hello.capabilities.as_ref().map(|c| c.protocol_version),
             "miner handshake rejected; dropping session"
         );
         return;
