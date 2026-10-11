@@ -127,10 +127,18 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
         return Err(format!("odd-length hex ({} digits)", s.len()));
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
+    let decode_nibble = |byte| match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("invalid hex digit".to_string()),
+    };
+    let (pairs, _) = s.as_bytes().as_chunks::<2>();
+    let mut bytes = Vec::with_capacity(pairs.len());
+    for &[high, low] in pairs {
+        bytes.push((decode_nibble(high)? << 4) | decode_nibble(low)?);
+    }
+    Ok(bytes)
 }
 
 fn secret_uri_error_kind(error: &SecretStringError) -> &'static str {
@@ -446,6 +454,16 @@ mod tests {
     }
 
     #[test]
+    fn hex_decode_rejects_even_length_unicode() {
+        assert!(hex_decode("00€0").is_err());
+    }
+
+    #[test]
+    fn hex_decode_rejects_non_hex_ascii() {
+        assert!(hex_decode("0g").is_err());
+    }
+
+    #[test]
     fn hybrid_extrinsic_has_signed_v4_prefix_and_compact_len() {
         let pair = HybridPair::from_string("//Alice", None).expect("alice");
         let proof = QuantumProof {
@@ -674,6 +692,18 @@ mod tests {
             .expect("an odd-length seed is rejected");
         let _ = std::fs::remove_file(&path);
         assert!(!err.contains("abcdef123"), "error echoes the seed: {err}");
+    }
+
+    #[test]
+    fn a_unicode_keystore_seed_is_rejected_without_echoing_it() {
+        let path =
+            std::env::temp_dir().join(format!("quip-ks-unicode-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"master_seed_hex":"00€0"}"#).expect("write keystore");
+        let result = load_hybrid_pair(path.to_str().expect("utf-8 path"));
+        let _ = std::fs::remove_file(&path);
+        let err = result.err().expect("a Unicode seed is rejected");
+        assert!(!err.contains("00€0"), "error echoes the seed: {err}");
+        assert!(!err.contains('€'), "error echoes a seed character: {err}");
     }
 
     #[test]
