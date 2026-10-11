@@ -564,6 +564,37 @@ fields of the `Configure` message; every other key passes through verbatim in
 `Configure.backend_toml`, which the coordinator forwards to the miner. This is
 how a backend receives its own settings without the coordinator knowing them.
 
+For D-Wave, set `budget` and `budget_reset_day` in `[dwave]`:
+
+```toml
+[dwave]
+binary = "quip-dwave-qa"
+budget = "30s"
+budget_reset_day = 1
+```
+
+`budget` is QPU access time for one monthly billing period.
+The example allows 30 seconds for the whole period.
+Set the amount to your Leap allotment.
+Use a quoted duration with an `s`, `m`, `h`, `d`, or `w` suffix,
+or numeric seconds. A quoted number also means seconds.
+
+`budget_reset_day` is an integer from 1 through 31, with a default of 1.
+Set it to your billing reset day. The reset occurs at midnight UTC.
+If a month has fewer days, the reset occurs on that month's final day.
+The allowance grows with the elapsed fraction of the period and gates new rounds.
+Exhausting the whole period allowance can also stop an active round.
+
+The miner stores usage in `/data/qpu-usage.db` by default.
+Keep `/data` writable and persistent, including for native runs.
+The examples omit `usage_db` because the miner supplies this default path.
+A ledger open failure stops budgeted mining.
+
+The Docker template keeps D-Wave disabled until you uncomment its backend section.
+Updating an image does not replace an existing `/data/config.toml`.
+Replace the previous D-Wave budget settings in that file with these period keys.
+Restart the coordinator to apply them.
+
 For CUDA, N is the device ordinal as well as the miner id. The coordinator
 forwards it on the child argv as `--device N`. The id and the flag come from the
 same parsed number, so they cannot disagree. The ordinal also reaches the
