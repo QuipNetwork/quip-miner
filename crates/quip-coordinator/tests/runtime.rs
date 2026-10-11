@@ -630,6 +630,7 @@ async fn feeder_broadcasts_set_target_once_per_difficulty() {
 fn mempool_order() -> quip_coordinator::chain::JobOrder {
     quip_coordinator::chain::JobOrder {
         order_id: 7u64.to_le_bytes().to_vec(),
+        mode: quip_coordinator::chain::scale_types::JobMode::Open,
         nodes: vec![0, 1, 2, 3],
         edges: vec![(0, 1), (1, 2), (2, 3), (0, 3)],
         h_milli: vec![0; 4],

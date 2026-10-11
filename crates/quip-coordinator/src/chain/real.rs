@@ -1211,6 +1211,7 @@ impl ChainClient for RealChainClient {
             };
             orders.push(JobOrder {
                 order_id: oid.to_le_bytes().to_vec(),
+                mode: scale.mode,
                 nodes: scale.ising_params.nodes,
                 edges: scale.ising_params.edges,
                 h_milli: scale.ising_params.h_values,
