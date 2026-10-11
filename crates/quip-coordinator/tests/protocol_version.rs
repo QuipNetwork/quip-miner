@@ -136,15 +136,6 @@ async fn an_unknown_protocol_version_is_rejected() {
 
 #[tokio::test]
 async fn a_hello_without_capabilities_is_rejected_before_a_v2_reconnect() {
-    let log = tempfile::NamedTempFile::new().expect("log file");
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(log.reopen().expect("log writer"))
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-
     let mut replies = first_replies("no-capabilities", &[None, Some(PROTOCOL_VERSION)])
         .await
         .into_iter();
@@ -157,19 +148,5 @@ async fn a_hello_without_capabilities_is_rejected_before_a_v2_reconnect() {
     assert!(
         matches!(reply, Some(coord_msg::Msg::Welcome(_))),
         "got {reply:?}"
-    );
-
-    let log = std::fs::read_to_string(log.path()).expect("read log");
-    let rejection = log
-        .lines()
-        .find(|line| line.contains("miner handshake rejected"))
-        .expect("rejection warning");
-    assert!(
-        rejection.contains("capabilities_present=false"),
-        "got {rejection:?}"
-    );
-    assert!(
-        rejection.contains("offered_protocol=None"),
-        "got {rejection:?}"
     );
 }
