@@ -344,15 +344,17 @@ mod tests {
 
     #[test]
     fn trailing_bytes_decode_to_nothing() {
-        let (_, mut ext) = signed(&encode_submit_proof_call(&proof()));
-        ext.push(0xff);
+        let mut call = encode_submit_proof_call(&proof());
+        call.push(0xff);
+        let (_, ext) = signed(&call);
         assert!(decode_pending_proof(&ext, &CTX).is_none());
     }
 
     #[test]
     fn truncated_bytes_decode_to_nothing() {
-        let (_, ext) = signed(&encode_submit_proof_call(&proof()));
-        let cut = ext.len() - 10;
-        assert!(decode_pending_proof(ext.get(..cut).expect("prefix"), &CTX).is_none());
+        let mut call = encode_submit_proof_call(&proof());
+        call.truncate(call.len() - 10);
+        let (_, ext) = signed(&call);
+        assert!(decode_pending_proof(&ext, &CTX).is_none());
     }
 }

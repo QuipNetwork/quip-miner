@@ -2057,6 +2057,7 @@ mod tests {
         pending: Vec<String>,
         runtime_version_calls: std::sync::Mutex<u32>,
         spec_version: std::sync::Mutex<u32>,
+        transaction_version: std::sync::Mutex<u32>,
         fail_runtime_version: bool,
     }
 
@@ -2077,7 +2078,7 @@ mod tests {
                     }
                     Ok(serde_json::json!({
                         "specVersion": *self.spec_version.lock().unwrap(),
-                        "transactionVersion": 1,
+                        "transactionVersion": *self.transaction_version.lock().unwrap(),
                     }))
                 }
                 "author_pendingExtrinsics" => Ok(JsonValue::Array(
@@ -2125,7 +2126,7 @@ mod tests {
         }
     }
 
-    fn pool_entry(genesis_hash: [u8; 32]) -> String {
+    fn pool_entry(genesis_hash: [u8; 32], spec_version: u32, transaction_version: u32) -> String {
         use crate::chain::extrinsic::{build_hybrid_signed_extrinsic, SignedExtensionContext};
         use crate::chain::scale_types::{encode_submit_proof_call, QuantumProof};
         let pair = HybridPair::from_string("//Alice", None).expect("alice");
@@ -2139,8 +2140,8 @@ mod tests {
         let ctx = SignedExtensionContext {
             account_nonce: 0,
             genesis_hash,
-            spec_version: 100,
-            transaction_version: 1,
+            spec_version,
+            transaction_version,
             tip: 0,
         };
         hex_encode(&build_hybrid_signed_extrinsic(&pair, &call, &ctx))
@@ -2148,11 +2149,19 @@ mod tests {
 
     #[tokio::test]
     async fn pending_proofs_are_verified_and_the_context_is_cached_per_spec_version() {
+        use crate::chain::extrinsic::{extrinsic_hash, hex_decode};
         use crate::chain::ChainClient as _;
+        let upgraded_entry = pool_entry([0x11; 32], 101, 2);
+        let upgraded_hash = extrinsic_hash(&hex_decode(&upgraded_entry).expect("upgraded hex"));
         let validator = std::sync::Arc::new(PoolValidator {
-            pending: vec![pool_entry([0x11; 32]), pool_entry([0x22; 32])],
+            pending: vec![
+                pool_entry([0x11; 32], 100, 1),
+                pool_entry([0x22; 32], 100, 1),
+                upgraded_entry,
+            ],
             runtime_version_calls: std::sync::Mutex::new(0),
             spec_version: std::sync::Mutex::new(100),
+            transaction_version: std::sync::Mutex::new(1),
             fail_runtime_version: false,
         });
         let client = RealChainClient::with_transport(
@@ -2167,7 +2176,7 @@ mod tests {
         assert_eq!(
             proofs.len(),
             1,
-            "the entry signed for another genesis is dropped"
+            "entries signed for another genesis or runtime are dropped"
         );
         let _ = client.fetch_pending_proofs().await.expect("pool read");
         assert_eq!(
@@ -2177,12 +2186,22 @@ mod tests {
         );
 
         *validator.spec_version.lock().unwrap() = 101;
+        *validator.transaction_version.lock().unwrap() = 2;
         *client.last_snapshot.lock().unwrap() = Some(pool_snapshot(101));
         let after_upgrade = client.fetch_pending_proofs().await.expect("pool read");
         assert_eq!(*validator.runtime_version_calls.lock().unwrap(), 2);
-        assert!(
-            after_upgrade.is_empty(),
-            "entries signed for spec 100 fail under spec 101"
+        assert_eq!(
+            after_upgrade.len(),
+            1,
+            "only the entry signed for spec 101 / transaction version 2 is accepted"
+        );
+        assert_eq!(
+            after_upgrade
+                .first()
+                .expect("upgraded proof")
+                .extrinsic_hash,
+            upgraded_hash,
+            "entries signed for spec 100 / transaction version 1 are dropped"
         );
     }
 
@@ -2190,9 +2209,10 @@ mod tests {
     async fn a_runtime_version_outage_is_an_error_not_a_panic() {
         use crate::chain::ChainClient as _;
         let validator = std::sync::Arc::new(PoolValidator {
-            pending: vec![pool_entry([0x11; 32])],
+            pending: vec![pool_entry([0x11; 32], 100, 1)],
             runtime_version_calls: std::sync::Mutex::new(0),
             spec_version: std::sync::Mutex::new(100),
+            transaction_version: std::sync::Mutex::new(1),
             fail_runtime_version: true,
         });
         let client = RealChainClient::with_transport(
