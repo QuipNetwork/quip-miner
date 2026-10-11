@@ -56,10 +56,11 @@ cargo fmt --all --check
 # configured miners, feed them work, submit proofs. Stops on SIGINT/SIGTERM.
 quip-coordinator --config ./docker/config.toml
 
-# Drive: spawn one miner and feed it synthetic problems. No chain, no submit —
-# for benchmarking and matched-condition parity runs.
+# Drive: spawn one miner and feed it synthetic problems. No chain, no submit.
+# Set the target in energy units and write the per-job JSONL report.
 quip-coordinator drive --miner ./miners/quip-cpu-sa --source random \
-  --topology-preset advantage2-system1 --count 100
+  --topology-preset advantage2-system1 --count 100 \
+  --target-energy -10000 --report drive.jsonl
 
 # Drive a miner with generated salt leases.
 quip-coordinator drive --miner ./miners/quip-cpu-sa --source lease \
@@ -78,6 +79,11 @@ mnemonic, a 32-byte hex master seed, or a keystore path. `--mnemonic-file`
 reads a BIP39 phrase from a file. Pass `--topology` to use a specification JSON
 file instead of a preset.
 
+Negative energy arguments accept a separate value. The drive option
+`--target-energy -10000` uses energy units. The seed-chain option
+`--max-energy-milli -2500000` uses milli units. Both options also accept the
+equals form.
+
 You can seed a chain only once. `register_topology` writes `DefaultTopology`
 only when that value is unset. `seed-chain` refuses to run when a chain already
 has a default topology. Wipe the chain data and restart the validator instead.
@@ -85,6 +91,11 @@ has a default topology. Wipe the chain data and restart the validator instead.
 The coordinator binary embeds the `advantage2-system1` and `smoke` topology
 presets. `drive --topology-preset` and `seed-chain` read those presets from the
 binary.
+
+For ordinary drive results, compare miner energies with `raw_best_energy_milli`
+in the `--report` JSONL file. The `best_energy_milli` field describes the diversity
+selection. See `COORDINATOR.md` for units, missing-energy values, and lease
+summaries.
 
 The config registers miners and their launch plan. Each backend section (`[cpu]`, `[cuda.0]`, `[metal]`, `[dwave]`) becomes one supervised subprocess; `binary` selects the executable — `quip-cpu-sa`, the chromatic `quip-cpu-gibbs`, `quip-cpu-sb`, or one of quip-solver-cpu's experimental kernels when that release published it. See `crates/quip-coordinator/config.toml.example`. Miner binaries are fetched per host by `crates/quip-coordinator/tools/fetch-miners.sh` from the standalone repos and resolved on `PATH` or by absolute path.
 

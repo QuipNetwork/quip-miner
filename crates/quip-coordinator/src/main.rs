@@ -91,7 +91,11 @@ struct SeedChainArgs {
     #[arg(long, default_value_t = DEFAULT_SEED_DIFFICULTY.min_solutions)]
     min_solutions: u32,
     /// Energy ceiling in milli units; solutions must be strictly below it.
-    #[arg(long, default_value_t = DEFAULT_SEED_DIFFICULTY.max_energy_milli)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SEED_DIFFICULTY.max_energy_milli,
+        allow_negative_numbers = true
+    )]
     max_energy_milli: i64,
     /// Minimum solution-set diversity in milli units.
     #[arg(long, default_value_t = DEFAULT_SEED_DIFFICULTY.min_diversity_milli)]
@@ -136,7 +140,7 @@ struct DriveArgs {
     list: Option<PathBuf>,
     /// Difficulty target energy (the adapt target, in energy units). Overrides
     /// the spec's gate; the miner adapts its reads/sweeps from this.
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     target_energy: Option<f64>,
     /// Minimum unique solutions gate. Overrides the spec.
     #[arg(long)]
@@ -896,5 +900,137 @@ mod tests {
         a.topology_preset = Some("smoke".into());
         let text = resolve_topology_text(&a).unwrap().unwrap();
         assert!(parse_topology_spec(&text).is_ok());
+    }
+
+    #[test]
+    fn qui_1540_drive_accepts_signed_energy_values() {
+        let spec = parse_topology_spec(preset_spec("smoke").expect("smoke preset exists"))
+            .expect("smoke preset is valid");
+        for (value, expected_milli) in [
+            ("-10000", -10_000_000),
+            ("-10000.125", -10_000_125),
+            ("-0.125", -125),
+            ("0", 0),
+            ("10.5", 10_500),
+        ] {
+            let equals = format!("--target-energy={value}");
+            for energy_args in [vec!["--target-energy", value], vec![equals.as_str()]] {
+                let mut argv = vec![
+                    "quip-coordinator",
+                    "drive",
+                    "--miner",
+                    "miner",
+                    "--source",
+                    "list",
+                    "--list",
+                    "nonces.jsonl",
+                    "--topology",
+                    "spec.json",
+                ];
+                argv.extend(energy_args);
+                argv.extend(["--num-reads", "64"]);
+                let cli = Cli::try_parse_from(argv).expect("signed drive energy parses");
+                let Some(Command::Drive(args)) = cli.command else {
+                    panic!("expected drive subcommand");
+                };
+                assert_eq!(args.num_reads, Some(64));
+                assert_eq!(
+                    set_target_from_spec(&spec, &args).max_energy_milli,
+                    expected_milli
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qui_1540_seed_chain_accepts_signed_milli_values() {
+        for (value, expected_milli) in [
+            ("-2500000", -2_500_000),
+            ("-1", -1),
+            ("-9223372036854775808", i64::MIN),
+            ("0", 0),
+            ("2500000", 2_500_000),
+        ] {
+            let equals = format!("--max-energy-milli={value}");
+            for energy_args in [vec!["--max-energy-milli", value], vec![equals.as_str()]] {
+                let mut argv = vec!["quip-coordinator", "seed-chain", "--sudo-key", "//Alice"];
+                argv.extend(energy_args);
+                let cli = Cli::try_parse_from(argv).expect("signed seed-chain energy parses");
+                let Some(Command::SeedChain(args)) = cli.command else {
+                    panic!("expected seed-chain subcommand");
+                };
+                assert_eq!(args.max_energy_milli, expected_milli);
+            }
+        }
+    }
+
+    #[test]
+    fn qui_1540_energy_options_keep_numeric_and_unsigned_constraints() {
+        for value in ["--bogus", "-oops"] {
+            assert!(Cli::try_parse_from([
+                "quip-coordinator",
+                "drive",
+                "--miner",
+                "miner",
+                "--source",
+                "list",
+                "--target-energy",
+                value,
+            ])
+            .is_err());
+            assert!(Cli::try_parse_from([
+                "quip-coordinator",
+                "seed-chain",
+                "--sudo-key",
+                "//Alice",
+                "--max-energy-milli",
+                value,
+            ])
+            .is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "quip-coordinator",
+            "drive",
+            "--miner",
+            "miner",
+            "--source",
+            "list",
+            "--target-energy",
+            "--num-reads",
+            "64",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "quip-coordinator",
+            "drive",
+            "--miner",
+            "miner",
+            "--source",
+            "random",
+            "--count",
+            "-1",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "quip-coordinator",
+            "seed-chain",
+            "--sudo-key",
+            "//Alice",
+            "--max-energy-milli=-0.5",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn qui_1540_seed_chain_keeps_default_energy() {
+        let cli = Cli::try_parse_from(["quip-coordinator", "seed-chain", "--sudo-key", "//Alice"])
+            .expect("default seed-chain arguments parse");
+        let Some(Command::SeedChain(args)) = cli.command else {
+            panic!("expected seed-chain subcommand");
+        };
+        assert_eq!(
+            args.max_energy_milli,
+            DEFAULT_SEED_DIFFICULTY.max_energy_milli
+        );
     }
 }

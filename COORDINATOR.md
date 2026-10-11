@@ -642,5 +642,33 @@ per-job and total timing, and can pin
 matched-condition throughput and parity comparisons. This is the path used for
 CPU-versus-CUDA benchmarking.
 
+Use `--report <path.jsonl>` for both energy fields. For ordinary `Result` rows,
+the coordinator recomputes energies from returned spins and the dispatched
+problem. Report energies use milli units.
+
+`best_energy_milli` is the minimum after the strict energy ceiling, Z2
+deduplication, and diversity selection. The field equals `i64::MAX` if no row
+clears the energy ceiling. A finite value can appear with `passed = false` when
+the count or diversity gate fails. The stdout column `best_energy` shows this
+selected value.
+
+`raw_best_energy_milli` is the minimum across all shape-valid returned rows,
+before the ceiling, deduplication, and selection. The field equals `i64::MAX` if
+no shape-valid row exists. Rejected rows use `i64::MAX` for both energy fields.
+
+Miner per-job logs show the raw minimum in whole energy units, rounded down.
+Compare the logged energy with `raw_best_energy_milli.div_euclid(1000)`.
+Diversity selection can exclude that raw minimum, so the two report fields can
+differ.
+
+Lease summary rows copy the miner's lease-wide `LeaseDone.best_energy_milli`
+into both energy fields and set diversity to zero. The coordinator verifies
+reported winning salts for these lease summaries.
+
+Negative energy arguments accept a separate value, such as
+`--target-energy -10000`. The drive target uses energy units and becomes
+`-10_000_000` milli in `SetTarget`. The seed-chain option
+`--max-energy-milli -2500000` already uses milli units.
+
 The preset JSON stays under `crates/quip-coordinator/fixtures/drive/` as the
 readable source. The binary copies each file in at compile time.
