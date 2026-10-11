@@ -1,9 +1,9 @@
-//! Drive-mode topology provider: parses a JSON topology-spec file into a
-//! `Topology` + synthetic `MiningSnapshot` (chain-only fields defaulted).
+//! Drive-mode topology providers: JSON specs and registered chain metadata.
 //!
-//! Sub-project #1 ships this file-spec provider only. Topology-by-hash from
-//! the network is sub-project #2, behind the same seam (a `TopologySpec`).
+//! Both produce a validated `TopologySpec` and a synthetic `MiningSnapshot`.
 
+use crate::chain::extrinsic::hex_encode;
+use crate::chain::scale_types::{require_set_values, TopologyMetaScale};
 use crate::chain::MiningSnapshot;
 use crate::topology::{Topology, DEFAULT_SPIN_SET};
 use serde::Deserialize;
@@ -116,8 +116,40 @@ pub struct TopologySpec {
 }
 
 impl TopologySpec {
-    /// Build a synthetic `MiningSnapshot`: chain-only fields (last proof
-    /// block hash, block number) are zeroed since drive mode has no chain.
+    /// Convert registered chain metadata into a drive spec.
+    ///
+    /// Keeps node, edge, and value-set order. Difficulty gates use the same
+    /// defaults as a JSON spec without gates. Registration height is excluded
+    /// from topology identity.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported value specs, invalid graph data,
+    /// or a computed topology hash that differs from `hash`.
+    pub fn from_chain_meta(hash: [u8; 32], meta: TopologyMetaScale) -> Result<Self, String> {
+        let raw = TopologySpecJson {
+            nodes: meta.nodes,
+            edges: meta.edges,
+            allowed_h_milli: require_set_values(&meta.allowed_h_values)
+                .map_err(|error| format!("chain topology allowed_h_milli: {error}"))?,
+            allowed_j_milli: require_set_values(&meta.allowed_j_values)
+                .map_err(|error| format!("chain topology allowed_j_milli: {error}"))?,
+            allowed_spin_milli: require_set_values(&meta.allowed_spin_values)
+                .map_err(|error| format!("chain topology allowed_spin_milli: {error}"))?,
+            gates: None,
+        };
+        let spec = validate_spec(raw).map_err(|error| error.to_string())?;
+        if spec.topology.hash.as_slice() != hash.as_slice() {
+            return Err(format!(
+                "topology hash mismatch: chain reported {}, computed {}",
+                hex_encode(&hash),
+                hex_encode(&spec.topology.hash)
+            ));
+        }
+        Ok(spec)
+    }
+
+    /// Build a synthetic `MiningSnapshot` for generated or replayed drive work.
+    /// Round hashes, block number, and runtime version use synthetic defaults.
     #[must_use]
     pub fn to_snapshot(&self) -> MiningSnapshot {
         MiningSnapshot {
@@ -161,7 +193,11 @@ fn validate_edges(nodes: &[u32], edges: &[(u32, u32)]) -> Result<(), TopologySpe
 /// empty, or an edge references an unknown node id.
 pub fn parse_topology_spec(text: &str) -> Result<TopologySpec, TopologySpecError> {
     let raw: TopologySpecJson =
-        serde_json::from_str(text).map_err(|e| TopologySpecError::Json(e.to_string()))?;
+        serde_json::from_str(text).map_err(|error| TopologySpecError::Json(error.to_string()))?;
+    validate_spec(raw)
+}
+
+fn validate_spec(raw: TopologySpecJson) -> Result<TopologySpec, TopologySpecError> {
     if raw.nodes.is_empty() {
         return Err(TopologySpecError::EmptyNodes);
     }
@@ -200,6 +236,8 @@ pub fn parse_topology_spec(text: &str) -> Result<TopologySpec, TopologySpecError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::scale_types::TopologyMetaScale;
+    use quantum_validation::AllowedValueSpec;
 
     const VALID: &str = r#"{
         "nodes": [0, 1, 2, 3],
@@ -302,5 +340,102 @@ mod tests {
         let spec = parse_topology_spec(text).unwrap();
         assert_eq!(spec.topology.nodes, vec![0, 12, 2400]);
         assert_eq!(spec.topology.edge_pairs(), vec![(0, 12), (12, 2400)]);
+    }
+
+    fn chain_meta_fixture() -> Result<([u8; 32], TopologyMetaScale), String> {
+        let spec = parse_topology_spec(crate::presets::preset_spec("aglais")?)
+            .map_err(|error| error.to_string())?;
+        let hash = spec
+            .topology
+            .hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| "topology hash is not 32 bytes".to_string())?;
+        let edges = spec.topology.edge_pairs();
+        Ok((
+            hash,
+            TopologyMetaScale {
+                nodes: spec.topology.nodes,
+                edges,
+                allowed_h_values: AllowedValueSpec::Set(spec.allowed_h_milli),
+                allowed_j_values: AllowedValueSpec::Set(spec.allowed_j_milli),
+                allowed_spin_values: AllowedValueSpec::Set(spec.allowed_spin_milli),
+                registered_at: 7,
+            },
+        ))
+    }
+
+    #[test]
+    fn from_chain_meta_preserves_aglais_and_uses_neutral_gates() {
+        let (hash, meta) = chain_meta_fixture().expect("valid Aglais metadata");
+        let expected_nodes = meta.nodes.clone();
+        let expected_edges = meta.edges.clone();
+        let spec = TopologySpec::from_chain_meta(hash, meta).expect("valid chain topology");
+        assert_eq!(spec.topology.hash, hash.to_vec());
+        assert_eq!(spec.topology.nodes, expected_nodes);
+        assert_eq!(spec.topology.edge_pairs(), expected_edges);
+        assert_eq!(spec.allowed_h_milli, vec![0]);
+        assert_eq!(spec.allowed_j_milli, vec![-1000, 1000]);
+        assert_eq!(spec.allowed_spin_milli, vec![-1000, 1000]);
+        assert_eq!(spec.min_solutions, 0);
+        assert_eq!(spec.max_energy_milli, i64::MAX);
+        assert_eq!(spec.min_diversity_milli, 0);
+        let snapshot = spec.to_snapshot();
+        assert_eq!(snapshot.head_hash, [0; 32]);
+        assert_eq!(snapshot.last_proof_block_hash, [0; 32]);
+        assert_eq!(snapshot.block_number, 0);
+        assert_eq!(snapshot.spec_version, 0);
+        assert_eq!(snapshot.topology_hash, hash.to_vec());
+    }
+
+    #[test]
+    fn from_chain_meta_does_not_hash_registration_height() {
+        let (hash, mut meta) = chain_meta_fixture().expect("valid Aglais metadata");
+        meta.registered_at = u32::MAX;
+        let spec = TopologySpec::from_chain_meta(hash, meta).expect("valid chain topology");
+        assert_eq!(spec.topology.hash, hash.to_vec());
+    }
+
+    #[test]
+    fn from_chain_meta_rejects_ranges_and_empty_sets() {
+        let (hash, meta) = chain_meta_fixture().expect("valid Aglais metadata");
+        let mut integer_h = meta.clone();
+        integer_h.allowed_h_values = AllowedValueSpec::IntegerRange { min: -1, max: 1 };
+        let mut continuous_j = meta.clone();
+        continuous_j.allowed_j_values = AllowedValueSpec::ContinuousRange {
+            min: -1000,
+            max: 1000,
+        };
+        let mut empty_spin = meta;
+        empty_spin.allowed_spin_values = AllowedValueSpec::Set(vec![]);
+        for (meta, message) in [
+            (integer_h, "requires AllowedValueSpec::Set"),
+            (continuous_j, "requires AllowedValueSpec::Set"),
+            (empty_spin, "Set is empty"),
+        ] {
+            let error = TopologySpec::from_chain_meta(hash, meta)
+                .expect_err("expected unsupported allowed-value error");
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn from_chain_meta_rejects_bad_graphs_and_hashes() {
+        let (hash, meta) = chain_meta_fixture().expect("valid Aglais metadata");
+        let mut empty = meta.clone();
+        empty.nodes.clear();
+        let error =
+            TopologySpec::from_chain_meta(hash, empty).expect_err("expected empty graph error");
+        assert!(error.contains("nodes must be non-empty"));
+        let mut bad_edge = meta.clone();
+        bad_edge.edges.push((938, u32::MAX));
+        let error =
+            TopologySpec::from_chain_meta(hash, bad_edge).expect_err("expected unknown node error");
+        assert!(error.contains("references node id"));
+        let mut incorrect_hash = hash;
+        *incorrect_hash.first_mut().expect("nonempty hash") ^= 1;
+        let error = TopologySpec::from_chain_meta(incorrect_hash, meta)
+            .expect_err("expected hash mismatch");
+        assert!(error.contains("topology hash mismatch"));
     }
 }

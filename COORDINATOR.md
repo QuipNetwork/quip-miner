@@ -17,9 +17,9 @@ how they fit together. For build and run commands, see `AGENTS.md`.
   (`run_config_path` → `runtime::run_runtime`). Connects to the validators,
   spawns and supervises the configured miners, feeds them chain work, submits
   proofs.
-- `quip-coordinator drive …` — a synthetic driver (`drive` module). Spawns one
-  miner and feeds it generated or replayed problems with no chain and no submit.
-  Used for benchmarking and matched-condition parity runs.
+- `quip-coordinator drive …` — generates or replays work for one miner.
+  It can read a chain topology once, then drives the miner without submissions.
+  Use this mode for benchmarking and comparisons under matched conditions.
 - `quip-coordinator seed-chain …` — registers a default topology and sets its
   difficulty on a fresh chain. You can seed a chain only once. Wipe the chain
   data and restart the validator if `DefaultTopology` is already set.
@@ -140,7 +140,8 @@ difficulty `target`, per-miner `Configure`, and the salt→job bookkeeping.
 
 ## The blockchain seam
 
-All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
+Production mining uses the `ChainClient` trait in `chain/mod.rs`.
+`RealChainClient` also exposes a read-only default-topology lookup for drive.
 
 - `fetch_mining_snapshot` — the mining inputs at a block: topology
   (nodes/edges, allowed h/J/spin ranges), difficulty gates
@@ -652,14 +653,30 @@ address the operator trusts, because it applies no authentication.
 
 ## Drive mode
 
-`quip-coordinator drive` (the `drive` module)
-spawns one miner and feeds it synthetic work with no chain and no submit. Jobs
-come from a golden random draw (`--source random`, optionally with a topology
-preset embedded in the binary) or a JSONL replay (`--source list`). Drive reports
-per-job and total timing, and can pin
-`num_reads`/`num_sweeps` through the `SetTarget` control-plane override to run
-matched-condition throughput and parity comparisons. This is the path used for
-CPU-versus-CUDA benchmarking.
+`quip-coordinator drive` spawns one miner and feeds it generated or replayed
+work. Sources are random draws (`--source random`), salt leases
+(`--source lease`), and JSONL replay (`--source list`). Drive reports per-job
+and total timing. `--num-reads` and `--num-sweeps` override the miner's
+sampling settings through `SetTarget`.
+
+Choose one topology selector: `--topology <spec.json>`,
+`--topology-preset <name>`, or `--topology-from-chain <url>`.
+Without a selector, random and lease use `advantage2-system1`.
+List replay has no default topology. Nonce entries need one.
+
+The chain selector reads `QuantumPow.DefaultTopology` and calls
+`QuantumPowApi_topology_meta` at the same best-block hash.
+`RealChainClient::fetch_default_topology` supplies this read-only lookup.
+The coordinator validates the returned discrete h/J/spin sets and the
+canonical topology hash before creating jobs. It preserves node, edge,
+and set order. A failed lookup stops before miner launch.
+
+This lookup does not read difficulty gates or follow later chain heads.
+Gates use the JSON parser's defaults: `min_solutions = 0`,
+`max_energy_milli = i64::MAX`, and `min_diversity_milli = 0`. `--target-energy` and
+`--min-solutions` override the first two gates. Drive uses synthetic round
+inputs and submits no proofs. The Aglais preset supports the same graph
+and coefficient distribution without a validator connection.
 
 Use `--report <path.jsonl>` for both energy fields. For ordinary `Result` rows,
 the coordinator recomputes energies from returned spins and the dispatched

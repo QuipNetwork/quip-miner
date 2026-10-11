@@ -1,10 +1,7 @@
-//! Drive-mode harness: a pull-based `JobSource` seam feeding synthetic work
-//! to a spawned miner, so it can be exercised and measured without a chain.
+//! Drive-mode harness for generated work and JSONL replay.
 //!
-//! Scope (sub-project #1 of the v0.3 coordinator work): golden-draw random
-//! problems and a JSONL replay list, both file/in-memory and bounded. Network
-//! sources and by-hash topology are later sub-projects; they plug into the
-//! same `JobSource` / topology-provider seams.
+//! A topology comes from a JSON file, an embedded preset, or one read-only
+//! default-topology fetch. Jobs remain synthetic and are never submitted.
 
 pub mod harness;
 pub mod lease_source;

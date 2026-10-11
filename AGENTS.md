@@ -56,8 +56,8 @@ cargo fmt --all --check
 # configured miners, feed them work, submit proofs. Stops on SIGINT/SIGTERM.
 quip-coordinator --config ./docker/config.toml
 
-# Drive: spawn one miner and feed it synthetic problems. No chain, no submit.
-# Set the target in energy units and write the per-job JSONL report.
+# Drive: spawn one miner and feed it synthetic problems without submissions.
+# Use a preset, a JSON file, or a read-only chain topology lookup.
 quip-coordinator drive --miner ./miners/quip-cpu-sa --source random \
   --topology-preset advantage2-system1 --count 100 \
   --target-energy -10000 --report drive.jsonl
@@ -65,6 +65,10 @@ quip-coordinator drive --miner ./miners/quip-cpu-sa --source random \
 # Draw the Aglais graph with fields fixed at zero.
 quip-coordinator drive --miner ./miners/quip-cpu-sa --source random \
   --topology-preset aglais --count 100 --seed 7
+
+# Read the local validator's default topology, then draw synthetic jobs.
+quip-coordinator drive --miner ./miners/quip-cpu-sa --source random \
+  --topology-from-chain ws://127.0.0.1:9944 --count 100 --seed 7
 
 # Drive a miner with generated salt leases.
 quip-coordinator drive --miner ./miners/quip-cpu-sa --source lease \
@@ -74,6 +78,19 @@ quip-coordinator drive --miner ./miners/quip-cpu-sa --source lease \
 # Give exactly one of --sudo-key or --mnemonic-file.
 quip-coordinator seed-chain --sudo-key //Alice
 ```
+
+Drive accepts one of `--topology <spec.json>`, `--topology-preset <name>`,
+or `--topology-from-chain <url>`. The chain option reads `DefaultTopology`
+and its metadata once at the same best-block hash. It requires no signer.
+An unset default, invalid metadata, or failed RPC stops the run before
+the miner starts. Random and lease sources default to `advantage2-system1`
+when you supply no selector. List replay needs a topology for nonce entries.
+
+The chain option reads graph and coefficient sets, without difficulty gates.
+Its gates default to `min_solutions = 0`, `max_energy_milli = i64::MAX`,
+and `min_diversity_milli = 0`. Use `--target-energy` and `--min-solutions`
+to set benchmark gates. Work remains synthetic, and drive submits no proofs.
+Use `--topology-preset aglais` for the fixed Aglais topology without an RPC.
 
 `seed-chain` defaults to `--validator ws://quip-validator:9944` and
 `--topology-preset advantage2-system1`. Difficulty defaults are
