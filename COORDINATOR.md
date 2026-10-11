@@ -704,6 +704,13 @@ per-job and total timing, and can pin
 matched-condition throughput and parity comparisons. This is the path used for
 CPU-versus-CUDA benchmarking.
 
+Drive applies protocol-2 capability snapshots to queued jobs. A miner can send
+snapshots after Configure. Jobs must meet the new model limits. For a native
+graph, drive requires proof that each inline job is a subgraph. Snapshots keep
+credits and counters. Jobs that no longer fit become failing report rows and
+count toward run completion. Drive ignores snapshots with an incompatible
+protocol version.
+
 Use `--report <path.jsonl>` for both energy fields. For ordinary `Result` rows,
 the coordinator recomputes energies from returned spins and the dispatched
 problem. Report energies use milli units.

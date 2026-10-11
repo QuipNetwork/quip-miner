@@ -7,7 +7,9 @@ use crate::router::{MinerCaps, Router};
 use crate::topology::Topology;
 use crate::validate::{beats_current, validate_result, ResolvedTopo};
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
-use quip_proto::v1::{coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, Shutdown, Welcome};
+use quip_proto::v1::{
+    coord_msg, miner_msg, Capabilities, Configure, CoordMsg, MinerMsg, Shutdown, Welcome,
+};
 use quip_protocol::session::PROTOCOL_VERSION;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -394,6 +396,36 @@ impl CoordinatorState {
     /// Register a live session's dispatcher wakeup channel.
     pub fn register_wakeup(&mut self, miner_id: &str, grants: mpsc::Sender<u32>) {
         let _ = self.wakeups.insert(miner_id.to_string(), grants);
+    }
+
+    /// Apply a compatible snapshot and wake dispatchers without granting credits.
+    pub(crate) fn apply_capabilities(&mut self, miner_id: &str, caps: &Capabilities) -> bool {
+        if caps.protocol_version != PROTOCOL_VERSION {
+            tracing::warn!(
+                miner = %miner_id,
+                offered_protocol = caps.protocol_version,
+                "ignoring capability snapshot with incompatible protocol"
+            );
+            return false;
+        }
+        if !self
+            .router
+            .update_capabilities(miner_id, MinerCaps::from_capabilities(caps))
+        {
+            return false;
+        }
+        tracing::debug!(
+            miner = %miner_id,
+            max_nodes = caps.max_nodes,
+            max_edges = caps.max_edges,
+            max_degree = ?caps.max_degree,
+            stream_width = caps.stream_width,
+            "miner capability snapshot applied"
+        );
+        for id in self.router.miner_ids() {
+            self.wake_dispatcher(&id);
+        }
+        true
     }
 
     /// Wake a miner's dispatcher so it drains newly staged work against credits
@@ -1079,29 +1111,7 @@ async fn run_session<C: ChainClient>(
                 tracing::warn!(miner = %miner_id, "miner sent Hello mid-session; ignoring");
             }
             Some(miner_msg::Msg::Capabilities(caps)) => {
-                if caps.protocol_version == PROTOCOL_VERSION {
-                    let indexed = MinerCaps::from_capabilities(&caps);
-                    let mut st = state.lock().await;
-                    if st.router.update_capabilities(&miner_id, indexed) {
-                        tracing::debug!(
-                            miner = %miner_id,
-                            max_nodes = caps.max_nodes,
-                            max_edges = caps.max_edges,
-                            max_degree = ?caps.max_degree,
-                            stream_width = caps.stream_width,
-                            "miner capability snapshot applied"
-                        );
-                        for id in st.router.miner_ids() {
-                            st.wake_dispatcher(&id);
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        miner = %miner_id,
-                        offered_protocol = caps.protocol_version,
-                        "ignoring capability snapshot with incompatible protocol"
-                    );
-                }
+                let _ = state.lock().await.apply_capabilities(&miner_id, &caps);
             }
             Some(miner_msg::Msg::LeaseDone(done)) => {
                 let mut st = state.lock().await;
