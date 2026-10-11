@@ -479,23 +479,11 @@ liveness; `Shutdown` ends the session in-band. The harness owns credits, reject
 reasons, and liveness, so each backend only has to sample. `SPEC.md` in the
 quip-solver-core repo specifies this contract from the miner's side.
 
-### Protocol v1 and v2 edge
+### Protocol version
 
-The session edge serves protocol v1 and v2 miners on the same gRPC path. It
-classifies the first frame, then decodes and encodes messages with that
-protocol's schema. The edge translates v1 frames to the coordinator's v2
-messages and translates supported v2 responses back to v1.
-
-| Message | Translation at the edge |
-|---|---|
-| v1 `Hello` in | v2 `Hello` with v2 capabilities |
-| v1 `Result` spin bytes in | Packed spins in a v2 `Result` |
-| v2 plain `I32` job at scale 1000 out | v1 `Job` with little-endian milli coefficients |
-| v2 lease or other encoding out | No v1 form. The router does not send it to v1 miners |
-
-The edge reports a v1 peer as protocol v2 to the session handler after
-translation. Remove the edge and its v1 dependency after every miner repository
-releases a v2 build.
+The coordinator accepts only protocol v2, defined by `PROTOCOL_VERSION`.
+A miner must set `Hello.capabilities.protocol_version` to that value.
+The handshake rejects other versions by closing the session without a reply.
 
 ## Salt lease staging
 

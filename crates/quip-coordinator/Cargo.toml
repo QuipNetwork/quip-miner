@@ -12,8 +12,6 @@ name = "quip_coordinator"
 path = "src/lib.rs"
 
 [dependencies]
-quip-proto-v1 = { package = "quip-proto", version = "=0.0.1" }
-bytes = "1"
 rayon = "1.10"
 quip-proto = "0.0.2"
 quip-protocol = "0.0.2"
@@ -40,7 +38,6 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
 ] }
 tonic = { workspace = true }
-prost = { workspace = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
