@@ -73,8 +73,8 @@ Publish one asset per architecture named `<binary>-<arch>`
 `config.toml`'s `binary` field and the coordinator's `PATH` lookup expect. A
 real fetch stays inert until the miner repository has cut its first release.
 
-Release this coordinator before any miner repository publishes a v2 build.
-During that rollout, the session edge accepts both v1 and v2 miners.
+Miners must speak protocol v2, defined by `PROTOCOL_VERSION`.
+The coordinator rejects other versions during the `Hello` handshake.
 
 ## Testing a new miner
 

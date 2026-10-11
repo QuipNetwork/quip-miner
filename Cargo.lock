@@ -3013,7 +3013,6 @@ dependencies = [
  "axum 0.8.9",
  "blake2",
  "blake3",
- "bytes",
  "clap",
  "futures",
  "getrandom 0.2.17",
@@ -3021,10 +3020,8 @@ dependencies = [
  "jsonrpsee",
  "libm",
  "parity-scale-codec",
- "prost",
  "quantum-validation",
- "quip-proto 0.0.1",
- "quip-proto 0.0.2",
+ "quip-proto",
  "quip-protocol",
  "quip-transaction-crypto",
  "quip-transaction-crypto-core",
@@ -3085,22 +3082,12 @@ dependencies = [
  "clap",
  "hyper-util",
  "prost",
- "quip-proto 0.0.2",
+ "quip-proto",
  "quip-protocol",
  "tokio",
  "tokio-stream",
  "tonic",
  "tower 0.5.3",
-]
-
-[[package]]
-name = "quip-proto"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b6c09ef8df03dec54672cf6f20109a0217e772018a1515f1cf76587cb79e6df"
-dependencies = [
- "prost",
- "tonic",
 ]
 
 [[package]]
@@ -3120,7 +3107,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2685030cd72ce49aeb91a3ece54b91733cd30d64922277f907459b231441b46f"
 dependencies = [
  "blake3",
- "quip-proto 0.0.2",
+ "quip-proto",
 ]
 
 [[package]]
@@ -3135,7 +3122,7 @@ dependencies = [
  "half",
  "hyper-util",
  "prost",
- "quip-proto 0.0.2",
+ "quip-proto",
  "quip-protocol",
  "serde",
  "serde_json",

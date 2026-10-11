@@ -6,6 +6,7 @@ use crate::chain::{
 use crate::router::{MinerCaps, Router};
 use crate::topology::Topology;
 use crate::validate::{beats_current, validate_result, ResolvedTopo};
+use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, Shutdown, Welcome};
 use quip_protocol::session::{backend_name, PROTOCOL_VERSION};
 use std::collections::HashMap;
@@ -19,7 +20,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tokio_stream::StreamExt as _;
 use tonic::transport::Server;
-use tonic::{Response, Status, Streaming};
+use tonic::{Request, Response, Status, Streaming};
 
 /// Depth of the read loop's queue of credit grants to the dispatcher task.
 /// Grants are single `u32`s, so this only absorbs a burst of `JobRequest`s
@@ -430,49 +431,25 @@ pub struct CoordinatorService<C: ChainClient + 'static> {
     pub submit_notify: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
-impl<C: ChainClient + 'static> CoordinatorService<C> {
-    /// Serve one miner session from raw frames. The first frame picks the
-    /// protocol, see [`crate::edge::classify`].
-    #[expect(
-        clippy::result_large_err,
-        reason = "tonic streams require Status errors"
-    )]
-    pub(crate) async fn session_frames(
+#[tonic::async_trait]
+impl<C: ChainClient + 'static> MinerService for CoordinatorService<C> {
+    type SessionStream = ReceiverStream<Result<CoordMsg, Status>>;
+
+    async fn session(
         &self,
-        mut inbound: Streaming<bytes::Bytes>,
-    ) -> Result<Response<crate::edge::FrameStream>, Status> {
-        use prost::Message as _;
-        let first = inbound
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("stream closed before Hello"))?;
-        let (peer, hello) = crate::edge::classify(&first);
+        request: Request<Streaming<MinerMsg>>,
+    ) -> Result<Response<Self::SessionStream>, Status> {
+        let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<CoordMsg, Status>>(64);
         let state = Arc::clone(&self.state);
         let chain = Arc::clone(&self.chain);
         let submit_notify = Arc::clone(&self.submit_notify);
-        let decode = match peer {
-            crate::edge::PeerProtocol::V1 => crate::edge::decode_v1,
-            crate::edge::PeerProtocol::V2 => crate::edge::decode_v2,
-        };
-        let rest = inbound.map(move |frame| frame.and_then(|b| decode(&b)));
-        let mut msgs = Box::pin(tokio_stream::once(hello).chain(rest));
+
         drop(tokio::spawn(async move {
-            run_session(&mut msgs, &tx, state, chain, submit_notify, peer).await;
+            run_session(&mut inbound, &tx, state, chain, submit_notify).await;
         }));
-        let out = ReceiverStream::new(rx);
-        let frames: crate::edge::FrameStream = match peer {
-            crate::edge::PeerProtocol::V2 => {
-                Box::pin(out.map(|r| r.map(|m| bytes::Bytes::from(m.encode_to_vec()))))
-            }
-            crate::edge::PeerProtocol::V1 => Box::pin(out.filter_map(|r| match r {
-                Ok(m) => {
-                    crate::edge::v2_to_v1(m).map(|o| Ok(bytes::Bytes::from(o.encode_to_vec())))
-                }
-                Err(s) => Some(Err(s)),
-            })),
-        };
-        Ok(Response::new(frames))
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
@@ -830,14 +807,13 @@ async fn run_session<C: ChainClient>(
     state: Arc<Mutex<CoordinatorState>>,
     chain: Arc<C>,
     submit_notify: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    peer: crate::edge::PeerProtocol,
 ) {
     // 1. Hello
     let Some(Ok(MinerMsg {
         msg: Some(miner_msg::Msg::Hello(hello)),
     })) = inbound.next().await
     else {
-        tracing::warn!(protocol = ?peer, "miner handshake rejected; expected Hello");
+        tracing::warn!("miner handshake rejected; expected Hello");
         return;
     };
 
@@ -870,7 +846,8 @@ async fn run_session<C: ChainClient>(
             miner = %miner_id,
             token_ok,
             protocol_ok,
-            offered_protocol = caps.protocol_version,
+            capabilities_present = hello.capabilities.is_some(),
+            offered_protocol = ?hello.capabilities.as_ref().map(|c| c.protocol_version),
             "miner handshake rejected; dropping session"
         );
         return;
@@ -889,7 +866,6 @@ async fn run_session<C: ChainClient>(
         max_nodes = miner_caps.max_nodes,
         max_edges = miner_caps.max_edges,
         stream_width = miner_caps.stream_width,
-        protocol = ?peer,
         "miner registered"
     );
 
@@ -1350,7 +1326,7 @@ pub async fn serve_one_session_expecting(
     };
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(crate::edge::DualMinerServer::new(svc))
+            .add_service(MinerServiceServer::new(svc))
             .serve_with_incoming(incoming)
             .await
     });
