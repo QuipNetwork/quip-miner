@@ -62,6 +62,10 @@ quip-coordinator drive --miner ./miners/quip-cpu-sa --source random \
   --topology-preset advantage2-system1 --count 100 \
   --target-energy -10000 --report drive.jsonl
 
+# Draw the Aglais graph with fields fixed at zero.
+quip-coordinator drive --miner ./miners/quip-cpu-sa --source random \
+  --topology-preset aglais --count 100 --seed 7
+
 # Drive a miner with generated salt leases.
 quip-coordinator drive --miner ./miners/quip-cpu-sa --source lease \
   --topology-preset smoke --count 200 --lease-size 32 --seed 7
@@ -88,9 +92,12 @@ You can seed a chain only once. `register_topology` writes `DefaultTopology`
 only when that value is unset. `seed-chain` refuses to run when a chain already
 has a default topology. Wipe the chain data and restart the validator instead.
 
-The coordinator binary embeds the `advantage2-system1` and `smoke` topology
-presets. `drive --topology-preset` and `seed-chain` read those presets from the
-binary.
+The coordinator binary provides `advantage2-system1`, `aglais`, and `smoke`
+topology presets. `drive --topology-preset` and `seed-chain` read them from
+the binary. Aglais derives from the embedded Advantage2 graph. It keeps
+4,577 native node IDs, removes native edge `(938, 2812)`, and fixes h at zero.
+The removed edge is `(880, 2695)` in compacted positions. Aglais has 41,514
+edges and topology hash prefix `cbec1eb4`.
 
 For ordinary drive results, compare miner energies with `raw_best_energy_milli`
 in the `--report` JSONL file. The `best_energy_milli` field describes the diversity

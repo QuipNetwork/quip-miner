@@ -689,5 +689,9 @@ Negative energy arguments accept a separate value, such as
 `-10_000_000` milli in `SetTarget`. The seed-chain option
 `--max-energy-milli -2500000` already uses milli units.
 
-The preset JSON stays under `crates/quip-coordinator/fixtures/drive/` as the
-readable source. The binary copies each file in at compile time.
+The `advantage2-system1` and `smoke` preset JSON files stay under
+`crates/quip-coordinator/fixtures/drive/`. The binary embeds those files.
+The `aglais` preset derives from Advantage2 in memory once. It removes
+native edge `(938, 2812)`, which is `(880, 2695)` in compacted positions,
+and sets `allowed_h_milli` to `[0]`. The nodes and all other edges keep their
+order. Its 41,514 edges and hash prefix `cbec1eb4` match the Aglais topology.
