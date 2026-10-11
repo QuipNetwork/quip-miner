@@ -2,6 +2,7 @@
 
 use parity_scale_codec::{Compact, Encode};
 use quip_transaction_crypto::{account_id_from_public, HybridPair, HybridTxSignature};
+use sp_core::crypto::SecretStringError;
 use sp_core::hashing::blake2_256;
 use sp_core::Pair as _;
 
@@ -132,6 +133,18 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+fn secret_uri_error_kind(error: &SecretStringError) -> &'static str {
+    // Never format parser errors: InvalidFormat stores the original URI.
+    match error {
+        SecretStringError::InvalidFormat(_) => "invalid format",
+        SecretStringError::InvalidPhrase => "invalid phrase",
+        SecretStringError::InvalidPassword => "invalid password",
+        SecretStringError::InvalidSeed => "invalid seed",
+        SecretStringError::InvalidSeedLength => "invalid seed length",
+        SecretStringError::InvalidPath => "invalid path",
+    }
+}
+
 /// Load a hybrid pair from signer material.
 ///
 /// Accepted forms:
@@ -144,6 +157,7 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 /// Returns an error when the path cannot be read or parsed, the keystore seed
 /// is not 32 bytes, or the secret URI fails to derive a pair.
 /// The error text never contains the key material.
+/// Secret URI errors name only a fixed error kind and omit parser payloads.
 pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
     let path = std::path::Path::new(signer_key);
     if path.exists() {
@@ -177,10 +191,11 @@ pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
     }
     // Any substrate secret URI: a dev path (//Alice), a BIP39 mnemonic, or a
     // mnemonic with derivation and password (phrase//hard/soft///password).
-    HybridPair::from_string(signer_key, None).map_err(|e| {
+    HybridPair::from_string(signer_key, None).map_err(|error| {
+        let kind = secret_uri_error_kind(&error);
         format!(
             "signer_key is not an existing keystore file, a 32-byte hex seed, \
-             or a valid secret URI: {e:?}"
+             or a valid secret URI: {kind}"
         )
     })
 }
@@ -626,6 +641,22 @@ mod tests {
             .err()
             .expect("a bad phrase is rejected");
         for fragment in ["lake", "wolk", "hard", "pw"] {
+            assert!(!err.contains(fragment), "error echoes {fragment:?}: {err}");
+        }
+        assert!(
+            err.contains("keystore") && err.contains("secret URI"),
+            "error names the accepted forms: {err}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_secret_uri_is_rejected_without_echoing_it() {
+        // An empty hard-derivation path triggers a grammar error with the original URI.
+        let secret = "review sentinel//";
+        let err = load_hybrid_pair(secret)
+            .err()
+            .expect("a malformed URI is rejected");
+        for fragment in [secret, "review", "sentinel", "//"] {
             assert!(!err.contains(fragment), "error echoes {fragment:?}: {err}");
         }
         assert!(
