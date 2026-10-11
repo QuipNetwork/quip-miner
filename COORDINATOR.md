@@ -151,7 +151,10 @@ All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
   `DefaultTopology` when the caller names no topology. The client keeps the
   last topology it read through `topology_meta` and reads again only when the
   hash changes, because a topology never changes under its hash.
-- `fetch_mempool_orders` — open mempool orders eligible for this miner.
+- `fetch_mempool_orders` — open mempool orders eligible for the signing account.
+  A Bid admits the account when its account list or registered solver type
+  matches. An absent or empty list contributes no match. The client skips
+  excluded orders before the feeder records or stages them.
 - `submit_proof` — hybrid-sign and submit a proof extrinsic, then classify the
   receipt.
 - `declare_participation` — hybrid-sign and submit
@@ -164,9 +167,10 @@ All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
   account and, when the account is absent, submit
   `QuantumPow.register_miner`.
 - `ensure_solver_registered` — read `QuantumComputeMempool.Solvers` for the
-  signing account. When the account is absent, submit `register_solver`. When
-  the stored type differs from the configured type, submit `deregister_solver`
-  first.
+  signing account and cache its registered type. When the account is absent,
+  submit `register_solver`. When the stored type differs from the configured
+  type, submit `deregister_solver` first. Registration confirmation reads
+  back the requested type and refreshes the cache.
 - `submit_solution` — hybrid-sign and submit
   `QuantumComputeMempool.submit_solution` for one order, then confirm that
   `OrderSolutions` holds a submission from the inclusion block.
@@ -405,6 +409,14 @@ Mempool jobs carry generation `0` (`producer::mempool::job_order_to_job`).
 Reseeds keep those jobs. PoW jobs carry the live generation. The feeder drops
 them when their round ends. A cancelled in-flight job is not re-queued, not
 scored, and not submitted. The miner refunds its credit with `JobRequest{1}`.
+
+Bid eligibility uses the account's registered solver type. Metal registers
+as GPU. The first solver-registration check after startup reads that type.
+Later Bid checks reuse it. A Bid check with no cached registration reads
+`Solvers` at the order head. An absent registration excludes Bids and stays
+uncached. Read and decode errors leave the feeder free to retry. Open discovery
+needs no type read. The feeder requires registration before staging any order.
+Restart the coordinator after another process changes its solver registration.
 
 ### Adaptive staging window
 
