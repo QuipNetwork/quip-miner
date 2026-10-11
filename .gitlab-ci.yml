@@ -19,7 +19,7 @@ variables:
 # coordinator's production runtime is still being wired (quip-6ha/4kn/agm).
 
 # ---------------------------------------------------------------------------
-# Tests (branches only — main/tags skip straight to build)
+# Tests (every branch, including main; tags skip straight to build)
 # ---------------------------------------------------------------------------
 
 # The solver contract (proto, wire codec, harness, PyO3 wheel, conformance
@@ -41,8 +41,6 @@ rust:
   rules:
     - if: $CI_COMMIT_TAG
       when: never
-    - if: $CI_COMMIT_BRANCH == "main"
-      when: never
     - if: $CI_COMMIT_BRANCH
 
 # The `rust:` job above excludes quip-coordinator from the workspace jobs; it
@@ -62,8 +60,6 @@ coordinator:
     paths: [target/, .cargo/]
   rules:
     - if: $CI_COMMIT_TAG
-      when: never
-    - if: $CI_COMMIT_BRANCH == "main"
       when: never
     - if: $CI_COMMIT_BRANCH
 
@@ -163,8 +159,6 @@ verify-fetch-miners:
       echo "ok   every invocation uses bash"
   rules:
     - if: $CI_COMMIT_TAG
-      when: never
-    - if: $CI_COMMIT_BRANCH == "main"
       when: never
     - if: $CI_COMMIT_BRANCH
 
