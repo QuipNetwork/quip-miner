@@ -463,10 +463,19 @@ bundle-darwin-arm64:
       tar -czf quip-solver-darwin-arm64.tar.gz -C bundle quip-solver-darwin-arm64
       ls -l quip-solver-darwin-arm64.tar.gz
       cat "${STAGE}/MANIFEST"
+    # quip-node-manager releases through v0.2.10-rc4 install only the asset
+    # named quip-miner-darwin-arm64.tar.gz, its name before the repo rename.
+    # Upload the same tarball under that name too, so installed managers keep
+    # updating. GitLab wants a distinct URL per release link, hence a second
+    # file rather than a second link to the first. Drop it once those managers
+    # are retired.
     - |
-      curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" \
-        --upload-file quip-solver-darwin-arm64.tar.gz \
-        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}/quip-solver-darwin-arm64.tar.gz"
+      cp quip-solver-darwin-arm64.tar.gz quip-miner-darwin-arm64.tar.gz
+      for f in quip-solver-darwin-arm64.tar.gz quip-miner-darwin-arm64.tar.gz; do
+        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+          --upload-file "$f" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}/$f"
+      done
   artifacts:
     paths: [quip-solver-darwin-arm64.tar.gz]
     expire_in: 1 week
@@ -491,4 +500,5 @@ release-binaries:
     - |
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
       release-cli create --name "quip-solver ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
-        --assets-link "{\"name\":\"quip-solver-darwin-arm64.tar.gz\",\"url\":\"${base}/quip-solver-darwin-arm64.tar.gz\"}"
+        --assets-link "{\"name\":\"quip-solver-darwin-arm64.tar.gz\",\"url\":\"${base}/quip-solver-darwin-arm64.tar.gz\"}" \
+        --assets-link "{\"name\":\"quip-miner-darwin-arm64.tar.gz\",\"url\":\"${base}/quip-miner-darwin-arm64.tar.gz\"}"
