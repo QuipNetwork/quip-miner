@@ -463,10 +463,22 @@ rule a round ran under.
 
 ## Routing and credits
 
-`Router` (`router.rs`) indexes miners by capability and holds a staged queue
-per miner. `route` first-fits a job to a capable miner (by `supported_kinds`
-and `max_nodes`/`max_edges` from the miner's `Hello`); `stage_on` targets a
-specific miner, which is what the feeder uses.
+`Router` (`router.rs`) indexes miner capabilities and holds a staged queue per miner.
+`route` selects the first capable miner by sorted miner id.
+`stage_on` targets a specific miner, which is what the feeder uses.
+Both paths check job kinds, the lease generator, node and edge limits, and degree.
+Inline graphs supply their own degree. Hash jobs and leases use the active session graph.
+Lease node and edge counts also come from that graph.
+An absent degree limit makes no claim. A degree limit of zero permits any degree.
+If the graph is unknown, the miner's reject path remains the fallback.
+
+The router retains the miner's native topology fingerprint, feature names,
+and optional degree limit. A protocol-2 `Capabilities` message replaces the
+stored envelope during a session. The update preserves credits and counters.
+Queued jobs that no longer fit move to another capable miner, in queue order.
+The dispatch path checks each queued job again before spending a credit.
+Jobs already dispatched continue under the existing result and reject rules.
+A snapshot with an incompatible protocol version leaves the current envelope intact.
 
 Dispatch is gated by a **credit pool**, not a queue depth. The miner grants
 `width` credits up front and one more per terminal event (`Result` or
@@ -478,6 +490,25 @@ router keeps no separate outstanding counter.
 On a reject with `UnsupportedKind`, the router records that the miner can't
 serve that job kind and re-routes the job to another capable miner. On a miner
 crash, `reclaim` returns its staged and in-flight jobs for re-queue.
+
+A miner with a native fingerprint receives hash jobs for the active session topology.
+The miner keeps its refusal or defect handling for those jobs.
+The native fingerprint uses a separate namespace from the chain topology hash
+and is never a chain lookup key.
+
+Inline work reaches that miner only when the coordinator proves graph membership.
+It computes the D-Wave graph-only fingerprint of the active topology.
+An equal fingerprint supplies the native nodes and edges for the subgraph check.
+Each inline node and undirected edge must belong to that graph.
+Inline ids are dense and start at zero without a mapping through the sparse
+session node list. Isolated nodes must also exist on the chip.
+If the native graph is unknown or the fingerprints differ, inline work goes
+to another capable miner without embedding.
+
+A reject re-routes to another capable miner and excludes the miner that
+rejected it. If none exists, the job enters `unroutable`.
+The production feeder does not retry it. Capability snapshots affect queued and future work.
+They do not restore dropped jobs.
 
 ## The miner session
 
@@ -689,6 +720,13 @@ Gates use the JSON parser's defaults: `min_solutions = 0`,
 `--min-solutions` override the first two gates. Drive uses synthetic round
 inputs and submits no proofs. The Aglais preset supports the same graph
 and coefficient distribution without a validator connection.
+
+Drive applies protocol-2 capability snapshots to queued jobs. A miner can send
+snapshots after Configure. Jobs must meet the new model limits. For a native
+graph, drive requires proof that each inline job is a subgraph. Snapshots keep
+credits and counters. Jobs that no longer fit become failing report rows and
+count toward run completion. Drive ignores snapshots with an incompatible
+protocol version.
 
 Use `--report <path.jsonl>` for both energy fields. For ordinary `Result` rows,
 the coordinator recomputes energies from returned spins and the dispatched

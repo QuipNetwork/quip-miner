@@ -63,6 +63,7 @@ fn mock_capabilities() -> Capabilities {
         generators: vec![quip_proto::v1::GeneratorAlgorithm::Blake3Chacha8V1 as i32],
         backend: Backend::Mock as i32,
         algorithm: Algorithm::Sa as i32,
+        ..Capabilities::default()
     }
 }
 

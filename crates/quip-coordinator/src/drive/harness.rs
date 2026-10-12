@@ -11,7 +11,7 @@
 
 use crate::config::LaunchEntry;
 use crate::drive::report::JobRow;
-use crate::router::MinerCaps;
+use crate::router::{MinerCaps, Router};
 use crate::session::{coord, shutdown_msg, CoordinatorState};
 use crate::topology::Topology;
 use crate::validate::validate_result;
@@ -162,6 +162,14 @@ impl RunState {
         self.span.lock().unwrap().1 = Some(Instant::now());
     }
 
+    /// Count jobs no miner can serve as terminal failures, including live updates.
+    fn record_unroutable(&self, router: &mut Router) {
+        for job in std::mem::take(&mut router.unroutable) {
+            let is_pow = job_is_pow(&job);
+            self.record(failing_row(job.job_id, is_pow, 0));
+        }
+    }
+
     /// Real wall-clock span first-dispatch → last-result, in ms.
     #[expect(
         clippy::unwrap_used,
@@ -264,9 +272,7 @@ async fn handshake(
         // Reconcile jobs no registered miner can serve: record failing rows now
         // so the completion gate accounts for them instead of stalling to the
         // overall timeout.
-        for j in std::mem::take(&mut st.router.unroutable) {
-            run.record(failing_row(j.job_id.clone(), job_is_pow(&j), 0));
-        }
+        run.record_unroutable(&mut st.router);
         st.configure.get(miner_id).cloned().unwrap_or(Configure {
             queue_depth: 3,
             idle_timeout_s: 300,
@@ -496,7 +502,7 @@ async fn handle_fatal(state: &Arc<Mutex<CoordinatorState>>, run: &Arc<RunState>)
 async fn handle_message(
     msg: MinerMsg,
     state: &Arc<Mutex<CoordinatorState>>,
-    _miner_id: &str,
+    miner_id: &str,
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
     run: &Arc<RunState>,
     grants: &mpsc::Sender<u32>,
@@ -515,6 +521,13 @@ async fn handle_message(
         // only task reading results. Blocking here stops us reading the very
         // results that would free credits — the deadlock this split fixes.
         Some(miner_msg::Msg::JobRequest(req)) => grants.send(req.credits).await.is_ok(),
+        Some(miner_msg::Msg::Capabilities(caps)) => {
+            let mut st = state.lock().await;
+            if st.apply_capabilities(miner_id, &caps) {
+                run.record_unroutable(&mut st.router);
+            }
+            true
+        }
         Some(miner_msg::Msg::Result(result)) => {
             let is_lease = {
                 let st = state.lock().await;
@@ -582,6 +595,10 @@ async fn run_drive_session(
     // Dispatcher task: the only place that writes `Job`s. Kept off the read
     // path so a full outbound channel can never stop us draining results.
     let (grants, mut grant_rx) = mpsc::channel::<u32>(GRANT_CHANNEL_DEPTH);
+    state
+        .lock()
+        .await
+        .register_wakeup(&miner_id, grants.clone());
     let dispatcher = {
         let state = Arc::clone(&state);
         let run = Arc::clone(&run);
@@ -610,6 +627,7 @@ async fn run_drive_session(
             break;
         }
     }
+    state.lock().await.deregister_outbound(&miner_id);
     drop(grants);
     dispatcher.abort();
 }
@@ -728,9 +746,391 @@ mod tests {
         TopologySpec, TopologySpecError,
     };
     use crate::validate::MAX_PROOF_SOLUTIONS_WIRE;
-    use quip_proto::v1::{LeaseDone, SetTarget, Solution};
+    use quip_proto::v1::miner_service_client::MinerServiceClient;
+    use quip_proto::v1::{
+        ising_problem, Capabilities, EdgeList, Hello, JobKind, LeaseDone, Provenance, Ready,
+        SetTarget, Solution,
+    };
     use quip_protocol::chacha8::draw_ising_milli;
     use quip_protocol::wire::encode_spins_packed;
+
+    struct DriveTestSession {
+        _directory: tempfile::TempDir,
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        inbound: mpsc::Sender<MinerMsg>,
+        outbound: Streaming<CoordMsg>,
+        state: Arc<Mutex<CoordinatorState>>,
+        run: Arc<RunState>,
+    }
+
+    impl DriveTestSession {
+        async fn new(jobs: Vec<Job>, topology: Option<Topology>) -> Self {
+            let directory = tempfile::tempdir().expect("test directory is created");
+            let socket = directory.path().join("miner.sock");
+            let listener = UnixListener::bind(&socket).expect("test socket is bound");
+            let mut st = CoordinatorState::new();
+            let _ = st
+                .expected_tokens
+                .insert("m".to_owned(), "token".to_owned());
+            let _ = st.configure.insert(
+                "m".to_owned(),
+                Configure {
+                    queue_depth: 3,
+                    ..Configure::default()
+                },
+            );
+            let has_topology = topology.is_some();
+            st.set_topology(topology);
+            let state = Arc::new(Mutex::new(st));
+            let run = Arc::new(RunState::new(jobs.len()));
+            let service = DriveManyService {
+                state: Arc::clone(&state),
+                jobs: Arc::new(Mutex::new(jobs)),
+                run: Arc::clone(&run),
+                miner_id: "m".to_owned(),
+            };
+            let server = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(MinerServiceServer::new(service))
+                    .serve_with_incoming(UnixListenerStream::new(listener))
+                    .await
+            });
+            let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
+                .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+                    let socket = socket.clone();
+                    async move {
+                        tokio::net::UnixStream::connect(socket)
+                            .await
+                            .map(hyper_util::rt::TokioIo::new)
+                    }
+                }))
+                .await
+                .expect("test miner connects");
+            let (inbound, inbound_rx) = mpsc::channel(16);
+            inbound
+                .send(MinerMsg {
+                    msg: Some(miner_msg::Msg::Hello(Hello {
+                        miner_id: "m".to_owned(),
+                        session_token: "token".to_owned(),
+                        capabilities: Some(Capabilities {
+                            protocol_version: PROTOCOL_VERSION,
+                            ..Capabilities::default()
+                        }),
+                    })),
+                })
+                .await
+                .expect("test miner sends Hello");
+            let outbound = MinerServiceClient::new(channel)
+                .session(ReceiverStream::new(inbound_rx))
+                .await
+                .expect("drive session starts")
+                .into_inner();
+            let mut session = Self {
+                _directory: directory,
+                server,
+                inbound,
+                outbound,
+                state,
+                run,
+            };
+            let coord_msg::Msg::Welcome(_) = session.receive().await else {
+                panic!("drive must welcome the miner");
+            };
+            let coord_msg::Msg::Configure(configure) = session.receive().await else {
+                panic!("drive must configure the miner");
+            };
+            assert_eq!(configure.queue_depth, 3);
+            if has_topology {
+                let coord_msg::Msg::Topology(_) = session.receive().await else {
+                    panic!("drive must send the configured topology");
+                };
+            }
+            session
+        }
+
+        async fn send(&self, msg: miner_msg::Msg) {
+            self.inbound
+                .send(MinerMsg { msg: Some(msg) })
+                .await
+                .expect("test miner sends a frame");
+        }
+
+        async fn receive(&mut self) -> coord_msg::Msg {
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.outbound.message())
+                .await
+                .expect("drive responds without stalling")
+                .expect("drive response is valid")
+                .expect("drive session remains open")
+                .msg
+                .expect("drive response has a payload")
+        }
+
+        async fn finish(&mut self, jobs: &[Job]) {
+            for job in jobs {
+                let nodes = job.ising.as_ref().expect("test job is Ising").h.len() / 4;
+                self.send(miner_msg::Msg::Result(JobResult {
+                    job_id: job.job_id.clone(),
+                    solutions: vec![Solution {
+                        spins: encode_spins_packed(&vec![1; nodes]),
+                        energy_milli: 0,
+                    }],
+                    ..JobResult::default()
+                }))
+                .await;
+            }
+            let coord_msg::Msg::Shutdown(_) = self.receive().await else {
+                panic!("drive must shut down after every job is terminal");
+            };
+            assert!(self.run.is_complete());
+        }
+    }
+
+    impl Drop for DriveTestSession {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn inline_job(id: u8, nodes: usize, edges: &[(u32, u32)]) -> Job {
+        let (u, v) = edges.iter().copied().unzip();
+        Job {
+            job_id: vec![id],
+            kind: JobKind::IsingSample as i32,
+            ising: Some(crate::producer::problem::milli_problem(
+                Some(ising_problem::Graph::Edges(EdgeList { u, v })),
+                &vec![0; nodes],
+                &vec![0; edges.len()],
+            )),
+            provenance: Some(Provenance {
+                is_pow: true,
+                ..Provenance::default()
+            }),
+            ..Job::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn live_capability_degree_reduction_preserves_order_accounting_and_completion() {
+        let degree_twenty = (1..=20).map(|node| (0, node)).collect::<Vec<_>>();
+        let degree_twenty_one = (1..=21).map(|node| (0, node)).collect::<Vec<_>>();
+        let mut session = DriveTestSession::new(
+            vec![
+                inline_job(1, 22, &degree_twenty),
+                inline_job(2, 22, &degree_twenty_one),
+                inline_job(3, 22, &[(0, 1)]),
+            ],
+            None,
+        )
+        .await;
+        {
+            let mut st = session.state.lock().await;
+            assert_eq!(st.router.caps("m").and_then(|caps| caps.max_degree), None);
+            assert_eq!(st.router.staged_len("m"), 3);
+            st.router.grant_credits("m", 4);
+            st.router.record_completion("m");
+            st.router.record_lease_salts("m", 7);
+            st.router.record_round_salts("m", 9);
+        }
+        session
+            .send(miner_msg::Msg::Capabilities(Capabilities {
+                protocol_version: PROTOCOL_VERSION,
+                max_degree: Some(20),
+                ..Capabilities::default()
+            }))
+            .await;
+        // The snapshot wake must use existing credits before Ready grants more.
+        let mut dispatched = Vec::new();
+        for id in [1, 3] {
+            let coord_msg::Msg::Job(job) = session.receive().await else {
+                panic!("compatible queued jobs must dispatch");
+            };
+            assert_eq!(job.job_id, vec![id]);
+            dispatched.push(job);
+        }
+        {
+            let rows = session
+                .run
+                .rows
+                .lock()
+                .expect("report lock is not poisoned");
+            assert_eq!(rows.len(), 1);
+            let row = rows.first().expect("one terminal failure is recorded");
+            assert_eq!(row.job_id, vec![2]);
+            assert!(row.is_pow);
+            assert!(row.rejected);
+            assert!(!row.passed);
+            assert_eq!(row.n_solutions, 0);
+            assert_eq!(row.best_energy_milli, i64::MAX);
+            assert_eq!(row.raw_best_energy_milli, i64::MAX);
+            assert_eq!(row.wall_ms, 0);
+        }
+        session.send(miner_msg::Msg::Ready(Ready {})).await;
+        session.finish(&dispatched).await;
+        assert_eq!(
+            session
+                .run
+                .rows
+                .lock()
+                .expect("report lock is not poisoned")
+                .len(),
+            3
+        );
+        let mut st = session.state.lock().await;
+        assert_eq!(st.router.jobs_completed("m"), 1);
+        assert_eq!(st.router.take_consumed("m"), 2);
+        assert_eq!(st.router.take_lease_salts("m"), 7);
+        assert_eq!(st.router.round_salts("m"), 9);
+        // Four existing credits plus three from Ready, minus two dispatched jobs.
+        for id in 10..15 {
+            assert!(st.router.stage_on("m", inline_job(id, 22, &[(0, 1)])));
+            assert_eq!(
+                st.router.next_job("m").map(|job| job.job_id),
+                Some(vec![id])
+            );
+        }
+        assert!(st.router.stage_on("m", inline_job(15, 22, &[(0, 1)])));
+        assert!(st.router.next_job("m").is_none());
+    }
+
+    #[tokio::test]
+    async fn live_capability_native_fingerprint_after_configure_requires_inline_proof() {
+        let topology = Topology::from_nodes_edges(
+            vec![0, 1, 2],
+            vec![(0, 1), (1, 2)],
+            &[0],
+            &[1000],
+            &[-1000, 1000],
+        );
+        let native_hash =
+            crate::topology::native_topology_hash(&topology.nodes, &topology.edge_pairs())
+                .expect("native graph is valid")
+                .to_vec();
+        let mut session = DriveTestSession::new(
+            vec![
+                inline_job(1, 3, &[(0, 1)]),
+                inline_job(2, 3, &[(0, 2)]),
+                inline_job(3, 4, &[]),
+            ],
+            Some(topology.clone()),
+        )
+        .await;
+        session
+            .send(miner_msg::Msg::Capabilities(Capabilities {
+                protocol_version: PROTOCOL_VERSION,
+                native_topology_hash: Some(native_hash.clone()),
+                ..Capabilities::default()
+            }))
+            .await;
+        session.send(miner_msg::Msg::Ready(Ready {})).await;
+        let coord_msg::Msg::Job(job) = session.receive().await else {
+            panic!("the proven inline subgraph must dispatch");
+        };
+        assert_eq!(job.job_id, vec![1]);
+        {
+            let rows = session
+                .run
+                .rows
+                .lock()
+                .expect("report lock is not poisoned");
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.job_id.clone())
+                    .collect::<Vec<_>>(),
+                vec![vec![2], vec![3]]
+            );
+            assert!(rows.iter().all(|row| row.rejected && !row.passed));
+        }
+        session.finish(&[job]).await;
+        {
+            let st = session.state.lock().await;
+            assert_eq!(
+                st.router
+                    .caps("m")
+                    .and_then(|caps| caps.native_topology_hash.as_ref()),
+                Some(&native_hash)
+            );
+            assert_eq!(st.router.staged_len("m"), 0);
+            assert!(st.inflight.is_empty());
+        }
+        let mut all_unroutable =
+            DriveTestSession::new(vec![inline_job(4, 3, &[(0, 2)])], Some(topology)).await;
+        all_unroutable
+            .send(miner_msg::Msg::Capabilities(Capabilities {
+                protocol_version: PROTOCOL_VERSION,
+                native_topology_hash: Some(native_hash),
+                ..Capabilities::default()
+            }))
+            .await;
+        all_unroutable.finish(&[]).await;
+        let rows = all_unroutable
+            .run
+            .rows
+            .lock()
+            .expect("report lock is not poisoned");
+        assert_eq!(rows.len(), 1);
+        let row = rows.first().expect("one terminal failure is recorded");
+        assert_eq!(row.job_id, vec![4]);
+        assert!(row.rejected);
+        assert!(!row.passed);
+    }
+
+    #[tokio::test]
+    async fn live_capability_incompatible_protocol_keeps_the_last_accepted_snapshot() {
+        let edges = (1..=21).map(|node| (0, node)).collect::<Vec<_>>();
+        let mut session = DriveTestSession::new(
+            vec![inline_job(1, 22, &edges), inline_job(2, 22, &[(0, 1)])],
+            None,
+        )
+        .await;
+        session
+            .send(miner_msg::Msg::Capabilities(Capabilities {
+                protocol_version: PROTOCOL_VERSION,
+                max_nodes: 64,
+                max_edges: 128,
+                max_degree: Some(21),
+                stream_width: 4,
+                features: vec!["streaming".to_owned()],
+                ..Capabilities::default()
+            }))
+            .await;
+        session
+            .send(miner_msg::Msg::Capabilities(Capabilities {
+                protocol_version: 1,
+                max_nodes: 1,
+                max_degree: Some(20),
+                native_topology_hash: Some(vec![9; 32]),
+                ..Capabilities::default()
+            }))
+            .await;
+        session.send(miner_msg::Msg::Ready(Ready {})).await;
+        let mut dispatched = Vec::new();
+        for id in [1, 2] {
+            let coord_msg::Msg::Job(job) = session.receive().await else {
+                panic!("the invalid snapshot must not remove compatible jobs");
+            };
+            assert_eq!(job.job_id, vec![id]);
+            dispatched.push(job);
+        }
+        {
+            let st = session.state.lock().await;
+            let caps = st.router.caps("m").expect("miner remains registered");
+            assert_eq!(caps.max_nodes, 64);
+            assert_eq!(caps.max_edges, 128);
+            assert_eq!(caps.max_degree, Some(21));
+            assert_eq!(caps.stream_width, 4);
+            assert_eq!(caps.features, vec!["streaming".to_owned()]);
+            assert_eq!(caps.native_topology_hash, None);
+            assert!(st.router.unroutable.is_empty());
+        }
+        session.finish(&dispatched).await;
+        let rows = session
+            .run
+            .rows
+            .lock()
+            .expect("report lock is not poisoned");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| !row.rejected));
+    }
 
     fn report_spec() -> Result<TopologySpec, TopologySpecError> {
         parse_topology_spec(
