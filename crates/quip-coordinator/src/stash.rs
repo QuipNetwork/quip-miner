@@ -203,8 +203,8 @@ pub struct StashSummary {
     pub last_proof_block: u64,
     /// Blocks per decay step.
     pub epoch_length: u64,
-    /// Decay rule the projection ran under: `stepwise`, `continuous`, or
-    /// `none` without a model.
+    /// Decay rule the projection ran under: `stepwise`, `continuous`,
+    /// `gated`, or `none` without a model.
     pub decay_algorithm: &'static str,
     /// Top-K candidates currently held.
     pub candidates: Vec<CandidateSummary>,
