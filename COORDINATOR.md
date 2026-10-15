@@ -439,20 +439,26 @@ threshold now may clear it later in the same round, so the session path
 stashes it and the feeder submits it at the projected block. `decay.rs`
 mirrors the chain's rule so the projection needs no per-block RPC.
 
-The chain has shipped two rules. Runtime 117 steps the threshold once per
+The chain has shipped three rules. Runtime 117 steps the threshold once per
 100-block epoch by 2.5% of the room to the easy cap. Runtime 118
 (quip-validator !87) eases every block in closed form. Past 100 blocks in a
 round it eases at twice the baseline rate. That doubling holds while the
 room to the easy cap exceeds the 40,000 milli floor crossover. Under the
 crossover both phases step 1,000 milli per epoch and the overdue term adds
-nothing. `DecayAlgorithm` names the two. `DecayModel` holds the stored base difficulty, the curve, the epoch
-length, and the rule, and answers the threshold at any elapsed block.
+nothing. Runtime 119 (quip-validator v0.4.0) holds the threshold at the
+stored base through 100 blocks. From block 101 it eases every block at the
+combined rate, `1 - 0.975 * 0.975` (4.9375%) of the room per epoch, for the
+blocks past 100 only. The 1,000 milli floor per epoch still applies near the
+easy cap. `DecayAlgorithm` names the three. `DecayModel` holds the stored
+base difficulty, the curve, the epoch length, and the rule, and answers the
+threshold at any elapsed block.
 
 `fetch_mining_snapshot` reads `state_getRuntimeVersion` at the snapshot
-block. `DecayAlgorithm::for_spec_version` picks the rule: continuous at
-spec 118 and later, stepwise before. The feeder builds the model at each
-reseed. On every poll it swaps the rule into the stash when the spec version
-changes. The stash keeps its candidates across the swap. The upgrade needs
+block. `DecayAlgorithm::for_spec_version` picks the rule from the
+`spec_version`. Version 119 and later use the gated rule. Version 118 uses
+the continuous rule, and earlier versions use the stepwise rule. The feeder
+builds the model at each reseed. On every poll it swaps the rule into the
+stash when the `spec_version` changes. The stash keeps its candidates across the swap. The upgrade needs
 no restart.
 
 `WinStash::viability_block` finds the first block whose threshold exceeds a

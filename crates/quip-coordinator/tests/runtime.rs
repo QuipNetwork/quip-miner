@@ -2222,9 +2222,9 @@ async fn feeder_holds_a_stashed_candidate_until_the_live_difficulty_admits_it() 
         .expect("feeder task panicked");
 }
 
-/// A runtime upgrade to 118 takes effect mid-round. The feeder switches the
-/// stash projection to the continuous rule on the poll that reports the new
-/// spec version, keeps the stashed candidate, and projects it earlier.
+/// A runtime upgrade takes effect mid-round. The feeder switches the stash
+/// projection on the poll that reports the new spec version (continuous at
+/// 118, gated at 119), keeps the stashed candidate, and reprojects it.
 #[tokio::test]
 async fn feeder_switches_the_decay_projection_when_the_runtime_upgrades() {
     use quip_coordinator::decay::{DecayAlgorithm, DecayModel, EnergyCurve};
@@ -2311,6 +2311,33 @@ async fn feeder_switches_the_decay_projection_when_the_runtime_upgrades() {
     assert!(
         1_000_000 < block && block < 1_000_010,
         "continuous projection must land inside the first epoch, got {block}"
+    );
+
+    // The next upgrade, spec 119, gates easing behind the 100-block target.
+    let mut gated = gated_snapshot(-1500);
+    gated.spec_version = 119;
+    chain.set_snapshot(Some(gated));
+
+    let mut switched = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if state.lock().await.stash.algorithm() == Some(DecayAlgorithm::Gated) {
+            switched = true;
+            break;
+        }
+    }
+    assert!(switched, "feeder never switched the projection to gated");
+
+    let summary = state.lock().await.stash.summary();
+    assert_eq!(summary.decay_algorithm, "gated");
+    let block = summary
+        .candidates
+        .first()
+        .and_then(|c| c.viability_block)
+        .unwrap_or(u64::MAX);
+    assert!(
+        1_000_100 < block && block < 1_000_110,
+        "gated projection must land in the first overdue epoch, got {block}"
     );
 
     let _ = stop_tx.send(true);

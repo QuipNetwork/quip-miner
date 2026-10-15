@@ -2,11 +2,13 @@
 //!
 //! The chain eases `max_energy_milli` upward each epoch since the
 //! last winning proof, so a candidate that does not clear the current
-//! threshold eventually wins as difficulty decays. This module mirrors both
-//! rules the chain has shipped: `ease_step` is the runtime-117 step, one
-//! geometric fraction of the remaining gap per whole epoch, and
+//! threshold eventually wins as difficulty decays. This module mirrors the
+//! three rules the chain has shipped: `ease_step` is the runtime-117 step, one
+//! geometric fraction of the remaining gap per whole epoch;
 //! `ease_continuous` is the runtime-118 closed form (quip-validator !87) that
-//! eases every block and faster past the target round length. No chain
+//! eases every block and faster past the target round length; and
+//! `ease_gated` is the runtime-119 rule (quip-validator v0.4.0) that holds the
+//! threshold through the target and then eases at the combined rate. No chain
 //! dependency — the caller supplies the curve + base.
 //!
 //! Golden-faithful: `round` is half-away-from-zero (Rust `f64::round`, matching
@@ -30,6 +32,9 @@ pub const OVERDUE_EASE_RATE_MILLI: i64 = 25;
 /// First runtime `spec_version` that decays per block (quip-validator !87).
 /// Earlier runtimes step once per whole epoch.
 pub const CONTINUOUS_DECAY_SPEC_VERSION: u32 = 118;
+/// First runtime `spec_version` that holds the threshold through
+/// [`TARGET_PROOF_BLOCKS`] before easing (quip-validator v0.4.0).
+pub const GATED_DECAY_SPEC_VERSION: u32 = 119;
 
 // The pallet exposes these as constants/defaults, not via any runtime API, so
 // (per the independent-reads path) the coordinator mirrors them. They match
@@ -191,20 +196,56 @@ pub fn ease_continuous(
     current.saturating_add((first + second).min(room))
 }
 
+/// EASIER decay of `current` after `elapsed_blocks` blocks under the
+/// runtime-119 rule (quip-validator v0.4.0): no easing through
+/// [`TARGET_PROOF_BLOCKS`], then per-block easing at the combined
+/// baseline-plus-overdue rate for the blocks past it only, from the full room
+/// to `curve.max_milli`. Block 101 eases by exactly one block. A degenerate
+/// curve or zero epoch is a no-op.
+///
+/// Transcribed from the pallet's `apply_decay`. Keep the expression order:
+/// `1.0 - retained` is not exactly `0.049375` in f64, and the golden table
+/// pins the result.
+#[must_use]
+pub fn ease_gated(
+    current: i64,
+    elapsed_blocks: u64,
+    epoch_length: u64,
+    curve: &EnergyCurve,
+) -> i64 {
+    let overdue = elapsed_blocks.saturating_sub(TARGET_PROOF_BLOCKS);
+    if curve.max_milli <= curve.min_milli || overdue == 0 || epoch_length == 0 {
+        return current;
+    }
+    let room = curve.max_milli.saturating_sub(current);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "per-mille rates are small integers, exact in f64"
+    )]
+    let retained =
+        (1.0 - DECAY_RATE_MILLI as f64 / 1000.0) * (1.0 - OVERDUE_EASE_RATE_MILLI as f64 / 1000.0);
+    current.saturating_add(ease_room(room, overdue, epoch_length, 1.0 - retained))
+}
+
 /// Which decay rule the connected runtime applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecayAlgorithm {
     /// Runtime 117 and earlier: one 2.5% step per whole epoch.
     Stepwise,
-    /// Runtime 118 and later: per-block closed form with overdue easing.
+    /// Runtime 118: per-block closed form with overdue easing.
     Continuous,
+    /// Runtime 119 and later: no easing through the target, then per-block
+    /// easing at the combined rate.
+    Gated,
 }
 
 impl DecayAlgorithm {
     /// The rule a runtime at `spec_version` applies.
     #[must_use]
     pub fn for_spec_version(spec_version: u32) -> Self {
-        if spec_version >= CONTINUOUS_DECAY_SPEC_VERSION {
+        if spec_version >= GATED_DECAY_SPEC_VERSION {
+            Self::Gated
+        } else if spec_version >= CONTINUOUS_DECAY_SPEC_VERSION {
             Self::Continuous
         } else {
             Self::Stepwise
@@ -217,6 +258,7 @@ impl DecayAlgorithm {
         match self {
             Self::Stepwise => "stepwise",
             Self::Continuous => "continuous",
+            Self::Gated => "gated",
         }
     }
 }
@@ -257,12 +299,18 @@ impl DecayModel {
                 self.epoch_length,
                 curve,
             ),
+            DecayAlgorithm::Gated => ease_gated(
+                self.base_max_energy_milli,
+                elapsed_blocks,
+                self.epoch_length,
+                curve,
+            ),
         }
     }
 
     /// Blocks after the last proof at which the threshold first strictly
     /// exceeds `energy_milli`, or `None` if it never does within
-    /// `horizon_blocks`. Binary search: both rules are monotone
+    /// `horizon_blocks`. Binary search: every rule is monotone
     /// non-decreasing in elapsed blocks.
     #[must_use]
     pub fn first_clearing_elapsed(&self, energy_milli: i64, horizon_blocks: u64) -> Option<u64> {
@@ -441,12 +489,34 @@ mod tests {
             DecayAlgorithm::for_spec_version(118),
             DecayAlgorithm::Continuous
         );
-        assert_eq!(
-            DecayAlgorithm::for_spec_version(119),
-            DecayAlgorithm::Continuous
-        );
+        assert_eq!(DecayAlgorithm::for_spec_version(119), DecayAlgorithm::Gated);
+        assert_eq!(DecayAlgorithm::for_spec_version(120), DecayAlgorithm::Gated);
         assert_eq!(DecayAlgorithm::Stepwise.name(), "stepwise");
         assert_eq!(DecayAlgorithm::Continuous.name(), "continuous");
+        assert_eq!(DecayAlgorithm::Gated.name(), "gated");
+    }
+
+    #[test]
+    fn gated_model_holds_through_the_target_then_eases_per_block() {
+        let m = DecayModel {
+            algorithm: DecayAlgorithm::Gated,
+            ..stepwise_model()
+        };
+        let target = TARGET_PROOF_BLOCKS;
+        // The gate is TARGET_PROOF_BLOCKS, independent of the epoch length.
+        assert_eq!(m.threshold_at(target), -50_000);
+        assert!(m.threshold_at(target + 1) > -50_000);
+        // Any easing at all first happens one block past the target.
+        assert_eq!(m.first_clearing_elapsed(-50_000, 1_000), Some(target + 1));
+        assert_eq!(m.first_clearing_elapsed(-50_001, 1_000), Some(0));
+        // The gate releases later than runtime 118 would for the same energy.
+        let continuous = DecayModel {
+            algorithm: DecayAlgorithm::Continuous,
+            ..m
+        };
+        let gated = m.first_clearing_elapsed(-49_500, 1_000);
+        let earlier = continuous.first_clearing_elapsed(-49_500, 1_000);
+        assert!(earlier < gated, "continuous {earlier:?} vs gated {gated:?}");
     }
 
     fn stepwise_model() -> DecayModel {
@@ -700,6 +770,159 @@ mod tests {
             let got = ease_continuous(c.min_milli + offset, elapsed, 100, &c);
             assert_eq!(got, want, "offset {offset}, elapsed {elapsed}");
         }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the complete pallet golden table stays together for verbatim parity"
+    )]
+    fn ease_gated_matches_the_runtime_119_golden_table() {
+        // (offset above min_milli, elapsed blocks, eased max_energy_milli), the
+        // `eased` column of quip-validator v0.4.0's
+        // `apply_decay_and_adjust_on_proof_golden_table` on `walkup_curve()`
+        // with epoch 100. Regenerate there with
+        // `cargo test -p pallet-quantum-pow print_golden_table -- --ignored --nocapture`.
+        #[expect(
+            clippy::unreadable_literal,
+            reason = "golden literals are copied verbatim from the pallet table"
+        )]
+        const GOLDEN: &[(i64, u64, i64)] = &[
+            (0, 1, -16000000),
+            (0, 7, -16000000),
+            (0, 30, -16000000),
+            (0, 59, -16000000),
+            (0, 60, -16000000),
+            (0, 99, -16000000),
+            (0, 100, -16000000),
+            (0, 101, -15998988),
+            (0, 150, -15950000),
+            (0, 200, -15901250),
+            (0, 500, -15633304),
+            (0, 1000, -15267982),
+            (0, 10000, -14011952),
+            (1000, 1, -15999000),
+            (1000, 7, -15999000),
+            (1000, 30, -15999000),
+            (1000, 59, -15999000),
+            (1000, 60, -15999000),
+            (1000, 99, -15999000),
+            (1000, 100, -15999000),
+            (1000, 101, -15997988),
+            (1000, 150, -15949025),
+            (1000, 200, -15900299),
+            (1000, 500, -15632487),
+            (1000, 1000, -15267348),
+            (1000, 10000, -14011942),
+            (20000, 1, -15980000),
+            (20000, 7, -15980000),
+            (20000, 30, -15980000),
+            (20000, 59, -15980000),
+            (20000, 60, -15980000),
+            (20000, 99, -15980000),
+            (20000, 100, -15980000),
+            (20000, 101, -15978998),
+            (20000, 150, -15930500),
+            (20000, 200, -15882237),
+            (20000, 500, -15616971),
+            (20000, 1000, -15255302),
+            (20000, 10000, -14011754),
+            (80000, 1, -15920000),
+            (80000, 7, -15920000),
+            (80000, 30, -15920000),
+            (80000, 59, -15920000),
+            (80000, 60, -15920000),
+            (80000, 99, -15920000),
+            (80000, 100, -15920000),
+            (80000, 101, -15919028),
+            (80000, 150, -15872000),
+            (80000, 200, -15825200),
+            (80000, 500, -15567971),
+            (80000, 1000, -15217263),
+            (80000, 10000, -14011146),
+            (400000, 1, -15600000),
+            (400000, 7, -15600000),
+            (400000, 30, -15600000),
+            (400000, 59, -15600000),
+            (400000, 60, -15600000),
+            (400000, 99, -15600000),
+            (400000, 100, -15600000),
+            (400000, 101, -15599190),
+            (400000, 150, -15560000),
+            (400000, 200, -15521000),
+            (400000, 500, -15306643),
+            (400000, 1000, -15014386),
+            (400000, 10000, -14007545),
+            (1000000, 1, -15000000),
+            (1000000, 7, -15000000),
+            (1000000, 30, -15000000),
+            (1000000, 59, -15000000),
+            (1000000, 60, -15000000),
+            (1000000, 99, -15000000),
+            (1000000, 100, -15000000),
+            (1000000, 101, -14999494),
+            (1000000, 150, -14975000),
+            (1000000, 200, -14950625),
+            (1000000, 500, -14816652),
+            (1000000, 1000, -14633991),
+            (1000000, 10000, -14000000),
+            (1960000, 1, -14040000),
+            (1960000, 7, -14040000),
+            (1960000, 30, -14040000),
+            (1960000, 59, -14040000),
+            (1960000, 60, -14040000),
+            (1960000, 99, -14040000),
+            (1960000, 100, -14040000),
+            (1960000, 101, -14039980),
+            (1960000, 150, -14039000),
+            (1960000, 200, -14038025),
+            (1960000, 500, -14032666),
+            (1960000, 1000, -14025360),
+            (1960000, 10000, -14000000),
+            (1999000, 1, -14001000),
+            (1999000, 7, -14001000),
+            (1999000, 30, -14001000),
+            (1999000, 59, -14001000),
+            (1999000, 60, -14001000),
+            (1999000, 99, -14001000),
+            (1999000, 100, -14001000),
+            (1999000, 101, -14000990),
+            (1999000, 150, -14000500),
+            (1999000, 200, -14000000),
+            (1999000, 500, -14000000),
+            (1999000, 1000, -14000000),
+            (1999000, 10000, -14000000),
+        ];
+        let c = walkup_curve();
+        assert_eq!(GOLDEN.len(), 104, "table covers the whole grid");
+        for &(offset, elapsed, want) in GOLDEN {
+            let got = ease_gated(c.min_milli + offset, elapsed, 100, &c);
+            assert_eq!(got, want, "offset {offset}, elapsed {elapsed}");
+        }
+    }
+
+    #[test]
+    fn ease_gated_is_monotone_and_capped() {
+        let c = walkup_curve();
+        for start in [c.min_milli, c.knee_milli, c.max_milli - 3_500] {
+            let mut previous = start;
+            for elapsed in 1..=20_000_u64 {
+                let now = ease_gated(start, elapsed, 100, &c);
+                assert!(now >= previous, "decay went backwards at elapsed={elapsed}");
+                assert!(
+                    now <= c.max_milli,
+                    "eased past the cap at elapsed={elapsed}"
+                );
+                previous = now;
+            }
+        }
+        assert_eq!(ease_gated(c.knee_milli, 500, 0, &c), c.knee_milli);
+        let degenerate = EnergyCurve {
+            min_milli: -1_000,
+            knee_milli: -1_000,
+            max_milli: -1_000,
+        };
+        assert_eq!(ease_gated(-50_000, 500, 100, &degenerate), -50_000);
     }
 
     #[test]
