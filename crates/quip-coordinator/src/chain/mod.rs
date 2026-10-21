@@ -138,6 +138,16 @@ pub trait ChainClient: Send + Sync {
     /// ([`MAX_ORDER_SOLUTIONS`] rows).
     async fn submit_solution(&self, proof: &Proof) -> Result<SubmitReceipt, ChainError>;
 
+    /// Claim the reward on a mempool order this account won.
+    ///
+    /// The pallet pays nothing on its own: the winner has to claim. A
+    /// solver that submits a solution and never claims is paid nothing,
+    /// and the reward goes back to the proposer when the order is
+    /// reclaimed. The claim is only submitted once the order's wait has
+    /// elapsed; before that the receipt is retryable and no fee is
+    /// spent.
+    async fn claim_reward(&self, order_id: u64) -> Result<SubmitReceipt, ChainError>;
+
     /// Hybrid-sign and submit `MinerRegistry.set_descriptor`.
     async fn file_descriptor(
         &self,

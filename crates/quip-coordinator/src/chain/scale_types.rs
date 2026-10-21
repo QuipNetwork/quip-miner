@@ -572,6 +572,24 @@ pub fn encode_deregister_solver_call() -> Vec<u8> {
     ]
 }
 
+/// `QuantumComputeMempool::claim_reward(order_id)` call index.
+pub const CLAIM_REWARD_CALL_INDEX: u8 = 5;
+
+/// SCALE-encode `QuantumComputeMempool.claim_reward(order_id)`.
+///
+/// The reward on a won order is not paid automatically. The pallet
+/// leaves the reward reserved with the proposer and the winner has to
+/// call this to collect it, so a solver that submits a solution and
+/// stops there is paid nothing, and the proposer reclaims the order
+/// when it expires.
+pub fn encode_claim_reward_call(order_id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + 8);
+    out.push(QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX);
+    out.push(CLAIM_REWARD_CALL_INDEX);
+    out.extend_from_slice(&order_id.to_le_bytes());
+    out
+}
+
 /// SCALE-encode `QuantumComputeMempool.submit_solution(order_id, solutions)`.
 ///
 /// Each row is one `±1` spin per node, in node order. A `BoundedVec` encodes
@@ -680,6 +698,14 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn claim_reward_call_encodes_pallet_then_call_index_then_order_id() {
+        let call = encode_claim_reward_call(0x0102);
+        assert_eq!(call[0], QUANTUM_COMPUTE_MEMPOOL_PALLET_INDEX);
+        assert_eq!(call[1], CLAIM_REWARD_CALL_INDEX);
+        assert_eq!(&call[2..], &0x0102u64.to_le_bytes());
+    }
+
     fn submit_solution_call_encodes_order_id_then_nested_spin_rows() {
         let call = encode_submit_solution_call(0x0102, &[vec![1, -1], vec![-1, 1]]);
         let mut expected = vec![

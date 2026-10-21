@@ -20,6 +20,8 @@ pub struct FakeChain {
     pub submitted: Mutex<Vec<Proof>>,
     /// Optional scripted submit receipt (default `Success`, no chain detail).
     submit_result: Mutex<Result<SubmitReceipt, ChainError>>,
+    /// Mempool orders the fake chain was asked to claim the reward on.
+    pub claimed_rewards: Mutex<Vec<u64>>,
     /// Scripted `latest_qblock_id` (default `None`).
     qblock_id: Mutex<Option<u64>>,
     /// Scripted `fetch_decay_params` (default `None`).
@@ -94,6 +96,7 @@ impl FakeChain {
             balance_accounts: Mutex::new(Vec::new()),
             miner_info: Mutex::new(None),
             solutions: Mutex::new(Vec::new()),
+            claimed_rewards: Mutex::new(Vec::new()),
             solver_registered: Mutex::new(false),
             solver_registration_result: Mutex::new(Ok(RegistrationOutcome::Registered)),
             solver_registration_submits: Mutex::new(0),
@@ -603,6 +606,17 @@ impl ChainClient for FakeChain {
                 Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
                 Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
             }
+        }
+    }
+
+    async fn claim_reward(&self, order_id: u64) -> Result<SubmitReceipt, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.claimed_rewards.lock().unwrap().push(order_id);
+            Ok(SubmitReceipt::action_only(SubmitAction::Success))
         }
     }
 

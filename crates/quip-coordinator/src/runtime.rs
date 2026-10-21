@@ -7,7 +7,7 @@
 //! this alone serves sessions and supervises miners but stages no work yet.
 
 use crate::chain::sync::{wait_until_synced, SyncOutcome, SyncSource};
-use crate::chain::{ChainClient, JobOrder, MiningSnapshot};
+use crate::chain::{ChainClient, JobOrder, MiningSnapshot, SubmitAction};
 use crate::config::{DescriptorParams, LaunchEntry};
 use crate::decay::{DecayAlgorithm, DecayModel, EnergyCurve};
 use crate::funding::{ensure_funded, BalanceSource, Faucet};
@@ -586,6 +586,42 @@ async fn stage_mempool_orders<C: ChainClient>(
     true
 }
 
+/// Claim the reward on every mempool order this account won.
+///
+/// The pallet pays a won order only when the winner claims it, so an
+/// order whose solution was accepted has to be claimed or it is paid
+/// nothing. The chain client reads the order and only submits the
+/// claim once the order's wait has elapsed, so a claim made too early
+/// costs no fee.
+async fn claim_mempool_rewards<C: ChainClient>(
+    chain: &C,
+    state: &Arc<Mutex<CoordinatorState>>,
+) {
+    let due: Vec<u64> = {
+        let mut st = state.lock().await;
+        std::mem::take(&mut st.pending_claims)
+    };
+    for order_id in due {
+        match chain.claim_reward(order_id).await {
+            Ok(receipt) => match receipt.action {
+                SubmitAction::Success => {}
+                // The order's wait has not elapsed yet. Put it back and
+                // try on a later poll.
+                SubmitAction::Retry => {
+                    state.lock().await.pending_claims.push(order_id);
+                }
+                _ => {
+                    tracing::warn!(order_id, "mempool reward not claimed");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(order_id, error = %e, "mempool reward claim failed");
+                state.lock().await.pending_claims.push(order_id);
+            }
+        }
+    }
+}
+
 /// The replenished `PoW` feeder: follow the chain head, and keep each registered
 /// miner's staged queue topped up to `buffer_depth` with fresh-salt jobs.
 ///
@@ -1156,6 +1192,9 @@ pub async fn feeder_loop<C>(
                 && stage_mempool_orders(chain.as_ref(), &state, params.miner_account).await
             {
                 orders_read_at = snap.block_number;
+            }
+            if params.solver_registered.load(Ordering::Relaxed) {
+                claim_mempool_rewards(chain.as_ref(), &state).await;
             }
 
             // Steady-state narration. Every poll at debug for diagnosis; once a
