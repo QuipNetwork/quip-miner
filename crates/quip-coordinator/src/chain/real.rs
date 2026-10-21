@@ -16,7 +16,8 @@ use super::extrinsic::{
 use super::pool::{decode_pending_proof, PendingProof};
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
-    encode_deregister_solver_call, encode_participate_call, encode_register_miner_call,
+    encode_claim_reward_call, encode_deregister_solver_call, encode_participate_call,
+    encode_register_miner_call,
     encode_register_solver_call, encode_set_descriptor_call, encode_submit_proof_call,
     encode_submit_solution_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
     JobSolutionScale, MinerInfoScale, MinerKind, NodeDescriptorV2Input, OrderStatus, OrderTiming,
@@ -703,6 +704,12 @@ impl RealChainClient {
                     .await?;
                 Ok(stored.is_some_and(|s| u64::from(s.submitted_at) == number))
             }
+            Confirmation::RewardClaimed { order_id } => {
+                let stored = self
+                    .read_storage::<JobOrderScale>(&job_orders_storage_key(order_id), block_hex)
+                    .await?;
+                Ok(stored.is_some_and(|o| o.status == OrderStatus::Closed))
+            }
         }
     }
 
@@ -852,6 +859,10 @@ impl RealChainClient {
                 "dispatch failed and OrderSolutions for order {order_id} holds no submission from \
                  this block; the order may have closed, or the solutions missed its gates"
             ),
+            Confirmation::RewardClaimed { order_id } => format!(
+                "dispatch failed and order {order_id} did not close; the wait may not have elapsed, \
+                 this account may not be a winner, or the order may already be claimed"
+            ),
         };
         (text, false)
     }
@@ -914,6 +925,10 @@ pub(crate) enum Confirmation {
     /// this block. Presence alone is not enough: an earlier submission for the
     /// same order would already be there.
     SolutionAccepted { order_id: u64, account: [u8; 32] },
+    /// `QuantumComputeMempool.JobOrders[order_id]` is closed. A claim
+    /// pays the winner and closes the order, so the order's own status
+    /// is what the inclusion has to show.
+    RewardClaimed { order_id: u64 },
 }
 
 /// On-chain result of a hybrid-signed extrinsic, before pallet-specific classify.
@@ -1544,6 +1559,85 @@ impl ChainClient for RealChainClient {
             }
             SignedCallOutcome::Dropped { message } => {
                 tracing::warn!(order_id, reason = %message, "mempool solution dropped before inclusion");
+                SubmitAction::Retry
+            }
+        };
+        Ok(SubmitReceipt {
+            action,
+            extrinsic_hash: Some(extrinsic_hash),
+            block_hash: None,
+            block_number: None,
+        })
+    }
+
+    async fn claim_reward(&self, order_id: u64) -> Result<SubmitReceipt, ChainError> {
+        // The order's own timing decides when the reward can be
+        // collected, so the order is read before anything is signed.
+        // A claim that is not ready yet is not submitted at all.
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let head_hex = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?
+            .to_string();
+        let header = self
+            .rpc_call(
+                "chain_getHeader",
+                Value::Array(vec![Value::String(head_hex.clone())]),
+            )
+            .await?;
+        let head_number = parse_block_number(&header)?;
+
+        let Some(order) = self
+            .read_storage::<JobOrderScale>(&job_orders_storage_key(order_id), &head_hex)
+            .await?
+        else {
+            tracing::warn!(order_id, "mempool reward not claimed: the order is not on chain");
+            return Ok(SubmitReceipt::action_only(SubmitAction::StopFatal));
+        };
+
+        // The pallet expires an order at the earlier of the hard
+        // deadline and the block wait after the first solution. The
+        // reward can only be collected once that point is reached.
+        let hard = order.created_at.saturating_add(order.timing.deadline_blocks);
+        let expiry = order.first_solution_at.map_or(hard, |first| {
+            hard.min(first.saturating_add(order.timing.block_wait))
+        });
+        if head_number < u64::from(expiry) {
+            tracing::debug!(
+                order_id,
+                head_number,
+                expiry,
+                "mempool reward is not claimable yet"
+            );
+            return Ok(SubmitReceipt::action_only(SubmitAction::Retry));
+        }
+
+        let call = encode_claim_reward_call(order_id);
+        let (outcome, extrinsic_hash) = self
+            .submit_signed_call(&call, Confirmation::RewardClaimed { order_id })
+            .await?;
+        let action = match &outcome {
+            SignedCallOutcome::Success { block, number } => {
+                tracing::info!(order_id, block = %block, number, "mempool reward claimed");
+                let block_hash = hex_decode(block)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+                return Ok(SubmitReceipt {
+                    action: SubmitAction::Success,
+                    extrinsic_hash: Some(extrinsic_hash),
+                    block_hash,
+                    block_number: Some(*number),
+                });
+            }
+            SignedCallOutcome::DispatchFailed { error: reason, .. }
+            | SignedCallOutcome::Invalid { message: reason } => {
+                tracing::warn!(order_id, reason = %reason, "mempool reward not claimed");
+                SubmitAction::StopFatal
+            }
+            SignedCallOutcome::Dropped { message } => {
+                tracing::warn!(order_id, reason = %message, "mempool reward claim dropped before inclusion");
                 SubmitAction::Retry
             }
         };

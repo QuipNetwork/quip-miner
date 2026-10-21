@@ -173,6 +173,13 @@ pub struct CoordinatorState {
     /// Populated in [`CoordinatorState::dispatch_inflight`] for lease jobs
     /// only; cleared in [`CoordinatorState::complete_inflight`].
     pub lease_issued_at: HashMap<Vec<u8>, std::time::Instant>,
+    /// Mempool orders this account submitted a solution for and has not
+    /// claimed the reward on yet.
+    ///
+    /// The pallet pays a won order only when the winner claims it, so
+    /// the order has to be remembered until the claim is made. The
+    /// feeder drains this list.
+    pub pending_claims: Vec<u64>,
     /// Live per-miner outbound channels, so the supervisor can push an in-band
     /// `Shutdown`/cancel to a running session. Registered on handshake success,
     /// removed when the session ends.
@@ -245,6 +252,7 @@ impl CoordinatorState {
             inflight: HashMap::new(),
             inflight_owner: HashMap::new(),
             lease_issued_at: HashMap::new(),
+            pending_claims: Vec::new(),
             outbound: HashMap::new(),
             wakeups: HashMap::new(),
             salts: HashMap::new(),
@@ -1201,13 +1209,24 @@ async fn submit_mempool_result<C: ChainClient>(
         salt: Vec::new(),
         device_access_time_us,
     };
-    match chain.submit_solution(&proof).await.map(|r| r.action) {
-        Ok(SubmitAction::Success) => tracing::info!(
-            order = %order,
-            best_energy_milli = proof.best_energy_milli,
-            rows = proof.solutions.len(),
-            "mempool solution submitted"
-        ),
+    let receipt = chain.submit_solution(&proof).await;
+    match receipt.as_ref().map(|r| r.action) {
+        Ok(SubmitAction::Success) => {
+            tracing::info!(
+                order = %order,
+                best_energy_milli = proof.best_energy_milli,
+                rows = proof.solutions.len(),
+                "mempool solution submitted"
+            );
+            // The reward is not paid on submission. The order has to be
+            // remembered so the feeder can claim it once the order's
+            // wait has elapsed.
+            if let Ok(order_id) = <[u8; 8]>::try_from(proof.order_id.as_slice())
+                .map(u64::from_le_bytes)
+            {
+                state.lock().await.pending_claims.push(order_id);
+            }
+        }
         Ok(SubmitAction::StopRoundStale | SubmitAction::StopFatal) => {
             tracing::warn!(order = %order, "mempool solution refused; not retrying this order");
         }
